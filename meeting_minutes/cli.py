@@ -7,6 +7,7 @@ from typing import Any
 
 from .asr import transcribe_audio
 from .diarization import attach_speakers, diarize_audio
+from .doctor import collect_environment_checks, doctor_exit_code, render_doctor_report
 from .identity import attach_names, load_participant_map
 from .jsonio import read_json, write_json
 from .keyframes import choose_keyframes, keyword_times, regular_times
@@ -63,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     voice_template.add_argument("--output-dir", required=True, type=Path)
     voice_template.add_argument("--names", nargs="+", help="Known participant names. Omit for generic Speaker 1..N placeholders.")
     voice_template.add_argument("--speaker-count", type=int, default=0, help="Generic speaker count when --names is omitted.")
+
+    doctor = sub.add_parser("doctor", help="Check local runtime dependencies before processing a recording.")
+    doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of Markdown.")
+    doctor.add_argument("--strict", action="store_true", help="Exit non-zero when required checks are missing.")
     return parser
 
 
@@ -341,5 +346,14 @@ def main(argv: list[str] | None = None) -> int:
         return diarize_existing(args)
     if args.command == "voice-template":
         return write_voice_template(args)
+    if args.command == "doctor":
+        checks = collect_environment_checks()
+        if args.json:
+            import json
+
+            print(json.dumps({"checks": checks}, ensure_ascii=False, indent=2))
+        else:
+            print(render_doctor_report(checks), end="")
+        return doctor_exit_code(checks, strict=args.strict)
     parser.error("unknown command")
     return 2

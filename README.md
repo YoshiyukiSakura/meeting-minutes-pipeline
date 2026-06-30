@@ -24,6 +24,7 @@ A quick GitHub search found related projects such as Whisper + diarization pipel
 - the default posture is local-first and privacy-preserving.
 
 See [docs/github-search-notes.md](docs/github-search-notes.md) for the search notes.
+See [docs/open-source-design-review.md](docs/open-source-design-review.md) for design ideas adopted from related projects.
 
 ## Pipeline
 
@@ -48,6 +49,14 @@ flowchart LR
 ```bash
 uv sync
 ```
+
+Check the local runtime before processing a long recording:
+
+```bash
+uv run meeting-minutes doctor
+```
+
+An example local Apple Silicon profile is available at `examples/pipeline_profile.apple_silicon.json`.
 
 Optional pyannote support:
 
@@ -179,3 +188,7 @@ Do not commit recordings, transcripts from private meetings, screenshots, OCR ou
 ```bash
 uv run --with pytest pytest -q
 ```
+
+## Roadmap
+
+The next high-value improvements are tracked in [docs/roadmap.md](docs/roadmap.md): VAD/forced alignment, preprocessing profiles, stereo/channel-aware diarization, structured output exporters, and benchmark fixtures.

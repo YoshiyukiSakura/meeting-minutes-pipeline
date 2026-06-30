@@ -1,0 +1,28 @@
+{
+  "asr": {
+    "backend": "mlx-whisper",
+    "model": "mlx-community/whisper-large-v3-turbo",
+    "language": "auto",
+    "prompt": []
+  },
+  "diarization": {
+    "backend": "speechbrain-cluster",
+    "expected_speakers": 4,
+    "enrollment": null
+  },
+  "preprocessing": {
+    "level": 1,
+    "channel_mode": "mono",
+    "sample_rate": 16000
+  },
+  "identity": {
+    "policy": "evidence-first",
+    "allow_cluster_fallback": true,
+    "allow_ocr_only_names": false
+  },
+  "outputs": {
+    "minutes": "markdown",
+    "transcript": ["json", "markdown"],
+    "review_queue": "markdown"
+  }
+}
