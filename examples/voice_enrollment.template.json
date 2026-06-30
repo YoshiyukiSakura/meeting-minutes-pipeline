@@ -1,0 +1,7 @@
+{
+  "enrollment_audio_reference": "effective_clip",
+  "speakers": {
+    "Alice": [{"start": 64.0, "end": 70.0}],
+    "Bob": [{"start": 78.0, "end": 86.0}]
+  }
+}

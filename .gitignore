@@ -1,0 +1,32 @@
+.DS_Store
+.venv/
+.pytest_cache/
+.serena/
+.local_bin/
+__pycache__/
+*.py[cod]
+
+# Generated meeting artifacts. These may contain private meeting content.
+outputs/
+keyframes/
+identity_probe/
+*.mov
+*.mp4
+*.m4a
+*.wav
+*.mp3
+*.aac
+transcript*.json
+transcript*.md
+minutes*.md
+ocr.json
+speaker_turns.json
+speaker_samples.md
+quality_report.md
+review_queue.md
+visual_identity_summary.json
+speaker_identity_visual_report.md
+
+# Local credentials/config.
+.env
+*.local.json
