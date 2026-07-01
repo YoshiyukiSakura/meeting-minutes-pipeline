@@ -124,7 +124,7 @@ def write_quality_report(
         f"- Unknown-speaker segments: {len(unknown)}",
         "",
         "## Known Limits",
-        "- Real names are assigned only from explicit voice enrollment, participant map, or nearby OCR names; unlabeled voice clusters are never promoted to real names.",
+        "- Real names are assigned only from explicit voice enrollment, a user-confirmed speaker map, a participant map, or nearby OCR names; unlabeled voice clusters are never promoted to real names without reviewed evidence.",
         "- If a video-call recording hides name plates and no voice enrollment is provided, speaker labels remain low-confidence until reviewed.",
         "- Pyannote diarization needs `HF_TOKEN` and the optional `diarization` extra; without it, local SpeechBrain ECAPA clustering is the strongest no-token backend.",
     ]
