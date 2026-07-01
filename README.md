@@ -166,6 +166,15 @@ uv run python tools/visual_identity_probe.py \
   --tiles-json examples/proton_meet_tiles.json
 ```
 
+Score active-speaker highlight borders from frame records:
+
+```bash
+uv run python tools/score_active_speaker_highlights.py \
+  --keyframes "/path/to/output/meeting_run/ocr.json" \
+  --boxes-json examples/highlight_boxes.json \
+  --output "/path/to/output/identity_probe/highlight_scores.json"
+```
+
 Apply reviewed visual identity evidence:
 
 ```bash
@@ -177,7 +186,7 @@ uv run python tools/apply_visual_identity.py \
   --mixed-clusters "Speaker 3"
 ```
 
-The current helper expects a precomputed `highlight_scores.json`; see [docs/visual-identity.md](docs/visual-identity.md) for the calibration workflow.
+The scoring helper accepts any JSON frame records containing `path` and `time`, including `keyframes.json` or `ocr.json`. See [docs/visual-identity.md](docs/visual-identity.md) for the calibration workflow.
 
 ## Privacy
 

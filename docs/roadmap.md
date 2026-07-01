@@ -28,8 +28,8 @@ The roadmap is ordered by evidence quality and local practicality.
 
 ## P3: Visual Identity Automation
 
-- Convert manual highlight scoring into a first-class CLI command.
-- Support per-layout tile boxes and layout switch points.
+- Convert manual highlight scoring into a first-class CLI command. Done for frame-record based scoring via `tools/score_active_speaker_highlights.py`.
+- Support per-layout tile boxes and layout switch points. Basic scoring supports per-layout boxes; identity application supports a manual layout switch point.
 - Detect presenter-only borders separately from active-speaker borders.
 - Produce an identity calibration report with contact sheets and score distributions.
 
