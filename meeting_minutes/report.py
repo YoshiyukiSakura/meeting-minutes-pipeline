@@ -136,9 +136,10 @@ def write_review_queue(path: Path, segments: list[dict[str, Any]]) -> None:
     queued = 0
     for segment in segments:
         reasons: list[str] = []
-        if str(segment.get("speaker")) == "Speaker Unknown":
+        has_resolved_name = bool(segment.get("name")) and float(segment.get("name_confidence", 0.0)) >= 0.6
+        if str(segment.get("speaker")) == "Speaker Unknown" and not has_resolved_name:
             reasons.append("speaker_unknown")
-        if not segment.get("name") or float(segment.get("name_confidence", 0.0)) < 0.6:
+        if not has_resolved_name:
             reasons.append("name_low_confidence")
         if reasons:
             queued += 1

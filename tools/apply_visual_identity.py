@@ -106,7 +106,9 @@ def _apply_visual_identity(
             if top_count >= max(1, len(evidence) * 0.6):
                 visual_name = top_name
                 top_scores = [float(frame["score"]) for frame in evidence if frame["person"] == top_name]
-                visual_confidence = min(0.96, 0.72 + max(top_scores) * 0.6)
+                # Border scores are ratios, not calibrated probabilities. Keep
+                # the confidence useful for filtering without overstating it.
+                visual_confidence = min(0.75, 0.50 + max(top_scores) * 0.50)
                 visual_refs = [str(frame["path"]) for frame in evidence if frame.get("path")]
                 segment["visual_identity_evidence"] = [
                     {
