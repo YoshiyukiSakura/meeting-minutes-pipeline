@@ -1,5 +1,7 @@
 # Roadmap
 
+Status: technical backlog. The canonical project sequence and current status live in [project-plan.md](project-plan.md).
+
 The roadmap is ordered by evidence quality and local practicality.
 
 ## P0: Reproducibility And Safety

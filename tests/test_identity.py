@@ -16,15 +16,15 @@ def test_voice_enrollment_name_has_priority_over_participant_map():
         {
             "start": 0.0,
             "end": 2.0,
-            "speaker": "Billy",
-            "name": "Billy",
+            "speaker": "Alice",
+            "name": "Alice",
             "name_source": "voice_enrollment",
             "name_confidence": 0.8,
             "text": "hello",
         }
     ]
-    attach_names(segments, [], {"Billy": "Xin"})
-    assert segments[0]["name"] == "Billy"
+    attach_names(segments, [], {"Alice": "Bob"})
+    assert segments[0]["name"] == "Alice"
     assert segments[0]["name_source"] == "voice_enrollment"
 
 
@@ -33,13 +33,51 @@ def test_user_confirmed_name_has_priority_over_participant_map():
         {
             "start": 0.0,
             "end": 2.0,
-            "speaker": "Billy",
-            "name": "Billy",
+            "speaker": "Alice",
+            "name": "Alice",
             "name_source": "user_confirmed_speaker_volume_mapping",
             "name_confidence": 0.8,
             "text": "hello",
         }
     ]
-    attach_names(segments, [], {"Billy": "Xin"})
-    assert segments[0]["name"] == "Billy"
+    attach_names(segments, [], {"Alice": "Bob"})
+    assert segments[0]["name"] == "Alice"
     assert segments[0]["name_source"] == "user_confirmed_speaker_volume_mapping"
+
+
+def test_voice_registry_name_has_priority_over_ocr_candidates():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 2.0,
+            "speaker": "Speaker 1",
+            "name": "Alice",
+            "name_source": "voice_registry",
+            "name_confidence": 0.8,
+            "text": "hello",
+        }
+    ]
+
+    attach_names(segments, [{"time": 1.0, "text": "Bob Smith", "path": "/tmp/frame.jpg"}])
+
+    assert segments[0]["name"] == "Alice"
+    assert segments[0]["name_source"] == "voice_registry"
+
+
+def test_participant_map_overrides_voice_registry_name():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 2.0,
+            "speaker": "Speaker 1",
+            "name": "Alice",
+            "name_source": "voice_registry",
+            "name_confidence": 0.8,
+            "text": "hello",
+        }
+    ]
+
+    attach_names(segments, [], {"Speaker 1": "Bob"})
+
+    assert segments[0]["name"] == "Bob"
+    assert segments[0]["name_source"] == "participant_map"

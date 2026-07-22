@@ -38,10 +38,10 @@ def build_minutes_prompt(
     return f"""你是会议纪要整理助手。请只根据下面 transcript 和关键帧信息写中文会议纪要，不要编造未出现的事实或人名。
 
 硬性要求：
-- 每条关键结论、风险、行动项都必须带时间戳。
+- 每条关键结论和决议都必须带时间戳。
 - 说话人未知时写“未知说话人”，不要猜实名。
-- 如果 transcript 不足以确定负责人或截止时间，写“未明确”。
-- 输出 Markdown，包含：会议主题、背景、关键讨论、决议/结论、行动项、风险/待确认、证据索引。
+- 输出 Markdown，只包含：会议主题、背景、关键讨论、决议/结论。
+- 不得输出“行动项”或“Action Items”章节，不得为任何待办补充负责人、时长、停机要求或技术对象。行动项由独立的确定性证据账本生成。
 
 输入文件：{metadata.get('input')}
 时长：{format_ts(float(metadata.get('duration', 0.0)))}
@@ -102,4 +102,3 @@ def generate_ollama_minutes(
         "model": model,
         "status": "ok",
     }
-

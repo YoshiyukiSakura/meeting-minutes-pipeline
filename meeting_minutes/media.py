@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .jsonio import read_json, write_json
+from .jsonio import write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,3 +133,10 @@ def ocr_frames(frames_manifest: list[dict[str, Any]], work_dir: Path) -> list[di
     proc = run_cmd(["swift", str(SWIFT_HELPER), "ocr", str(manifest_path)], timeout=1800)
     return json.loads(proc.stdout)
 
+
+def ocr_regions(regions_manifest: list[dict[str, Any]], work_dir: Path) -> list[dict[str, Any]]:
+    """Run Apple Vision only on calibrated nameplate crops, not whole frames."""
+    manifest_path = work_dir / "nameplate_regions_for_ocr.json"
+    write_json(manifest_path, regions_manifest)
+    proc = run_cmd(["swift", str(SWIFT_HELPER), "ocr-regions", str(manifest_path)], timeout=1800)
+    return json.loads(proc.stdout)

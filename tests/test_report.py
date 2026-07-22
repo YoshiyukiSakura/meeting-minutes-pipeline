@@ -1,4 +1,4 @@
-from meeting_minutes.report import write_quality_report, write_review_queue
+from meeting_minutes.report import write_minutes, write_quality_report, write_review_queue
 
 
 def test_quality_report_counts_anonymous_speaker_labels(tmp_path):
@@ -8,8 +8,8 @@ def test_quality_report_counts_anonymous_speaker_labels(tmp_path):
         {
             "start": 1.0,
             "end": 2.0,
-            "speaker": "Billy",
-            "name": "Billy",
+            "speaker": "Alice",
+            "name": "Alice",
             "name_confidence": 0.9,
             "text": "named",
         },
@@ -30,7 +30,7 @@ def test_review_queue_skips_unknown_speaker_when_visual_name_is_resolved(tmp_pat
             "start": 1.0,
             "end": 2.0,
             "speaker": "Speaker Unknown",
-            "name": "Xin",
+            "name": "Alice",
             "name_confidence": 0.94,
             "text": "resolved by visual evidence",
         },
@@ -50,3 +50,54 @@ def test_review_queue_skips_unknown_speaker_when_visual_name_is_resolved(tmp_pat
     assert "resolved by visual evidence" not in text
     assert "still unresolved" in text
     assert "speaker_unknown, name_low_confidence" in text
+
+
+def test_minutes_action_section_uses_only_the_action_ledger(tmp_path):
+    path = tmp_path / "minutes.md"
+    keyword_only_segment = {
+        "start": 0.0,
+        "end": 2.0,
+        "speaker": "Alice",
+        "name": "Alice",
+        "name_confidence": 0.95,
+        "text": "We need to schedule a two-hour MPC maintenance window.",
+    }
+    ledger = {
+        "candidates": [
+            {
+                "status": "accepted",
+                "start": 3.0,
+                "end": 5.0,
+                "owner": "Bob",
+                "source_quote": "I will set the MPC upgrade timing.",
+            }
+        ]
+    }
+
+    write_minutes(path, segments=[keyword_only_segment], keyframes=[], metadata={}, action_ledger=ledger)
+    action_section = path.read_text(encoding="utf-8").split("## Action Items", maxsplit=1)[1].split("## Key Frames", maxsplit=1)[0]
+
+    assert "I will set the MPC upgrade timing." in action_section
+    assert "two-hour MPC maintenance window" not in action_section
+
+
+def test_review_queue_includes_action_candidates_that_need_review(tmp_path):
+    path = tmp_path / "review_queue.md"
+    ledger = {
+        "candidates": [
+            {
+                "status": "review",
+                "start": 1.0,
+                "end": 2.0,
+                "source_quote": "I will handle it.",
+                "review_reasons": ["owner_unresolved", "topic_unresolved"],
+            }
+        ]
+    }
+
+    write_review_queue(path, [], action_ledger=ledger)
+    text = path.read_text(encoding="utf-8")
+
+    assert "## Action Items Needing Review" in text
+    assert "owner_unresolved, topic_unresolved" in text
+    assert "I will handle it." in text

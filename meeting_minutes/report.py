@@ -4,6 +4,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from meeting_minutes.action_items import action_item_lines, action_ledger_lines
 from .keyframes import KEYWORDS
 from .time_utils import format_ts
 
@@ -34,6 +35,7 @@ def write_minutes(
     segments: list[dict[str, Any]],
     keyframes: list[dict[str, Any]],
     metadata: dict[str, Any],
+    action_ledger: dict[str, Any] | None = None,
 ) -> None:
     keyword_segments = [
         segment
@@ -47,7 +49,7 @@ def write_minutes(
         "## Source",
         f"- Input: `{metadata.get('input')}`",
         f"- Duration: `{format_ts(float(metadata.get('duration', 0.0)))}`",
-        f"- Local-first: no SaaS upload performed by this pipeline.",
+        "- Local-first: no SaaS upload performed by this pipeline.",
         "",
         "## Speaker Coverage",
     ]
@@ -67,14 +69,7 @@ def write_minutes(
     else:
         lines.append("- ASR did not produce text; see `quality_report.md`.")
 
-    lines += ["", "## Decisions / Risks / Action Candidates"]
-    action_count = 0
-    for segment in keyword_segments:
-        action_count += 1
-        refs = ", ".join(Path(ref).name for ref in segment.get("frame_refs", [])[:2]) or "no frame ref"
-        lines.append(f"- `{_evidence(segment)}` **{_speaker_label(segment)}** [{refs}]: {segment['text']}")
-    if action_count == 0:
-        lines.append("- No explicit decision/action keywords were detected automatically.")
+    lines += ["", *action_item_lines(action_ledger or {"candidates": []})]
 
     lines += ["", "## Key Frames"]
     for frame in keyframes[:40]:
@@ -84,6 +79,10 @@ def write_minutes(
         lines.append("- No key frames selected.")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_action_item_ledger(path: Path, ledger: dict[str, Any]) -> None:
+    path.write_text("\n".join(action_ledger_lines(ledger)) + "\n", encoding="utf-8")
 
 
 def write_quality_report(
@@ -124,14 +123,20 @@ def write_quality_report(
         f"- Unknown-speaker segments: {len(unknown)}",
         "",
         "## Known Limits",
-        "- Real names are assigned only from explicit voice enrollment, a user-confirmed speaker map, a participant map, or nearby OCR names; unlabeled voice clusters are never promoted to real names without reviewed evidence.",
+        "- Real names are assigned only from explicit voice enrollment, a user-confirmed speaker map, a participant map, or calibrated segment-level visual evidence. Unlabeled voice clusters are never promoted to real names without reviewed evidence.",
+        "- Nameplate OCR without a participant whitelist remains a candidate only. Visual identity requires a calibrated layout, an active-speaker score and margin, a resolved nameplate or reviewed slot, and segment-level agreement.",
         "- If a video-call recording hides name plates and no voice enrollment is provided, speaker labels remain low-confidence until reviewed.",
         "- Pyannote diarization needs `HF_TOKEN` and the optional `diarization` extra; without it, local SpeechBrain ECAPA clustering is the strongest no-token backend.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_review_queue(path: Path, segments: list[dict[str, Any]]) -> None:
+def write_review_queue(
+    path: Path,
+    segments: list[dict[str, Any]],
+    *,
+    action_ledger: dict[str, Any] | None = None,
+) -> None:
     lines = ["# Review Queue", ""]
     queued = 0
     for segment in segments:
@@ -150,6 +155,16 @@ def write_review_queue(path: Path, segments: list[dict[str, Any]]) -> None:
             lines.append(f"- `{_evidence(segment)}` {', '.join(reasons)}{candidate_text}: {segment['text']}")
     if queued == 0:
         lines.append("- Empty.")
+    pending_actions = [
+        candidate
+        for candidate in (action_ledger or {}).get("candidates", [])
+        if candidate.get("status") == "review"
+    ]
+    if pending_actions:
+        lines += ["", "## Action Items Needing Review", ""]
+        for candidate in pending_actions:
+            reason_text = ", ".join(candidate.get("review_reasons", [])) or "review_required"
+            lines.append(f"- `{_evidence(candidate)}` {reason_text}: {candidate['source_quote']}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

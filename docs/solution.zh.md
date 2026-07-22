@@ -1,5 +1,10 @@
 # 仅基于视频电话录制的会议纪要闭环方案
 
+> Status: historical solution background. The current product contract is
+> `docs/product-requirements.zh.md`, the engineering architecture is
+> `docs/architecture.md`, and the implementation sequence is
+> `docs/project-plan.md`.
+
 ## 目标
 
 输入只有一份视频电话录屏，例如 `.mov` 或 `.mp4`。系统不依赖会议平台导出的参会者、聊天、字幕或说话人元数据。

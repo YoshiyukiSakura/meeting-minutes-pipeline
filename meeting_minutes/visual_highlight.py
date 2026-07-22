@@ -75,8 +75,103 @@ def score_highlight_border(
     )
     value = strips.max(axis=1)
     saturation = (value - strips.min(axis=1)) / np.maximum(value, 1e-6)
-    highlighted = (saturation > saturation_threshold) & (value > value_threshold)
+    colored_edge = (saturation > saturation_threshold) & (value > value_threshold)
+
+    # A colored tile background can otherwise look like an active border. Compare
+    # the outer pixels with the tile interior so uniform colored cards score low.
+    inset = min(max(edge * 2, edge + 1), max(1, min(crop.shape[:2]) // 3))
+    if crop.shape[0] <= inset * 2 or crop.shape[1] <= inset * 2:
+        return float(colored_edge.mean())
+    interior = crop[inset:-inset, inset:-inset, :]
+    baseline = np.median(interior.reshape(-1, 3), axis=0)
+    contrast = np.linalg.norm(strips - baseline, axis=1) / np.sqrt(3.0)
+    highlighted = colored_edge & (contrast >= 0.18)
     return float(highlighted.mean())
+
+
+def score_green_speaker_cue(image: Image.Image, box: Box) -> float:
+    """Score a tightly profiled green active-speaker waveform cue.
+
+    Slack Huddles renders this cue as a small bright-green waveform inside a
+    white pill near the lower-left of a participant tile. The caller must pass
+    the cue box itself rather than the whole tile; this is not a general green
+    object detector.
+    """
+    x1, y1, x2, y2 = _pixel_box(image, box)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    crop = np.asarray(image.crop((x1, y1, x2, y2)).convert("RGB"), dtype=np.float32) / 255.0
+    if crop.size == 0:
+        return 0.0
+    red, green, blue = np.moveaxis(crop, -1, 0)
+    waveform_green = (
+        (green >= 0.34)
+        & (green >= red * 1.28)
+        & (green >= blue * 1.18)
+        & ((green - red) >= 0.10)
+        & ((green - blue) >= 0.06)
+    )
+    # A Slack active-speaker waveform sits inside a small white pill. Requiring
+    # that background prevents a bright-green tile border from becoming a false
+    # speaker cue when a screen share changes the participant layout.
+    white_pill = (
+        (red >= 0.80)
+        & (green >= 0.80)
+        & (blue >= 0.80)
+        & ((np.maximum(np.maximum(red, green), blue) - np.minimum(np.minimum(red, green), blue)) <= 0.15)
+    )
+    if float(white_pill.mean()) < 0.03:
+        return 0.0
+    expected_pixels = max(1, int(round(crop.shape[0] * crop.shape[1] * 0.005)))
+    return float(min(1.0, int(waveform_green.sum()) / expected_pixels))
+
+
+def score_green_highlight_border(image: Image.Image, box: Box, *, edge_pixels: int = 5) -> float:
+    """Score a rectangular green active-speaker border conservatively.
+
+    A green avatar or green screen-share must not be treated as an active
+    speaker. A valid border therefore needs continuous green coverage on at
+    least three tile sides and a rim that is substantially greener than the
+    tile interior.
+    """
+    x1, y1, x2, y2 = _pixel_box(image, box)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    crop = np.asarray(image.crop((x1, y1, x2, y2)).convert("RGB"), dtype=np.float32) / 255.0
+    if crop.size == 0:
+        return 0.0
+    edge = max(1, min(edge_pixels, crop.shape[0] // 2 or 1, crop.shape[1] // 2 or 1))
+    red, green, blue = np.moveaxis(crop, -1, 0)
+    highlight_green = (
+        (green >= 0.34)
+        & (green >= red * 1.28)
+        & (green >= blue * 1.18)
+        & ((green - red) >= 0.10)
+        & ((green - blue) >= 0.06)
+    )
+
+    side_coverages = np.asarray(
+        [
+            highlight_green[:edge, :].any(axis=0).mean(),
+            highlight_green[-edge:, :].any(axis=0).mean(),
+            highlight_green[:, :edge].any(axis=1).mean(),
+            highlight_green[:, -edge:].any(axis=1).mean(),
+        ],
+        dtype=np.float32,
+    )
+    # The third-highest side is the weakest side in a required 3-of-4 outline.
+    # This rejects a green avatar or UI mark that only touches one or two edges.
+    outline_score = float(np.sort(side_coverages)[-3])
+    if outline_score < 0.55:
+        return 0.0
+
+    inset = min(max(edge * 2, edge + 1), max(1, min(crop.shape[:2]) // 3))
+    if crop.shape[0] <= inset * 2 or crop.shape[1] <= inset * 2:
+        return 0.0 if float(highlight_green.mean()) > 0.35 else outline_score
+    interior_green = float(highlight_green[inset:-inset, inset:-inset].mean())
+    if float(side_coverages.mean()) - interior_green < 0.25:
+        return 0.0
+    return outline_score
 
 
 def score_frame(

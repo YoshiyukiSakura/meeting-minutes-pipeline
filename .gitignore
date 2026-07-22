@@ -5,6 +5,7 @@
 .local_bin/
 __pycache__/
 *.py[cod]
+claude_*_review.jsonl
 
 # Generated meeting artifacts. These may contain private meeting content.
 outputs/
@@ -26,6 +27,10 @@ quality_report.md
 review_queue.md
 visual_identity_summary.json
 speaker_identity_visual_report.md
+visual_identity*.json
+visual_identity*.md
+visual_identity_frames/
+profiles/
 
 # Local credentials/config.
 .env

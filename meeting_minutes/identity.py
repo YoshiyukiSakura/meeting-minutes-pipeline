@@ -121,6 +121,13 @@ def attach_names(
             segment["name_confidence"] = 0.95
             continue
 
+        if (
+            segment.get("name")
+            and segment.get("name_source") == "voice_registry"
+            and float(segment.get("name_confidence", 0.0)) >= 0.6
+        ):
+            continue
+
         midpoint = (float(segment["start"]) + float(segment["end"])) / 2
         nearby = [
             record

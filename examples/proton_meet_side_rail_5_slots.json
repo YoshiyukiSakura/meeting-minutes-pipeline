@@ -1,0 +1,26 @@
+{
+  "settings": {
+    "samples_per_segment": 3,
+    "nameplate_samples_per_layout": 12,
+    "min_active_score": 0.14,
+    "min_active_margin": 0.05,
+    "minimum_nameplate_observations": 2,
+    "minimum_nameplate_share": 0.67,
+    "minimum_segment_vote_share": 0.66,
+    "short_segment_seconds": 1.5,
+    "time_offset_seconds": 0.0
+  },
+  "layouts": [
+    {
+      "name": "proton_side_rail_five",
+      "start": 90,
+      "slots": {
+        "slot_1": {"tile": [0.633, 0.12, 0.844, 0.262], "nameplate": [0.638, 0.212, 0.81, 0.261]},
+        "slot_2": {"tile": [0.633, 0.263, 0.844, 0.403], "nameplate": [0.638, 0.354, 0.81, 0.402]},
+        "slot_3": {"tile": [0.633, 0.405, 0.844, 0.545], "nameplate": [0.638, 0.496, 0.81, 0.544]},
+        "slot_4": {"tile": [0.633, 0.547, 0.844, 0.687], "nameplate": [0.638, 0.638, 0.81, 0.686]},
+        "slot_5": {"tile": [0.633, 0.689, 0.844, 0.829], "nameplate": [0.638, 0.78, 0.81, 0.828]}
+      }
+    }
+  ]
+}

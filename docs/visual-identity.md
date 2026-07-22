@@ -1,60 +1,70 @@
 # Visual Identity Workflow
 
-This project treats visual identity as evidence, not decoration.
+`meeting-minutes visual-identify` converts an active-speaker UI signal into segment-level identity evidence. It is local-first and does not send video frames or names to a SaaS. It uses nameplate OCR and UI activity indicators; it does not perform facial recognition.
 
-## Required Inputs
+## Profile Contract
 
-- `transcript.json`: ASR segments with diarized speaker labels.
-- keyframes or extracted still frames from the recording.
-- calibrated tile boxes for the meeting UI.
-- a reviewed UI-label-to-person map, for example `{"Tile A": "Alice"}`.
+A profile has non-overlapping time-bounded layouts. Every coordinate is normalized as `[x1, y1, x2, y2]` against the extracted frame width and height, so it is independent of the recording resolution.
 
-## Calibration Steps
+```json
+{
+  "participants": ["Alice", "Bob"],
+  "settings": {
+    "samples_per_segment": 3,
+    "min_active_score": 0.14,
+    "min_active_margin": 0.05,
+    "minimum_nameplate_observations": 2,
+    "minimum_nameplate_share": 0.67,
+    "minimum_segment_vote_share": 0.66,
+    "allow_direct_assignment": false
+  },
+  "layouts": [
+    {
+      "name": "screen_share_side_rail",
+      "start": 90,
+      "slots": {
+        "slot_1": {
+          "tile": [0.633, 0.12, 0.844, 0.262],
+          "nameplate": [0.638, 0.212, 0.81, 0.261]
+        }
+      }
+    }
+  ]
+}
+```
 
-1. Identify the meeting UI layout.
+- `participants` is strongly recommended. It is a local whitelist for resolving small OCR mistakes such as `Wiliam` to `William`. Without it, OCR output is retained only as a candidate.
+- A slot may use `person` instead of `nameplate` only after a reviewer has calibrated that slot to a named participant.
+- A layout is never applied before `start`, after `end`, or across an overlapping layout window.
+- `allow_direct_assignment` defaults to `false`. Enable it only after a reviewed sample shows that the UI cue tracks active speech rather than presenter, focus, or another tile state.
 
-   Common layouts:
+## Command
 
-   - full 2x2 grid before screen sharing,
-   - right-side participant rail during screen sharing,
-   - floating speaker thumbnails.
+```bash
+uv run meeting-minutes visual-identify \
+  --output-dir "$HOME/Documents/meeting-output" \
+  --visual-profile "$HOME/Documents/meeting-output/visual-profile.json"
+```
 
-2. Define normalized tile boxes.
+The same profile can be supplied to a new full run with `--visual-profile`.
 
-   Coordinates are `[x1, y1, x2, y2]`, normalized to image width and height.
+## Assignment Rules
 
-3. Pick high-confidence speech samples per diarized speaker.
+1. Short ASR segments receive one visual sample; longer segments receive two or three samples.
+2. A frame is active only when the highest tile-border score clears the profile threshold and leads the runner-up score by the configured margin.
+3. A slot name must come from a reviewed `person` field or multiple OCR observations that resolve to the participant whitelist.
+4. A segment needs one strong sample when it has one sample, or at least two consistent samples with a two-thirds vote share when it has multiple samples.
+5. Different active names in the same segment, unresolved nameplates, no calibrated layout, or weak evidence leave the segment anonymous.
+6. Existing voice-enrollment and reviewed participant-map names are preserved. A disagreement with visual evidence is recorded as a conflict.
+7. With direct assignment disabled, visual names are retained only as audit candidates and cannot enter the transcript or minutes.
 
-   Use `speaker_samples.md` and choose clear, non-overlapping samples.
+The direct visual identity confidence is `min(0.94, 0.62 + 0.16 * vote_share + 0.22 * average_active_border_score)`. It is an evidence-quality score, not a statistical probability or an accuracy claim.
 
-4. Generate contact sheets.
+## Outputs
 
-   ```bash
-   uv run python tools/visual_identity_probe.py \
-     --video "/path/to/recording.mov" \
-     --output "/path/to/identity_probe" \
-     --samples-json examples/visual_samples.json \
-     --tiles-json examples/proton_meet_tiles.json
-   ```
+- `visual_identity.json`: all scored frames, resolved slot names, and assignment summary.
+- `visual_identity_report.md`: calibration report with profile path, slot OCR evidence, assignment counts, and limits.
+- `visual_identity_nameplate_ocr.json`: cropped local OCR evidence.
+- `visual_identity_frames.json` and `work/visual_identity_frames/`: timestamped visual samples.
 
-5. Score or review active-speaker borders.
-
-   A border can mean different things depending on the UI. For example, a presenter border during screen sharing may not mean active speaker.
-
-6. Apply reviewed mapping.
-
-   ```bash
-   uv run python tools/apply_visual_identity.py \
-     --output-dir "/path/to/output" \
-     --scores "/path/to/identity_probe/highlight_scores.json" \
-     --ui-map examples/ui_name_map.json \
-     --cluster-fallback examples/cluster_fallback.json \
-     --mixed-clusters "Speaker 3"
-   ```
-
-## Reporting Rules
-
-- Count segment-level visual assignments separately from cluster fallback assignments.
-- Mark mixed clusters explicitly.
-- Keep unverified segments in `review_queue.md`.
-- Do not attribute speech to a participant who is merely visible in the UI.
+These artifacts are private meeting data and are excluded by `.gitignore`.

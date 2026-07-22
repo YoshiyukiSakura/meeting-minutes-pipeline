@@ -11,6 +11,18 @@ struct FrameRecord: Codable {
     let path: String
 }
 
+struct OCRRegion: Codable {
+    let label: String
+    let box: [Double]
+}
+
+struct OCRRegionsRecord: Codable {
+    let time: Double
+    let actualTime: Double?
+    let path: String
+    let regions: [OCRRegion]
+}
+
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
     exit(1)
@@ -155,9 +167,110 @@ func ocr(_ args: [String]) {
     printJSON(output)
 }
 
+func recognizeTexts(_ image: CGImage) throws -> [[String: Any]] {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+    request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US", "ja-JP"]
+    let handler = VNImageRequestHandler(cgImage: image, options: [:])
+    try handler.perform([request])
+    var texts: [[String: Any]] = []
+    for observation in request.results ?? [] {
+        guard let candidate = observation.topCandidates(1).first else { continue }
+        let box = observation.boundingBox
+        texts.append([
+            "text": candidate.string,
+            "confidence": Double(candidate.confidence),
+            "bbox": [
+                "x": Double(box.origin.x),
+                "y": Double(box.origin.y),
+                "width": Double(box.size.width),
+                "height": Double(box.size.height),
+            ],
+        ])
+    }
+    return texts
+}
+
+func upscaleForOCR(_ image: CGImage, factor: Int = 4) -> CGImage? {
+    let width = image.width * factor
+    let height = image.height * factor
+    let colorSpace = image.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+    guard let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+        return nil
+    }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return context.makeImage()
+}
+
+func ocrRegions(_ args: [String]) {
+    guard args.count == 1 else { fail("usage: ocr-regions <regions_manifest_json>") }
+    let manifestURL = URL(fileURLWithPath: args[0])
+    guard let data = try? Data(contentsOf: manifestURL),
+          let records = try? JSONDecoder().decode([OCRRegionsRecord].self, from: data) else {
+        fail("Cannot decode OCR regions manifest")
+    }
+
+    var output: [[String: Any]] = []
+    for record in records {
+        let url = URL(fileURLWithPath: record.path)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            output.append(["time": record.time, "path": record.path, "regions": [], "error": "cannot_read_image"])
+            continue
+        }
+        var regionOutput: [[String: Any]] = []
+        for region in record.regions {
+            guard region.box.count == 4 else {
+                regionOutput.append(["label": region.label, "texts": [], "error": "invalid_box"])
+                continue
+            }
+            let x1 = max(0, min(1, region.box[0]))
+            let y1 = max(0, min(1, region.box[1]))
+            let x2 = max(0, min(1, region.box[2]))
+            let y2 = max(0, min(1, region.box[3]))
+            guard x2 > x1, y2 > y1 else {
+                regionOutput.append(["label": region.label, "texts": [], "error": "invalid_box"])
+                continue
+            }
+            let rect = CGRect(
+                x: CGFloat(x1) * CGFloat(image.width),
+                y: CGFloat(y1) * CGFloat(image.height),
+                width: CGFloat(x2 - x1) * CGFloat(image.width),
+                height: CGFloat(y2 - y1) * CGFloat(image.height)
+            ).integral
+            guard let crop = image.cropping(to: rect) else {
+                regionOutput.append(["label": region.label, "texts": [], "error": "cannot_crop"])
+                continue
+            }
+            do {
+                let ocrImage = upscaleForOCR(crop) ?? crop
+                regionOutput.append(["label": region.label, "texts": try recognizeTexts(ocrImage)])
+            } catch {
+                regionOutput.append(["label": region.label, "texts": [], "error": "\(error)"])
+            }
+        }
+        var item: [String: Any] = ["time": record.time, "path": record.path, "regions": regionOutput]
+        if let actualTime = record.actualTime {
+            item["actualTime"] = actualTime
+        }
+        output.append(item)
+    }
+    printJSON(output)
+}
+
 let argv = Array(CommandLine.arguments.dropFirst())
 guard let command = argv.first else {
-    fail("usage: macos_media.swift <probe|frames|ocr> ...")
+    fail("usage: macos_media.swift <probe|frames|ocr|ocr-regions> ...")
 }
 let rest = Array(argv.dropFirst())
 switch command {
@@ -167,6 +280,8 @@ case "frames":
     frames(rest)
 case "ocr":
     ocr(rest)
+case "ocr-regions":
+    ocrRegions(rest)
 default:
     fail("unknown command: \(command)")
 }

@@ -357,8 +357,6 @@ def diarize_audio_speechbrain_cluster(
     speechbrain_cache: Path | None = None,
     speechbrain_model: str = SPEECHBRAIN_ECAPA_MODEL,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    import numpy as np
-
     sample_rate, data = _read_wav(audio_path)
     windows, vad_status = _speech_windows(
         data,
