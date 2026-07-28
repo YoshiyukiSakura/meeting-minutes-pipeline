@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from meeting_minutes.action_items import action_item_lines, action_ledger_lines
+
 from .keyframes import KEYWORDS
 from .time_utils import format_ts
 
@@ -29,7 +30,7 @@ def write_transcript_markdown(path: Path, segments: list[dict[str, Any]]) -> Non
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_minutes(
+def write_extractive_minutes(
     path: Path,
     *,
     segments: list[dict[str, Any]],
@@ -165,6 +166,17 @@ def write_review_queue(
         for candidate in pending_actions:
             reason_text = ", ".join(candidate.get("review_reasons", [])) or "review_required"
             lines.append(f"- `{_evidence(candidate)}` {reason_text}: {candidate['source_quote']}")
+    intent_recall = (action_ledger or {}).get("intent_recall") or {}
+    intent_signals = intent_recall.get("signals") if isinstance(intent_recall, dict) else []
+    if isinstance(intent_signals, list) and intent_signals:
+        lines += ["", "## Independently Recalled Action Intent", ""]
+        for signal in intent_signals:
+            candidate_ids = ", ".join(signal.get("candidate_ids", [])) or "unmatched"
+            disposition = "review_required" if signal.get("candidate_ids") else "unmatched_recall"
+            lines.append(
+                f"- `{format_ts(float(signal['start']))}-{format_ts(float(signal['end']))}` "
+                f"{disposition}, {signal['cue_kind']}, candidates={candidate_ids}: {signal['source_quote']}"
+            )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

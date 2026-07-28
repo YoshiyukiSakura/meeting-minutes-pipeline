@@ -32,10 +32,12 @@ flowchart LR
 | ASR | `meeting_minutes/asr.py` | `mlx-whisper` invocation and transcript segment normalization. |
 | Diarization | `meeting_minutes/diarization.py` | SpeechBrain, pyannote, voice enrollment, speaker attachment. |
 | Identity | `meeting_minutes/identity.py` | Participant maps, OCR candidates, evidence-preserving name attachment. |
-| Visual identity | `meeting_minutes/visual_identity.py`, `meeting_minutes/visual_highlight.py`, and `meeting_minutes/cli.py` | Time-bounded layout profiles, active-speaker border scoring, cropped nameplate OCR, segment-level identity assignment, and calibration evidence. |
+| Visual identity | `meeting_minutes/visual_identity.py`, `meeting_minutes/visual_highlight.py`, and `meeting_minutes/cli.py` | Time-bounded layout profiles, active-speaker border scoring, cropped nameplate OCR, segment-level identity assignment, calibration evidence, and recording provenance bound to path, duration, size, and content SHA-256. |
 | Action guard | `meeting_minutes/action_items.py` | Atomic commitment extraction, stable source IDs, topic and attribute normalization, constraint facts, and deterministic publication validation. |
 | Reporting | `meeting_minutes/report.py` | Markdown transcript, minutes, quality report, review queue, speaker samples. |
 | Summarization | `meeting_minutes/summarizer.py`, `meeting_minutes/deepseek.py` | Optional local or explicit remote LLM review drafts. Neither is an identity source or action-item publisher. DeepSeek accepts only `text` plus exact segment IDs, fingerprints exactly those transmitted records, derives quotes and times locally, blocks redirects, and never changes canonical minutes. |
+| Turn-level visual cluster identity | `meeting_minutes/direct_visual_cluster_identity.py` | Extends direct active-speaker visual evidence only after boundary erosion, turn-level voting, bidirectional chronological validation, quartile and erosion stability checks, unique name-to-cluster enforcement, and contiguous visual-support bounds. Reruns retract this stage's prior propagation even on a skip; mixed clusters remain unnamed. |
+| Same-session visual voiceprint | `meeting_minutes/visual_voice_identity.py` and `meeting_minutes/cli.py` | Builds a per-recording voice registry only from verified direct visual enrollment. It can confirm or correct cluster propagation after held-out calibration, never overrides direct visual labels, and retracts prior voiceprint labels before any rerun that cannot revalidate them. |
 
 ## Artifact Contract
 
@@ -45,9 +47,9 @@ flowchart LR
 | `speaker_turns.json` | Diarization | Speaker turns with `start`, `end`, `speaker`, backend status, confidence when available. |
 | `keyframes.json` | Keyframe selection | Frame path, timestamp, selection reasons. |
 | `ocr.json` | OCR stage | Frame path, timestamp, recognized text records. |
-| `visual_identity.json` | Visual identity command | Profile settings, slot-name resolution, per-frame highlight scores, and segment assignment summary. |
+| `visual_identity.json` | Visual identity command | Recording provenance, profile settings, slot-name resolution, per-frame highlight scores, and segment assignment summary. |
 | `visual_identity_report.md` | Visual identity command | Human-readable calibration evidence, resolved slots, assignment counts, and explicit limits. |
-| `action_items.json` | Action guard | Transcript fingerprint, candidates, exact quotes, bounded evidence, source-topic-bound normalized attributes, and contradiction constraints. |
+| `action_items.json` | Action guard | Transcript fingerprint, candidates, exact quotes, bounded evidence, source-topic-bound normalized attributes, contradiction constraints, and an independent weak-intent recall audit. |
 | `action_items.md` | Action guard | Human-readable publishable and review-required action ledger. |
 | `minutes.md` | Reporting | Evidence-backed summary candidates, timestamp links, and action rows rendered only from the action ledger. |
 | `minutes.deepseek.review.json` | Optional DeepSeek review | Draft-only validated claims, local citation results, input fingerprint, and no credential or raw API response. |
@@ -65,6 +67,7 @@ The action guard is a fail-closed publication boundary:
 3. The canonical minutes render the exact commitment quote. Model output is draft material and cannot write canonical action rows.
 4. `validate-actions` regenerates the ledger from `transcript.json` and rejects any stale or hand-edited ledger, rewrite, translation, unparsed duration, ungrounded topic or property, or contradictory explicitly named downtime fact.
 5. Ambiguous candidates and any human-facing rewrite remain review work rather than silently becoming published claims.
+6. A separate high-recall scan over evidence-backed named speech finds low-certainty action intent that the formal matcher may not accept. Every recalled signal requires a fingerprint-bound `published` or constrained `rejected` disposition before the bilingual minutes can publish, including an otherwise empty action table.
 
 ## Identity Trust Model
 

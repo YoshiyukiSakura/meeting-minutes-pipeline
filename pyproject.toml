@@ -18,6 +18,11 @@ diarization = [
   "pyannote.audio>=3.3.0",
 ]
 
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0",
+]
+
 [project.scripts]
 meeting-minutes = "meeting_minutes.cli:main"
 

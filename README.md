@@ -162,6 +162,8 @@ Action items are not written directly from keyword matches or free-form model ou
 - contradicting explicit downtime constraints reject a proposed row rather than selecting the latest assertion,
 - ambiguous candidates remain in `review_queue.md`; they are never silently discarded or published.
 
+The ledger also runs an independent, high-recall scan over high-confidence named speech for lower-certainty phrases such as `I would like to create` and `I want to create`. This scan is intentionally broader than the automatic candidate matcher. A matched phrase remains review-only; it never becomes an action row automatically. When the scan finds one or more signals, `publish-minutes` requires a fingerprinted internal `--action-intent-review` manifest that records one of two outcomes for every signal: `published`, linked to a reviewed action row owned by the same named participant, or `rejected`, with a constrained rejection reason and review note. This requirement applies even when the shareable Action Items table is empty.
+
 Rebuild the ledger after reviewing an existing run:
 
 ```bash
@@ -178,6 +180,8 @@ uv run meeting-minutes validate-actions \
 ```
 
 `proposed-action-items.json` is either a JSON array or an object containing `items`. Each item requires `candidate_id`, `owner`, `source_quote`, and `text`; `text` must equal the source quote after normalisation. A failed command writes `action_items.validation.json` with deterministic rejection reasons and exits non-zero. A human-written rewrite or translation is intentionally not an automatically publishable action item. `minutes.ollama.draft.md` is visibly marked as a non-shareable draft and cannot replace canonical `minutes.md`.
+
+For formal publication, place `minutes.reviewed.action-intents.json` beside the reviewed Chinese and English minutes whenever `action_items.json` contains `intent_recall.signals`, then pass it through `--action-intent-review`. The file is internal evidence, bound to the transcript and action-ledger fingerprints, and is never copied into `share/`.
 
 ## Identity Policy
 

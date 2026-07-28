@@ -4,6 +4,7 @@ import hashlib
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import subprocess
@@ -27,11 +28,18 @@ DEFAULT_DEEPSEEK_MAX_INPUT_CHARS = 700_000
 MAX_DEEPSEEK_OUTPUT_TOKENS = 12_000
 RETRY_MAX_DEEPSEEK_OUTPUT_TOKENS = 16_000
 MAX_API_RESPONSE_BYTES = 8 * 1024 * 1024
+DEEPSEEK_REQUEST_CHUNK_CHARS = 56_000
 MAX_CHINESE_CLAIM_CHARS = 160
 MAX_ENGLISH_CLAIM_CHARS = 300
-MAX_CLAIMS_PER_SECTION = 6
+MAX_CLAIMS_PER_SECTION = {
+    "overview": 4,
+    "discussion": 12,
+    "decisions": 8,
+}
 MAX_EVIDENCE_PER_CLAIM = 2
 SECTION_NAMES = ("overview", "discussion", "decisions")
+COVERAGE_WINDOW_SECONDS = 1800.0
+MIN_COVERAGE_WINDOW_SECONDS = 300.0
 
 DEEPSEEK_DRAFT_NOTICE = (
     "> **外部 AI 审校草稿，不可直接对外分享。** 此文件由 DeepSeek 基于转写文本生成；"
@@ -178,6 +186,8 @@ class DeepSeekConfig:
 class DeepSeekEvidenceInput:
     segments: tuple[dict[str, Any], ...]
     keyframe_hints: tuple[dict[str, Any], ...]
+    coverage_anchor_segment_ids: tuple[str, ...]
+    coverage_windows: tuple[tuple[float, float], ...]
     transcript_sha256: str
     transcript_characters: int
 
@@ -256,6 +266,55 @@ def _outbound_transcript_records(records: Iterable[dict[str, Any]]) -> list[dict
     return [{"segment_id": record["segment_id"], "text": record["text"]} for record in records]
 
 
+def _coverage_window_seconds(records: list[dict[str, Any]]) -> float:
+    if not records:
+        return COVERAGE_WINDOW_SECONDS
+    duration = max(float(record["end"]) for record in records)
+    return float(max(COVERAGE_WINDOW_SECONDS, math.ceil(duration / MAX_CLAIMS_PER_SECTION["discussion"])))
+
+
+def _coverage_windows(records: list[dict[str, Any]]) -> tuple[tuple[float, float], ...]:
+    if not records:
+        return ()
+    duration = max(float(record["end"]) for record in records)
+    window_seconds = _coverage_window_seconds(records)
+    windows = [
+        (float(index * window_seconds), min(float((index + 1) * window_seconds), duration))
+        for index in range(math.ceil(duration / window_seconds))
+    ]
+    if len(windows) > 1 and windows[-1][1] - windows[-1][0] < MIN_COVERAGE_WINDOW_SECONDS:
+        tail_start, tail_end = windows[-1]
+        tail_text_lengths = [
+            len(str(record["text"]).strip())
+            for record in records
+            if float(record["start"]) < tail_end and float(record["end"]) > tail_start
+        ]
+        if not tail_text_lengths or max(tail_text_lengths) < 40:
+            windows.pop()
+    return tuple(
+        (start, end)
+        for start, end in windows
+        if any(float(record["start"]) < end and float(record["end"]) > start for record in records)
+    )
+
+
+def _coverage_anchor_segment_ids(records: list[dict[str, Any]]) -> tuple[str, ...]:
+    """Choose one substantive transcript segment for each chronological window."""
+
+    if not records:
+        return ()
+    window_seconds = _coverage_window_seconds(records)
+    anchors: dict[int, dict[str, Any]] = {}
+    for record in records:
+        window = int(float(record["start"]) // window_seconds)
+        current = anchors.get(window)
+        # A longer utterance is less likely to be an acknowledgement or ASR fragment.
+        score = (len(str(record["text"]).strip()), -float(record["start"]))
+        if current is None or score > (len(str(current["text"]).strip()), -float(current["start"])):
+            anchors[window] = record
+    return tuple(anchors[window]["segment_id"] for window in sorted(anchors))
+
+
 def prepare_deepseek_evidence_input(
     *,
     segments: list[dict[str, Any]],
@@ -299,9 +358,79 @@ def prepare_deepseek_evidence_input(
     return DeepSeekEvidenceInput(
         segments=tuple(records),
         keyframe_hints=_keyframe_hints(keyframes),
+        coverage_anchor_segment_ids=_coverage_anchor_segment_ids(records),
+        coverage_windows=_coverage_windows(records),
         transcript_sha256=hashlib.sha256(encoded).hexdigest(),
         transcript_characters=characters,
     )
+
+
+def _chunk_evidence_input(
+    evidence_input: DeepSeekEvidenceInput,
+    *,
+    max_characters: int = DEEPSEEK_REQUEST_CHUNK_CHARS,
+) -> tuple[DeepSeekEvidenceInput, ...]:
+    """Create one focused request per coverage window, with bounded fallback splits."""
+
+    if max_characters < 1:
+        raise ValueError("DeepSeek request chunk size must be positive.")
+    inputs: list[DeepSeekEvidenceInput] = []
+
+    def append_input(records: list[dict[str, Any]], coverage_windows: tuple[tuple[float, float], ...]) -> None:
+        if not records:
+            return
+        record_ids = {record["segment_id"] for record in records}
+        anchors = (
+            tuple(anchor for anchor in evidence_input.coverage_anchor_segment_ids if anchor in record_ids)
+            if coverage_windows
+            else ()
+        )
+        encoded = json.dumps(_outbound_transcript_records(records), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        inputs.append(
+            DeepSeekEvidenceInput(
+                segments=tuple(records),
+                keyframe_hints=evidence_input.keyframe_hints,
+                coverage_anchor_segment_ids=anchors,
+                coverage_windows=coverage_windows,
+                transcript_sha256=hashlib.sha256(encoded).hexdigest(),
+                transcript_characters=len(encoded.decode("utf-8")),
+            )
+        )
+
+    covered_record_ids: set[str] = set()
+    for start, end in evidence_input.coverage_windows:
+        window_records = [
+            record
+            for record in evidence_input.segments
+            if float(record["start"]) < end and float(record["end"]) > start
+        ]
+        covered_record_ids.update(record["segment_id"] for record in window_records)
+        encoded_size = len(
+            json.dumps(_outbound_transcript_records(window_records), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        if encoded_size <= max_characters:
+            append_input(window_records, ((start, end),))
+            continue
+        current: list[dict[str, Any]] = []
+        current_size = 0
+        for record in window_records:
+            record_size = len(
+                json.dumps(
+                    {"segment_id": record["segment_id"], "text": record["text"]},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            if current and current_size + record_size > max_characters:
+                append_input(current, ((start, end),) if any(anchor in {item["segment_id"] for item in current} for anchor in evidence_input.coverage_anchor_segment_ids) else ())
+                current = []
+                current_size = 0
+            current.append(record)
+            current_size += record_size
+        append_input(current, ((start, end),) if any(anchor in {item["segment_id"] for item in current} for anchor in evidence_input.coverage_anchor_segment_ids) else ())
+    trailing_records = [record for record in evidence_input.segments if record["segment_id"] not in covered_record_ids]
+    append_input(trailing_records, ())
+    return tuple(inputs)
 
 
 def build_deepseek_messages(evidence_input: DeepSeekEvidenceInput, *, output_language: str = "zh-CN") -> list[dict[str, str]]:
@@ -317,7 +446,8 @@ Return one valid JSON object and no Markdown. Its only top-level keys are overvi
 Hard rules:
 - Every item must have non-empty text and one or more evidence entries.
 - Each evidence entry must contain only a segment_id that exactly matches an input segment_id. Do not output a quote; the caller derives the exact source quote locally.
-- Return no more than six items per section, no more than two evidence entries per item, and keep each text under 160 Chinese characters or 300 Latin characters.
+- Return no more than four overview items, 12 discussion items, and eight decision items; use no more than two evidence entries per item, and keep each text under 160 Chinese characters or 300 Latin characters.
+- For a long meeting, prefer five to eight high-value semantic themes. Merge related points across distant transcript windows instead of producing uniform time-slice narration.
 - Summarize only what the cited transcript establishes. Prefer omission to inference.
 - Do not name, identify, attribute, assign, or describe any speaker or participant.
 - Do not produce action items, owners, deadlines, schedules, durations, follow-ups, or implementation tasks.
@@ -329,6 +459,7 @@ Hard rules:
 - Do not use timestamps in item text; the caller derives them locally.
 - The decisions section may contain only an already-made decision. In Simplified Chinese its text must begin with 决定、确认、同意、采用、明确、已决定、已确认、已同意、已采用、已明确 or 达成一致. Never put a future work plan in decisions.
 - A decision must cite exactly one transcript segment. That segment itself must explicitly state a collective agreement, confirmation, decision, or selected design. A fact such as "the issue was confirmed" does not establish a meeting decision. A need, risk, request, or plan alone is not a decision.
+- The transcript array is chronological. Order discussion items by the first cited evidence, while grouping related points into semantic themes. The user message contains required discussion coverage anchors. For every anchor ID, include at least one discussion item that cites that exact anchor ID. This is a coverage rule, not a reason to invent a topic: summarize only what that anchor establishes.
 """
     language_instruction = (
         "All item text must be concise Simplified Chinese."
@@ -340,6 +471,7 @@ Hard rules:
             "required_json_schema_example": schema,
             "transcript": _outbound_transcript_records(evidence_input.segments),
             "keyframe_hints": list(evidence_input.keyframe_hints),
+            "required_discussion_coverage_anchor_segment_ids": list(evidence_input.coverage_anchor_segment_ids),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -595,7 +727,7 @@ def validate_deepseek_review(
             rejected.append({"section": section, "index": -1, "errors": ["section_not_array"]})
             continue
         for index, raw_item in enumerate(raw_items):
-            if index >= MAX_CLAIMS_PER_SECTION:
+            if index >= MAX_CLAIMS_PER_SECTION[section]:
                 rejected.append({"section": section, "index": index, "errors": ["too_many_claims"]})
                 continue
             claim, errors = _validated_claim(
@@ -611,8 +743,20 @@ def validate_deepseek_review(
             if claim:
                 sections[section].append(claim)
 
-    accepted = sum(len(items) for items in sections.values())
     warnings = ["response_model_mismatch"] if response_model and response_model != requested_model else []
+    discussion_evidence = [
+        evidence
+        for claim in sections["discussion"]
+        for evidence in claim["evidence"]
+    ]
+    missing_coverage = [
+        (start, end)
+        for start, end in evidence_input.coverage_windows
+        if not any(float(entry["start"]) < end and float(entry["end"]) > start for entry in discussion_evidence)
+    ]
+    if missing_coverage:
+        warnings.append(f"missing_discussion_coverage:{len(missing_coverage)}")
+    accepted = sum(len(items) for items in sections.values())
     return {
         "format": DEEPSEEK_REVIEW_FORMAT,
         "draft_only": True,
@@ -628,10 +772,11 @@ def validate_deepseek_review(
             "speaker_labels_transmitted": False,
             "transcript_fields": ["segment_id", "text"],
             "keyframe_metadata_fields": ["reasons"],
+            "required_discussion_coverage_windows": len(evidence_input.coverage_windows),
         },
         "sections": sections,
         "validation": {
-            "status": "ok" if accepted and not rejected and not warnings else "review_required",
+            "status": "ok" if accepted and not warnings else "review_required",
             "accepted": accepted,
             "rejected": rejected,
             "warnings": warnings,
@@ -717,6 +862,240 @@ def _decode_model_json(content: str) -> tuple[dict[str, Any] | None, dict[str, A
     return payload if isinstance(payload, dict) else None, metadata
 
 
+def request_deepseek_json(
+    *,
+    messages: list[dict[str, str]],
+    config: DeepSeekConfig,
+    max_tokens: int = RETRY_MAX_DEEPSEEK_OUTPUT_TOKENS,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Send a generic JSON-mode request through the hardened DeepSeek client."""
+
+    if not messages or any(message.get("role") not in {"system", "user", "assistant"} for message in messages):
+        return None, {"status": "invalid_messages", "attempts": 0}
+    if max_tokens < 1:
+        return None, {"status": "invalid_max_tokens", "attempts": 0}
+    try:
+        base_url, loopback = _validated_base_url(config.base_url)
+    except ValueError as exc:
+        return None, {"status": "configuration_error", "attempts": 0, "error": str(exc)}
+
+    api_key, credential_source = resolve_deepseek_api_key(config)
+    if not api_key:
+        if not (loopback and config.allow_unauthenticated_loopback):
+            return None, {
+                "status": "credential_missing",
+                "attempts": 0,
+                "credential_source": credential_source,
+            }
+        credential_source = "unauthenticated_loopback"
+
+    request_payload = {
+        "model": config.model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    decode_metadata: dict[str, Any] = {}
+    response_payload: dict[str, Any] | None = None
+    last_status = "empty_response"
+    attempts = 0
+    for attempt in range(2):
+        response_payload, failure, http_status = _post_chat_completion(
+            base_url=base_url,
+            body=request_payload,
+            headers=headers,
+            timeout=config.timeout,
+        )
+        attempts = attempt + 1
+        if failure:
+            return None, {
+                "status": failure,
+                "attempts": attempts,
+                "credential_source": credential_source,
+                **({"http_status": http_status} if http_status else {}),
+            }
+        assert response_payload is not None
+        content = _response_content(response_payload)
+        if not content:
+            last_status = "empty_response"
+            continue
+        model_payload, decode_metadata = _decode_model_json(content)
+        if model_payload is not None:
+            return model_payload, {
+                "status": "ok",
+                "attempts": attempts,
+                "credential_source": credential_source,
+                "requested_model": config.model,
+                "response_model": _plain_text(response_payload.get("model")) or None,
+                "external_processing": True,
+                "request_security": {"redirects": "blocked", "loopback": loopback},
+            }
+        last_status = "invalid_model_json"
+    return None, {
+        "status": last_status,
+        "attempts": attempts,
+        "credential_source": credential_source,
+        **decode_metadata,
+    }
+
+
+def _generate_deepseek_chunk(
+    *,
+    evidence_input: DeepSeekEvidenceInput,
+    source_segments: list[dict[str, Any]],
+    config: DeepSeekConfig,
+    base_url: str,
+    api_key: str | None,
+    credential_source: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    request_payload = {
+        "model": config.model,
+        "messages": build_deepseek_messages(evidence_input, output_language=config.output_language),
+        "response_format": {"type": "json_object"},
+        # Structured evidence output is more reliable in non-thinking mode.
+        "thinking": {"type": "disabled"},
+        "temperature": 0.0,
+        "max_tokens": MAX_DEEPSEEK_OUTPUT_TOKENS,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    response_payload: dict[str, Any] | None = None
+    model_payload: dict[str, Any] | None = None
+    decode_metadata: dict[str, Any] = {}
+    last_status = "empty_response"
+    attempts = 0
+    for attempt in range(2):
+        attempt_payload = request_payload
+        if attempt:
+            # DeepSeek documents occasional empty JSON-mode responses. Retry once with a larger output budget.
+            attempt_payload = {**request_payload, "max_tokens": RETRY_MAX_DEEPSEEK_OUTPUT_TOKENS}
+        response_payload, failure, http_status = _post_chat_completion(
+            base_url=base_url,
+            body=attempt_payload,
+            headers=headers,
+            timeout=config.timeout,
+        )
+        attempts = attempt + 1
+        if failure:
+            return None, {
+                "status": failure,
+                "attempts": attempts,
+                "credential_source": credential_source,
+                **({"http_status": http_status} if http_status else {}),
+            }
+        assert response_payload is not None
+        content = _response_content(response_payload)
+        if not content:
+            last_status = "empty_response"
+            continue
+        model_payload, decode_metadata = _decode_model_json(content)
+        if model_payload:
+            break
+        last_status = "invalid_model_json"
+    if not model_payload:
+        return None, {
+            "status": last_status,
+            "attempts": attempts,
+            "credential_source": credential_source,
+            **decode_metadata,
+        }
+
+    assert response_payload is not None
+    response_model = _plain_text(response_payload.get("model")) or None
+    try:
+        review = validate_deepseek_review(
+            model_payload,
+            evidence_input=evidence_input,
+            source_segments=source_segments,
+            requested_model=config.model,
+            response_model=response_model,
+            output_language=config.output_language,
+            redacted_names=config.redacted_names,
+        )
+    except ValueError:
+        return None, {
+            "status": "invalid_model_schema",
+            "attempts": attempts,
+            "credential_source": credential_source,
+        }
+    return review, {"status": "ok", "attempts": attempts}
+
+
+def _merge_deepseek_reviews(
+    *,
+    reviews: list[dict[str, Any]],
+    evidence_input: DeepSeekEvidenceInput,
+    config: DeepSeekConfig,
+) -> dict[str, Any]:
+    sections: dict[str, list[dict[str, Any]]] = {name: [] for name in SECTION_NAMES}
+    rejected: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    response_models: list[str] = []
+    for chunk_index, review in enumerate(reviews, start=1):
+        response_model = review.get("response_model")
+        if isinstance(response_model, str) and response_model:
+            response_models.append(response_model)
+        for section in SECTION_NAMES:
+            sections[section].extend(review.get("sections", {}).get(section, []))
+        for item in review.get("validation", {}).get("rejected", []):
+            rejected.append({**item, "chunk": chunk_index})
+        for warning in review.get("validation", {}).get("warnings", []):
+            if warning not in warnings and not str(warning).startswith("missing_discussion_coverage:"):
+                warnings.append(warning)
+
+    discussion_evidence = [
+        evidence
+        for claim in sections["discussion"]
+        for evidence in claim["evidence"]
+    ]
+    missing_coverage = [
+        (start, end)
+        for start, end in evidence_input.coverage_windows
+        if not any(float(entry["start"]) < end and float(entry["end"]) > start for entry in discussion_evidence)
+    ]
+    if missing_coverage:
+        warning = f"missing_discussion_coverage:{len(missing_coverage)}"
+        if warning not in warnings:
+            warnings.append(warning)
+    accepted = sum(len(items) for items in sections.values())
+    response_model = response_models[0] if len(set(response_models)) == 1 and response_models else None
+    return {
+        "format": DEEPSEEK_REVIEW_FORMAT,
+        "draft_only": True,
+        "external_processing": True,
+        "provider": "deepseek",
+        "requested_model": config.model,
+        "response_model": response_model,
+        "output_language": config.output_language,
+        "input": {
+            "transcript_sha256": evidence_input.transcript_sha256,
+            "transcript_segments": len(evidence_input.segments),
+            "transcript_characters": evidence_input.transcript_characters,
+            "speaker_labels_transmitted": False,
+            "transcript_fields": ["segment_id", "text"],
+            "keyframe_metadata_fields": ["reasons"],
+            "required_discussion_coverage_windows": len(evidence_input.coverage_windows),
+            "review_chunks": len(reviews),
+        },
+        "sections": sections,
+        "validation": {
+            "status": "ok" if accepted and not warnings else "review_required",
+            "accepted": accepted,
+            "rejected": rejected,
+            "warnings": warnings,
+        },
+    }
+
+
 def generate_deepseek_review(
     *,
     segments: list[dict[str, Any]],
@@ -751,94 +1130,57 @@ def generate_deepseek_review(
         if not (loopback and config.allow_unauthenticated_loopback):
             return _failure_status(config, "credential_missing", credential_source=credential_source)
         credential_source = "unauthenticated_loopback"
-    request_payload = {
-        "model": config.model,
-        "messages": build_deepseek_messages(evidence_input, output_language=config.output_language),
-        "response_format": {"type": "json_object"},
-        # Structured evidence output is more reliable in non-thinking mode.
-        "thinking": {"type": "disabled"},
-        "temperature": 0.0,
-        "max_tokens": MAX_DEEPSEEK_OUTPUT_TOKENS,
-        "stream": False,
-    }
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    response_payload: dict[str, Any] | None = None
-    model_payload: dict[str, Any] | None = None
-    decode_metadata: dict[str, Any] = {}
-    last_status = "empty_response"
-    attempts = 0
-    for attempt in range(2):
-        attempt_payload = request_payload
-        if attempt:
-            # DeepSeek documents occasional empty JSON-mode responses. Retry once with a larger output budget.
-            attempt_payload = {**request_payload, "max_tokens": RETRY_MAX_DEEPSEEK_OUTPUT_TOKENS}
-        response_payload, failure, http_status = _post_chat_completion(
+    chunk_inputs = _chunk_evidence_input(evidence_input)
+    reviews: list[dict[str, Any]] = []
+    total_attempts = 0
+    for chunk_index, chunk_input in enumerate(chunk_inputs, start=1):
+        review, chunk_status = _generate_deepseek_chunk(
+            evidence_input=chunk_input,
+            source_segments=segments,
+            config=config,
             base_url=base_url,
-            body=attempt_payload,
-            headers=headers,
-            timeout=config.timeout,
+            api_key=api_key,
+            credential_source=credential_source,
         )
-        attempts = attempt + 1
-        if failure:
+        total_attempts += int(chunk_status.get("attempts", 0))
+        if review is None:
             return _failure_status(
                 config,
-                failure,
+                str(chunk_status["status"]),
                 external_processing=True,
-                attempts=attempts,
+                attempts=total_attempts,
+                chunks=len(chunk_inputs),
+                chunk=chunk_index,
                 credential_source=credential_source,
-                **({"http_status": http_status} if http_status else {}),
+                **({"http_status": chunk_status["http_status"]} if chunk_status.get("http_status") else {}),
+                **(
+                    {
+                        key: value
+                        for key, value in chunk_status.items()
+                        if key
+                        in {
+                            "content_characters",
+                            "fenced",
+                            "starts_with_object",
+                            "ends_with_object",
+                        }
+                    }
+                ),
             )
-        assert response_payload is not None
-        content = _response_content(response_payload)
-        if not content:
-            last_status = "empty_response"
-            continue
-        model_payload, decode_metadata = _decode_model_json(content)
-        if model_payload:
-            break
-        last_status = "invalid_model_json"
-    if not model_payload:
-        return _failure_status(
-            config,
-            last_status,
-            external_processing=True,
-            attempts=attempts,
-            credential_source=credential_source,
-            **decode_metadata,
-        )
-    assert response_payload is not None
-
-    response_model = _plain_text(response_payload.get("model")) or None
-    try:
-        review = validate_deepseek_review(
-            model_payload,
-            evidence_input=evidence_input,
-            source_segments=segments,
-            requested_model=config.model,
-            response_model=response_model,
-            output_language=config.output_language,
-            redacted_names=config.redacted_names,
-        )
-    except ValueError:
-        return _failure_status(
-            config,
-            "invalid_model_schema",
-            external_processing=True,
-            credential_source=credential_source,
-        )
+        reviews.append(review)
+    review = _merge_deepseek_reviews(reviews=reviews, evidence_input=evidence_input, config=config)
     status = {
         "engine": "deepseek",
         "model": config.model,
-        "status": "draft_only",
+        "status": "draft_only" if review["validation"]["status"] == "ok" else "review_required",
         "external_processing": True,
         "credential_source": credential_source,
         "output_language": config.output_language,
         "accepted": review["validation"]["accepted"],
         "rejected": len(review["validation"]["rejected"]),
         "warnings": review["validation"]["warnings"],
-        "attempts": attempts,
+        "attempts": total_attempts,
+        "chunks": len(chunk_inputs),
         "request_security": {"redirects": "blocked", "loopback": loopback},
     }
     return review, status

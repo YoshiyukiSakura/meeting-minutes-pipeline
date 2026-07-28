@@ -13,6 +13,7 @@ from meeting_minutes.deepseek import (
     DeepSeekRedirectBlocked,
     MAX_API_RESPONSE_BYTES,
     _NoRedirectHandler,
+    _chunk_evidence_input,
     _validated_base_url,
     build_deepseek_messages,
     generate_deepseek_review,
@@ -105,6 +106,61 @@ def test_outbound_fingerprint_covers_only_the_exact_transmitted_transcript_field
 
     assert prepared.transcript_sha256 == hashlib.sha256(encoded).hexdigest()
     assert prepared.transcript_characters == len(encoded.decode("utf-8"))
+
+
+def test_discussion_coverage_anchors_are_required_and_validated():
+    segments = [
+        {"start": 0.0, "end": 5.0, "speaker": "Avery", "text": "The first discussion covers the current service status."},
+        {"start": 1805.0, "end": 1810.0, "speaker": "Riley", "text": "The later discussion covers the gateway design tradeoff."},
+    ]
+    prepared = prepare_deepseek_evidence_input(segments=segments, keyframes=[])
+    assert len(prepared.coverage_anchor_segment_ids) == 2
+    prompt = build_deepseek_messages(prepared)[1]["content"]
+    for anchor_id in prepared.coverage_anchor_segment_ids:
+        assert anchor_id in prompt
+
+    complete = {
+        "overview": [],
+        "discussion": [
+            {"text": "讨论了服务的当前状态。", "evidence": [{"segment_id": prepared.coverage_anchor_segment_ids[0]}]},
+            {"text": "讨论了网关设计的方案比较。", "evidence": [{"segment_id": prepared.coverage_anchor_segment_ids[1]}]},
+        ],
+        "decisions": [],
+    }
+    review = validate_deepseek_review(
+        complete,
+        evidence_input=prepared,
+        source_segments=segments,
+        requested_model="deepseek-v4-pro",
+    )
+    assert review["validation"]["warnings"] == []
+
+    incomplete = {**complete, "discussion": complete["discussion"][:1]}
+    review = validate_deepseek_review(
+        incomplete,
+        evidence_input=prepared,
+        source_segments=segments,
+        requested_model="deepseek-v4-pro",
+    )
+    assert "missing_discussion_coverage:1" in review["validation"]["warnings"]
+
+
+def test_evidence_input_chunks_preserve_order_and_coverage_anchors():
+    segments = [
+        {"start": float(index * 365), "end": float(index * 365 + 1), "speaker": "Avery", "text": f"segment {index} " + "details " * 40}
+        for index in range(4)
+    ]
+    prepared = prepare_deepseek_evidence_input(segments=segments, keyframes=[])
+
+    chunks = _chunk_evidence_input(prepared, max_characters=180)
+
+    assert len(chunks) == len(segments)
+    assert [record["segment_id"] for chunk in chunks for record in chunk.segments] == [
+        record["segment_id"] for record in prepared.segments
+    ]
+    assert {anchor for chunk in chunks for anchor in chunk.coverage_anchor_segment_ids} == set(
+        prepared.coverage_anchor_segment_ids
+    )
 
 
 def test_validator_derives_exact_source_quote_and_time_locally():
@@ -864,6 +920,7 @@ def test_deepseek_cli_keeps_canonical_minutes_and_action_ledger_unchanged(tmp_pa
     write_json(tmp_path / "metadata.json", {"input": "/private/recording.mov", "duration": 22.0, "source_offset": 0.0})
 
     assert summarize_existing(SimpleNamespace(output_dir=tmp_path, summary_engine="extractive")) == 0
+    (tmp_path / "minutes.md").write_text("# 已发布纪要\n", encoding="utf-8")
     minutes_before = (tmp_path / "minutes.md").read_bytes()
     actions_before = (tmp_path / "action_items.json").read_bytes()
     prepared = _prepared()
@@ -1015,7 +1072,7 @@ def test_run_pipeline_returns_nonzero_when_requested_deepseek_review_fails(tmp_p
     monkeypatch.setattr("meeting_minutes.cli.extract_frames", lambda *args, **kwargs: [])
     monkeypatch.setattr("meeting_minutes.cli.choose_keyframes", lambda frames, segments: [])
     monkeypatch.setattr("meeting_minutes.cli._write_action_artifacts", lambda output_dir, segments, statuses: {})
-    monkeypatch.setattr("meeting_minutes.cli.write_minutes", lambda *args, **kwargs: None)
+    monkeypatch.setattr("meeting_minutes.cli.write_extractive_minutes", lambda *args, **kwargs: None)
     monkeypatch.setattr("meeting_minutes.cli.write_transcript_markdown", lambda *args, **kwargs: None)
     monkeypatch.setattr("meeting_minutes.cli.write_speaker_samples", lambda *args, **kwargs: None)
     monkeypatch.setattr("meeting_minutes.cli.write_quality_report", lambda *args, **kwargs: None)

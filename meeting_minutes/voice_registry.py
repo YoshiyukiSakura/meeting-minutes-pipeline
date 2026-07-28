@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -451,4 +452,107 @@ def apply_voice_registry(
         "model_cache": str(cache_dir),
         **summary,
         "note": "Names were attached from a cross-recording voice registry only when score and runner-up margin gates passed.",
+    }
+
+
+def enforce_registry_cluster_consensus(
+    segments: list[dict[str, Any]],
+    *,
+    minimum_named_vote_share: float = 0.90,
+    minimum_cluster_coverage: float = 0.75,
+    minimum_support: int = 12,
+) -> dict[str, Any]:
+    """Keep registry identities only when their diarized cluster is internally coherent."""
+
+    by_speaker: dict[str, list[dict[str, Any]]] = {}
+    for segment in segments:
+        speaker = str(segment.get("speaker") or "")
+        if not speaker or speaker == "Speaker Unknown":
+            continue
+        by_speaker.setdefault(speaker, []).append(segment)
+
+    accepted: dict[str, dict[str, Any]] = {}
+    rejected: dict[str, dict[str, Any]] = {}
+    cleared_segments = 0
+    expanded_segments = 0
+    for speaker, cluster in by_speaker.items():
+        registry_named = [
+            segment
+            for segment in cluster
+            if segment.get("name")
+            and segment.get("voice_registry_evidence")
+            and (
+                segment.get("name_source") == "voice_registry"
+                or (
+                    segment.get("name_source") == "ocr_candidates_only"
+                )
+            )
+        ]
+        if not registry_named:
+            prior_rejection = next(
+                (
+                    segment.get("voice_registry_cluster_consensus")
+                    for segment in cluster
+                    if isinstance(segment.get("voice_registry_cluster_consensus"), dict)
+                    and segment["voice_registry_cluster_consensus"].get("status") == "rejected"
+                ),
+                None,
+            )
+            if prior_rejection:
+                rejected[speaker] = dict(prior_rejection)
+            continue
+        votes = Counter(str(segment["name"]) for segment in registry_named)
+        name, support = votes.most_common(1)[0]
+        named_vote_share = support / len(registry_named)
+        cluster_coverage = support / len(cluster)
+        evidence = {
+            "name": name,
+            "support": support,
+            "cluster_segments": len(cluster),
+            "registry_named_segments": len(registry_named),
+            "named_vote_share": round(named_vote_share, 3),
+            "cluster_coverage": round(cluster_coverage, 3),
+        }
+        if (
+            support >= minimum_support
+            and named_vote_share >= minimum_named_vote_share
+            and cluster_coverage >= minimum_cluster_coverage
+        ):
+            accepted[speaker] = evidence
+            for segment in cluster:
+                registry_candidate = segment in registry_named
+                if registry_candidate and segment.get("name") != name:
+                    segment["name"] = None
+                    segment["name_source"] = "voice_registry_cluster_inconsistent"
+                    segment["name_confidence"] = 0.0
+                    cleared_segments += 1
+                    continue
+                if registry_candidate:
+                    segment["name_source"] = "voice_registry"
+                    segment["name_confidence"] = round(min(0.95, 0.75 + 0.20 * cluster_coverage), 3)
+                    segment["voice_registry_cluster_consensus"] = evidence
+                    continue
+                if not segment.get("name"):
+                    segment["name"] = name
+                    segment["name_source"] = "voice_registry"
+                    segment["name_confidence"] = round(min(0.95, 0.75 + 0.20 * cluster_coverage), 3)
+                    segment["voice_registry_cluster_consensus"] = evidence
+                    expanded_segments += 1
+            continue
+
+        rejected[speaker] = {**evidence, "votes": dict(votes)}
+        for segment in registry_named:
+            segment["name"] = None
+            segment["name_source"] = "voice_registry_cluster_inconsistent"
+            segment["name_confidence"] = 0.0
+            segment["voice_registry_cluster_consensus"] = {"status": "rejected", **evidence, "votes": dict(votes)}
+            cleared_segments += 1
+    return {
+        "minimum_named_vote_share": minimum_named_vote_share,
+        "minimum_cluster_coverage": minimum_cluster_coverage,
+        "minimum_support": minimum_support,
+        "accepted_clusters": accepted,
+        "rejected_clusters": rejected,
+        "cleared_segments": cleared_segments,
+        "expanded_segments": expanded_segments,
     }

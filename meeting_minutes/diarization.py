@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -819,3 +820,143 @@ def attach_speakers(segments: list[dict[str, Any]], turns: list[dict[str, Any]])
                     weighted_name_confidence,
                     float(segment["speaker_confidence"]),
                 )
+
+
+def _timed_words(segment: dict[str, Any]) -> list[dict[str, Any]] | None:
+    words = segment.get("words")
+    if not isinstance(words, list) or not words:
+        return None
+
+    normalized: list[dict[str, Any]] = []
+    for word in words:
+        if not isinstance(word, dict):
+            return None
+        text = word.get("word", word.get("text"))
+        if not isinstance(text, str) or not text:
+            return None
+        try:
+            start = float(word["start"])
+            end = float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            return None
+        normalized.append({**word, "word": text, "start": start, "end": end})
+    return normalized
+
+
+def _best_turn_for_word(word: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str, Any] | None:
+    word_start = float(word["start"])
+    word_end = float(word["end"])
+    word_midpoint = (word_start + word_end) / 2.0
+    scored: list[tuple[dict[str, Any], float, float]] = []
+    for turn in turns:
+        try:
+            turn_start = float(turn["start"])
+            turn_end = float(turn["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(turn_start) or not math.isfinite(turn_end) or turn_end < turn_start:
+            continue
+        overlap = max(0.0, min(word_end, turn_end) - max(word_start, turn_start))
+        contains_midpoint = turn_start <= word_midpoint <= turn_end
+        if overlap <= 0.0 and not contains_midpoint:
+            continue
+        turn_midpoint = (turn_start + turn_end) / 2.0
+        scored.append((turn, overlap, abs(turn_midpoint - word_midpoint)))
+    if not scored:
+        return None
+
+    highest_overlap = max(item[1] for item in scored)
+    overlap_candidates = [item for item in scored if abs(item[1] - highest_overlap) <= 1e-6]
+    closest_distance = min(item[2] for item in overlap_candidates)
+    closest_candidates = [item for item in overlap_candidates if abs(item[2] - closest_distance) <= 1e-6]
+    if len(closest_candidates) != 1:
+        return None
+    return closest_candidates[0][0]
+
+
+def _compact_text(value: str) -> str:
+    return "".join(value.split())
+
+
+def split_segments_by_turns(
+    segments: list[dict[str, Any]],
+    turns: list[dict[str, Any]],
+    *,
+    max_word_gap_seconds: float = 1.0,
+) -> list[dict[str, Any]]:
+    """Split ASR chunks at diarization turns without losing transcript text.
+
+    The raw ASR chunk stays intact when word timings are unavailable or cannot
+    recreate its text exactly after whitespace normalization. That is safer than
+    attributing a mixed chunk to one speaker based only on its dominant turn.
+    """
+
+    if not turns:
+        return segments
+
+    output: list[dict[str, Any]] = []
+    for segment in segments:
+        words = _timed_words(segment)
+        if not words:
+            output.append(segment)
+            continue
+
+        assignments = [(word, _best_turn_for_word(word, turns)) for word in words]
+        if not any(turn is not None for _, turn in assignments):
+            output.append(segment)
+            continue
+
+        groups: list[list[tuple[dict[str, Any], dict[str, Any] | None]]] = []
+        previous_key: str | None | object = object()
+        previous_end: float | None = None
+        for word, turn in assignments:
+            key = str(turn.get("speaker", "Speaker Unknown")) if turn is not None else None
+            gap = float(word["start"]) - previous_end if previous_end is not None else 0.0
+            if not groups or key != previous_key or gap > max_word_gap_seconds:
+                groups.append([])
+            groups[-1].append((word, turn))
+            previous_key = key
+            previous_end = float(word["end"])
+
+        group_texts = ["".join(str(word["word"]) for word, _ in group).strip() for group in groups]
+        source_text = str(segment.get("text", ""))
+        if (
+            not all(group_texts)
+            or _compact_text("".join(group_texts)) != _compact_text(source_text)
+        ):
+            output.append(segment)
+            continue
+
+        original_id = str(segment.get("id", "segment"))
+        multiple_groups = len(groups) > 1
+        for index, (group, text) in enumerate(zip(groups, group_texts), start=1):
+            child = dict(segment)
+            for key in (
+                "speaker_speech_share",
+                "speaker_speech_overlap_seconds",
+                "speaker_segment_coverage",
+                "visual_identity_conflict",
+                "visual_identity_candidate_names",
+                "visual_identity_override",
+            ):
+                child.pop(key, None)
+            first_word = group[0][0]
+            last_word = group[-1][0]
+            child["id"] = f"{original_id}_{index:02d}" if multiple_groups else original_id
+            if multiple_groups:
+                child["split_from"] = original_id
+            child["start"] = float(first_word["start"])
+            child["end"] = float(last_word["end"])
+            child["text"] = text
+            child["words"] = [dict(word) for word, _ in group]
+            child["speaker"] = "Speaker Unknown"
+            child["speaker_confidence"] = 0.0
+            child["name"] = None
+            child["name_source"] = None
+            child["name_confidence"] = 0.0
+            child["frame_refs"] = []
+            child["speaker_assignment"] = "word_turn_overlap"
+            output.append(child)
+    return output

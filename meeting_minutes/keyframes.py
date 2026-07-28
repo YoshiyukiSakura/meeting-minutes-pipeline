@@ -71,11 +71,14 @@ def choose_keyframes(
     selected: list[dict[str, Any]] = []
     previous_path: Path | None = None
     for index, frame in enumerate(frames):
-        path = Path(str(frame["path"]))
+        path_value = frame.get("path")
+        if not path_value:
+            continue
+        path = Path(str(path_value))
         reasons: list[str] = []
-        if index == 0:
+        if index == 0 or previous_path is None:
             reasons.append("opening_frame")
-        if round(float(frame["time"]), 0) in keyword_starts:
+        if round(float(frame.get("time", 0.0)), 0) in keyword_starts:
             reasons.append("keyword_nearby")
         if previous_path and path.exists():
             try:

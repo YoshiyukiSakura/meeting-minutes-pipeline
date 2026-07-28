@@ -9,14 +9,60 @@ from typing import Any
 
 from .time_utils import format_ts
 
-
 LEDGER_FORMAT = "meeting-minutes/action-ledger-v2"
+ACTION_INTENT_AUDIT_FORMAT = "meeting-minutes/action-intent-audit-v1"
 MAX_EVIDENCE_SEGMENTS = 8
 MAX_EVIDENCE_SECONDS = 45.0
 
 _SELF_COMMITMENT = re.compile(
-    r"\b(?:i\s+(?:will|need\s+to|plan\s+to|am\s+going\s+to)|i['’]ll|i['’]m\s+going\s+to)\b|"
+    r"\b(?:i\s+(?:will|need\s+to|plan\s+to|am\s+going\s+to)|i['’]ll|"
+    r"i['’]m\s+(?:going\s+to|gonna)|let\s+me)\b|"
     r"(?:我会|我将|我要|我需要|我来|我负责)",
+    re.IGNORECASE,
+)
+_CONVERSATIONAL_LET_ME = re.compile(
+    r"^\s*let\s+me\s+(?:ask|explain|look|say|see|show|think)\b",
+    re.IGNORECASE,
+)
+_NEGATED_SELF_COMMITMENT = re.compile(
+    r"^\s*(?:"
+    r"i\s+will\s+(?:not|never)|i\s+won['’]?t|"
+    r"i['’]ll\s+(?:not|never)|i\s+am\s+not\s+going\s+to|"
+    r"i['’]m\s+not\s+(?:going\s+to|gonna)|我(?:将|会)\s*不"
+    r")\b",
+    re.IGNORECASE,
+)
+_ACTION_VERB = (
+    r"(?:create|file|open|prepare|update|deploy|investigate|review|fix|implement|"
+    r"document|coordinate|schedule|follow\s+up(?:\s+on)?|work\s+on|move|migrate|"
+    r"onboard|send|provide|calculate|test)"
+)
+# These cues are deliberately held for review. They express a concrete intent,
+# but lack the strength of an explicit "I will" commitment.
+_WEAK_SELF_ACTION_INTENT = re.compile(
+    rf"\b(?:i\s+(?:would\s+like\s+to|intend\s+to)|i['’]d\s+like\s+to)\s+(?P<verb>{_ACTION_VERB})\b",
+    re.IGNORECASE,
+)
+_WEAK_GROUP_ACTION_INTENT = re.compile(
+    rf"\b(?:i\s+would\s+like\s+us\s+to|i['’]d\s+like\s+us\s+to|"
+    rf"we\s+(?:need|plan|want)\s+to|we\s+want\s+them\s+to)\s+(?P<verb>{_ACTION_VERB})\b",
+    re.IGNORECASE,
+)
+# This is intentionally broader than _WEAK_*_ACTION_INTENT. It is an
+# independent recall audit, not the same matcher used to make candidates.
+_ACTION_INTENT_RECALL = re.compile(
+    rf"\b(?P<cue>i\s+(?:would\s+like\s+(?:us\s+)?to|intend\s+to|want\s+to)|"
+    rf"i['’]d\s+like\s+(?:us\s+)?to)\s+(?P<verb>{_ACTION_VERB})\b",
+    re.IGNORECASE,
+)
+_ASSURANCE_CLAUSE = re.compile(
+    r"\b(?:make\s+sure|ensure|confirm|verify)\s+that\s+(?P<clause>.+)$",
+    re.IGNORECASE,
+)
+_ASSURANCE_CLAUSE_PREDICATE = re.compile(
+    r"\b(?:is|are|was|were|be|been|being|has|have|had|does|do|did|will|would|"
+    r"can|could|should|must|needs?|works?|runs?|passes?|fails?|completes?|"
+    r"starts?|stops?|remains?|gets?|becomes?|[a-z]+(?:ed|ing))\b",
     re.IGNORECASE,
 )
 _TIME_UNIT = r"(?:hours?|hrs?|hr|h|minutes?|mins?|min)"
@@ -121,6 +167,15 @@ def _speaker_label(segment: dict[str, Any]) -> str | None:
     return None if speaker == "Speaker Unknown" else speaker
 
 
+def _trusted_named_segment(segment: dict[str, Any]) -> bool:
+    """Return whether a segment has a real, evidence-backed display name."""
+
+    name = str(segment.get("name") or "").strip()
+    if not name or name.casefold().startswith("speaker ") or name.casefold() in {"unknown", "unresolved"}:
+        return False
+    return float(segment.get("name_confidence", 0.0) or 0.0) >= 0.6
+
+
 def _topic_groups(text: str) -> list[str]:
     normalized = normalize_text(text)
     topics: list[str] = []
@@ -132,7 +187,29 @@ def _topic_groups(text: str) -> list[str]:
         topics.append("bps")
     if "zero confirmation" in normalized or "零确认" in normalized:
         topics.append("zero_confirmation")
-    return topics
+    if "gateway" in normalized or "网关" in normalized:
+        topics.append("api_gateway")
+    if re.search(r"\b(?:onboard|onboarding)\b", normalized) or "商户接入" in normalized:
+        topics.append("merchant_onboarding")
+    if re.search(r"\b(?:meeting notes?|minutes)\b", normalized) or "会议纪要" in normalized:
+        topics.append("meeting_notes")
+    if re.search(r"\bbusiness (?:needs?|requirements?)\b", normalized) or "业务需求" in normalized:
+        topics.append("business_requirements")
+    if "github" in normalized or "gitlab" in normalized or "git lab" in normalized:
+        topics.append("source_control_migration")
+    if "invoice" in normalized or "发票" in normalized or "账单" in normalized:
+        topics.append("invoice_review")
+    if "contract" in normalized or "合同" in normalized:
+        topics.append("contract")
+    if any(token in normalized for token in ("swagger", "postman", "documentation", "api docs", "文档")):
+        topics.append("api_documentation")
+    if "manual payout" in normalized or "手动付款" in normalized or "手动出款" in normalized:
+        topics.append("manual_payout")
+    if any(token in normalized for token in ("api key", "authentication", "merchant id", "认证", "商户标识")):
+        topics.append("merchant_authentication")
+    if any(token in normalized for token in (" kpi", "metrics", "code lines", "merge requests", "绩效", "度量")):
+        topics.append("team_metrics")
+    return list(dict.fromkeys(topics))
 
 
 def _english_amount(value: str) -> float | None:
@@ -240,6 +317,12 @@ def extract_attributes(text: str) -> dict[str, Any]:
 def _deduplicated_commitments(text: str) -> list[re.Match[str]]:
     matches: list[re.Match[str]] = []
     for match in _SELF_COMMITMENT.finditer(text):
+        suffix = text[match.start() :]
+        if (
+            _CONVERSATIONAL_LET_ME.match(suffix)
+            or _NEGATED_SELF_COMMITMENT.match(suffix)
+        ):
+            continue
         cue = normalize_text(match.group(0))
         if matches:
             previous = matches[-1]
@@ -248,6 +331,39 @@ def _deduplicated_commitments(text: str) -> list[re.Match[str]]:
                 continue
         matches.append(match)
     return matches
+
+
+def _weak_action_intent_matches(text: str) -> list[tuple[re.Match[str], str]]:
+    """Return low-certainty action intent cues that must stay in review."""
+
+    matches: list[tuple[re.Match[str], str]] = []
+    for pattern, cue_kind in (
+        (_WEAK_GROUP_ACTION_INTENT, "weak_group_intent"),
+        (_WEAK_SELF_ACTION_INTENT, "weak_self_intent"),
+    ):
+        matches.extend((match, cue_kind) for match in pattern.finditer(text))
+    return sorted(matches, key=lambda item: (item[0].start(), item[1]))
+
+
+def _conditional_intent(text: str, cue_start: int) -> bool:
+    """Treat an intent inside a recent if-clause as review-only context."""
+
+    prefix = text[max(0, cue_start - 96) : cue_start]
+    return bool(re.search(r"\bif\b[^.!?]{0,96}$", prefix, re.IGNORECASE))
+
+
+def _questioned_or_reported_intent(text: str, cue_start: int) -> bool:
+    """Detect a commitment cue embedded in another person's question or report."""
+
+    prefix = text[max(0, cue_start - 120) : cue_start]
+    return bool(
+        re.search(
+            r"\b(?:do|did|would|could|can)\s+you\s+"
+            r"(?:think|expect|say|confirm)\b[^.!?]{0,100}$",
+            prefix,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _direct_assignment_matches(text: str, known_owners: list[str]) -> list[tuple[re.Match[str], str]]:
@@ -267,18 +383,34 @@ def _direct_assignment_matches(text: str, known_owners: list[str]) -> list[tuple
     return matches
 
 
-def _action_specs(text: str, speaker: str | None, known_owners: list[str]) -> list[dict[str, Any]]:
+def _action_specs(
+    text: str,
+    speaker: str | None,
+    known_owners: list[str],
+    *,
+    speaker_identity_trusted: bool,
+) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
-    specs.extend(
-        {
-            "start": match.start(),
-            "match": match,
-            "owner": speaker,
-            "owner_evidence": "speaker_self_commitment" if speaker else "unresolved_speaker",
-            "commitment_kind": "self",
-        }
-        for match in _deduplicated_commitments(text)
-    )
+    for match in _deduplicated_commitments(text):
+        review_reasons: list[str] = []
+        if _conditional_intent(text, match.start()):
+            review_reasons.append("conditional_or_hypothetical")
+        if _questioned_or_reported_intent(text, match.start()):
+            review_reasons.append("questioned_or_reported_commitment")
+        specs.append(
+            {
+                "start": match.start(),
+                "match": match,
+                "owner": speaker if speaker_identity_trusted else None,
+                "owner_evidence": (
+                    "speaker_self_commitment"
+                    if speaker_identity_trusted
+                    else "unresolved_speaker"
+                ),
+                "commitment_kind": "self",
+                "force_review_reasons": review_reasons,
+            }
+        )
     for match, owner in _direct_assignment_matches(text, known_owners):
         specs.append(
             {
@@ -287,6 +419,26 @@ def _action_specs(text: str, speaker: str | None, known_owners: list[str]) -> li
                 "owner": owner,
                 "owner_evidence": "explicit_name_assignment",
                 "commitment_kind": "direct_assignment",
+                "force_review_reasons": ["owner_acceptance_unverified"],
+            }
+        )
+    for match, cue_kind in _weak_action_intent_matches(text):
+        group_intent = cue_kind == "weak_group_intent"
+        owner = speaker if speaker_identity_trusted and not group_intent else None
+        review_reasons = ["weak_intent_cue"]
+        if group_intent:
+            review_reasons.append("owner_unresolved")
+        if _conditional_intent(text, match.start()):
+            review_reasons.append("conditional_or_hypothetical")
+        specs.append(
+            {
+                "start": match.start(),
+                "match": match,
+                "owner": owner,
+                "owner_evidence": "speaker_weak_intent" if owner else "unresolved_weak_intent",
+                "commitment_kind": "weak_intent",
+                "intent_cue_kind": cue_kind,
+                "force_review_reasons": review_reasons,
             }
         )
     return sorted(specs, key=lambda item: (item["start"], item["owner_evidence"]))
@@ -303,6 +455,7 @@ def _segment_record(segment: dict[str, Any], index: int) -> dict[str, Any]:
         "start": float(segment.get("start", 0.0)),
         "end": float(segment.get("end", 0.0)),
         "speaker": _speaker_label(segment),
+        "speaker_identity_trusted": _trusted_named_segment(segment),
         "text": text,
         "attributes": extract_attributes(text),
     }
@@ -322,14 +475,14 @@ def _evidence_window(records: list[dict[str, Any]], index: int, topics: list[str
         previous_topics = set(record["attributes"]["topics"])
         if previous_topics and previous_topics.isdisjoint(expected_topics):
             break
-        if _deduplicated_commitments(record["text"]):
+        if _deduplicated_commitments(record["text"]) or _weak_action_intent_matches(record["text"]):
             break
         evidence.append(record)
     return sorted(evidence, key=lambda item: item["index"])
 
 
 def _candidate_id(commitment_segment_id: str, quote: str) -> str:
-    digest = hashlib.sha256(f"{commitment_segment_id}\x1f{quote}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{commitment_segment_id}\x1f{quote}".encode()).hexdigest()
     return f"action-{digest[:16]}"
 
 
@@ -371,6 +524,15 @@ def _candidate_attributes(
     }
 
 
+def _commitment_completeness_error(quote: str) -> str | None:
+    """Hold incomplete ASR clauses for review instead of publishing an invented task."""
+
+    assurance = _ASSURANCE_CLAUSE.search(normalize_text(quote))
+    if assurance and not _ASSURANCE_CLAUSE_PREDICATE.search(assurance.group("clause")):
+        return "commitment_incomplete"
+    return None
+
+
 def validate_action_candidate(candidate: dict[str, Any]) -> list[str]:
     """Return deterministic errors for a candidate before it can be rendered."""
 
@@ -383,6 +545,9 @@ def validate_action_candidate(candidate: dict[str, Any]) -> list[str]:
     quote = str(candidate.get("source_quote") or "")
     if not quote or normalize_text(quote) not in normalize_text(commitment["text"]):
         errors.append("quote_not_grounded")
+    completeness_error = _commitment_completeness_error(quote)
+    if completeness_error:
+        errors.append(completeness_error)
     if len(evidence) > MAX_EVIDENCE_SEGMENTS:
         errors.append("evidence_span_too_wide")
     if evidence and evidence[-1]["end"] - evidence[0]["start"] > MAX_EVIDENCE_SECONDS:
@@ -399,6 +564,12 @@ def validate_action_candidate(candidate: dict[str, Any]) -> list[str]:
         )
         if not owner or not assignment.search(commitment["text"]):
             errors.append("owner_not_explicit_in_commitment")
+    if commitment_kind == "weak_intent":
+        cue_start = candidate.get("intent_cue_start")
+        if not isinstance(cue_start, int) or not any(
+            match.start() == cue_start for match, _cue_kind in _weak_action_intent_matches(commitment["text"])
+        ):
+            errors.append("weak_intent_cue_not_grounded")
     source_topics = set(candidate.get("commitment_attributes", candidate.get("attributes", {})).get("topics") or [])
     for item in evidence:
         item_topics = set(item["attributes"]["topics"])
@@ -406,9 +577,75 @@ def validate_action_candidate(candidate: dict[str, Any]) -> list[str]:
             errors.append("cross_topic_evidence")
             break
     owner = candidate.get("owner")
-    if candidate.get("owner_evidence") == "speaker_self_commitment" and owner != commitment.get("speaker"):
+    if candidate.get("owner_evidence") in {"speaker_self_commitment", "speaker_weak_intent"} and owner != commitment.get("speaker"):
         errors.append("owner_not_explicit_in_commitment")
     return errors
+
+
+def _intent_signal_id(segment_id: str, cue_start: int, cue_kind: str) -> str:
+    digest = hashlib.sha256(f"{segment_id}\x1f{cue_start}\x1f{cue_kind}".encode()).hexdigest()
+    return f"intent-{digest[:16]}"
+
+
+def build_action_intent_recall(
+    segments: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Audit high-confidence named speech for weak action intent independently.
+
+    The recall expression is broader than the candidate matcher by design. A
+    signal with no matching candidate is a release-blocking review item rather
+    than proof that it should become an action automatically.
+    """
+
+    candidates_by_cue: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        cue_start = candidate.get("intent_cue_start")
+        if candidate.get("commitment_kind") != "weak_intent" or not isinstance(cue_start, int):
+            continue
+        key = (str(candidate.get("commitment_segment_id") or ""), cue_start)
+        candidates_by_cue.setdefault(key, []).append(candidate)
+
+    signals: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments):
+        if not _trusted_named_segment(segment):
+            continue
+        text = str(segment.get("text") or "")
+        segment_id = stable_segment_id(segment, index)
+        participant = str(segment.get("name") or "").strip()
+        for match in _ACTION_INTENT_RECALL.finditer(text):
+            cue = normalize_text(match.group("cue"))
+            cue_kind = "group_intent" if " us " in f" {cue} " else "self_intent"
+            if _conditional_intent(text, match.start()):
+                cue_kind = f"conditional_{cue_kind}"
+            matching_candidates = sorted(
+                candidates_by_cue.get((segment_id, match.start()), []),
+                key=lambda candidate: str(candidate.get("candidate_id") or ""),
+            )
+            signals.append(
+                {
+                    "signal_id": _intent_signal_id(segment_id, match.start(), cue_kind),
+                    "segment_id": segment_id,
+                    "start": float(segment.get("start", 0.0)),
+                    "end": float(segment.get("end", 0.0)),
+                    "participant": participant,
+                    "cue_kind": cue_kind,
+                    "cue": match.group(0),
+                    "source_quote": text[match.start() :].strip(),
+                    "candidate_ids": [str(candidate.get("candidate_id")) for candidate in matching_candidates],
+                    "candidate_statuses": [str(candidate.get("status")) for candidate in matching_candidates],
+                }
+            )
+    matched = sum(bool(signal["candidate_ids"]) for signal in signals)
+    return {
+        "format": ACTION_INTENT_AUDIT_FORMAT,
+        "signals": signals,
+        "summary": {
+            "signals": len(signals),
+            "matched_candidates": matched,
+            "unmatched_signals": len(signals) - matched,
+        },
+    }
 
 
 def _constraint_facts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -425,7 +662,7 @@ def _constraint_facts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if len(topics) != 1:
             continue
         for topic in topics:
-            fact_id = hashlib.sha256(f"{record['segment_id']}\x1f{topic}\x1f{downtime}".encode("utf-8")).hexdigest()[:16]
+            fact_id = hashlib.sha256(f"{record['segment_id']}\x1f{topic}\x1f{downtime}".encode()).hexdigest()[:16]
             facts.append(
                 {
                     "fact_id": f"constraint-{fact_id}",
@@ -448,7 +685,12 @@ def build_action_ledger(segments: list[dict[str, Any]]) -> dict[str, Any]:
     known_owners = sorted({str(record["speaker"]) for record in records if record.get("speaker")})
     candidates: list[dict[str, Any]] = []
     for index, record in enumerate(records):
-        specs = _action_specs(record["text"], record["speaker"], known_owners)
+        specs = _action_specs(
+            record["text"],
+            record["speaker"],
+            known_owners,
+            speaker_identity_trusted=bool(record["speaker_identity_trusted"]),
+        )
         for spec_index, spec in enumerate(specs):
             quote_end = specs[spec_index + 1]["start"] if spec_index + 1 < len(specs) else len(record["text"])
             quote = record["text"][spec["start"] : quote_end].strip(" \t,;:.-")
@@ -471,6 +713,9 @@ def build_action_ledger(segments: list[dict[str, Any]]) -> dict[str, Any]:
                 "attributes": attributes,
                 "evidence": evidence,
             }
+            if spec.get("intent_cue_kind"):
+                candidate["intent_cue_kind"] = spec["intent_cue_kind"]
+                candidate["intent_cue_start"] = spec["start"]
             errors = validate_action_candidate(candidate)
             review_reasons: list[str] = []
             if not spec["owner"]:
@@ -479,6 +724,7 @@ def build_action_ledger(segments: list[dict[str, Any]]) -> dict[str, Any]:
                 review_reasons.append("topic_unresolved")
             elif len(source_attributes["topics"]) != 1:
                 review_reasons.append("multiple_topics_in_commitment")
+            review_reasons.extend(spec.get("force_review_reasons", []))
             if errors:
                 review_reasons.extend(errors)
             if review_reasons:
@@ -486,11 +732,13 @@ def build_action_ledger(segments: list[dict[str, Any]]) -> dict[str, Any]:
                 candidate["review_reasons"] = sorted(set(review_reasons))
             candidates.append(candidate)
     constraints = _constraint_facts(records)
+    intent_recall = build_action_intent_recall(segments, candidates)
     return {
         "format": LEDGER_FORMAT,
         "transcript_sha256": transcript_fingerprint(segments),
         "candidates": candidates,
         "constraints": constraints,
+        "intent_recall": intent_recall,
         "summary": {
             "accepted": sum(item["status"] == "accepted" for item in candidates),
             "review": sum(item["status"] == "review" for item in candidates),
@@ -550,9 +798,10 @@ def validate_published_action_item(item: dict[str, Any], ledger: dict[str, Any])
     )
     if len(allowed_downtime_values) > 1:
         errors.append("downtime_constraint_conflict")
-    elif published_attributes["downtime"] is not None:
-        if not allowed_downtime_values or published_attributes["downtime"] not in allowed_downtime_values:
-            errors.append("downtime_not_grounded")
+    elif published_attributes["downtime"] is not None and (
+        not allowed_downtime_values or published_attributes["downtime"] not in allowed_downtime_values
+    ):
+        errors.append("downtime_not_grounded")
     return sorted(set(errors))
 
 
@@ -585,5 +834,19 @@ def action_ledger_lines(ledger: dict[str, Any]) -> list[str]:
         reasons = ", ".join(candidate.get("review_reasons", [])) or "review_required"
         lines.append(f"- `{candidate['candidate_id']}` `{timestamp}` [{reasons}]: {candidate['source_quote']}")
     if not pending:
+        lines.append("- Empty.")
+
+    intent_recall = ledger.get("intent_recall") or {}
+    signals = intent_recall.get("signals") if isinstance(intent_recall, dict) else []
+    lines += ["", "## Intent Recall Audit", ""]
+    if isinstance(signals, list) and signals:
+        for signal in signals:
+            timestamp = f"{format_ts(float(signal['start']))}-{format_ts(float(signal['end']))}"
+            candidate_ids = ", ".join(signal.get("candidate_ids", [])) or "unmatched"
+            lines.append(
+                f"- `{signal['signal_id']}` `{timestamp}` **{signal['participant']}** "
+                f"[{signal['cue_kind']}; {candidate_ids}]: {signal['source_quote']}"
+            )
+    else:
         lines.append("- Empty.")
     return lines

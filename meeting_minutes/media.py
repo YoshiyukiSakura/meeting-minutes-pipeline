@@ -18,14 +18,17 @@ class PipelineError(RuntimeError):
 
 
 def run_cmd(args: list[str], *, cwd: Path | None = None, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(
-        args,
-        cwd=str(cwd) if cwd else None,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PipelineError(f"Command timed out after {timeout}s: {' '.join(args)}") from exc
     if proc.returncode != 0:
         raise PipelineError(
             f"Command failed ({proc.returncode}): {' '.join(args)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
@@ -38,8 +41,56 @@ def probe_media(input_path: Path) -> dict[str, Any]:
     return json.loads(proc.stdout)
 
 
+def find_ffmpeg() -> str | None:
+    if ffmpeg := shutil.which("ffmpeg"):
+        return ffmpeg
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        bundled = Path(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        return None
+    return str(bundled) if bundled.is_file() else None
+
+
 def make_clip(input_path: Path, output_path: Path, *, start: float, duration: float) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if ffmpeg := find_ffmpeg():
+        run_cmd(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-ss",
+                f"{start:.3f}",
+                "-i",
+                str(input_path),
+                "-t",
+                f"{duration:.3f}",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ],
+            timeout=900,
+        )
+        return output_path
     run_cmd(
         [
             "avconvert",
@@ -62,7 +113,7 @@ def make_clip(input_path: Path, output_path: Path, *, start: float, duration: fl
 
 def extract_audio(input_path: Path, wav_path: Path) -> Path:
     wav_path.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg()
     if ffmpeg:
         run_cmd(
             [

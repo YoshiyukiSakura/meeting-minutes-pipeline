@@ -120,7 +120,11 @@ def test_unanchored_duration_cannot_be_absorbed_by_a_later_topic():
             _segment(6.0, 8.0, "Riley", "I will figure out when to upgrade MPC."),
         ]
     )
-    mpc = ledger["candidates"][0]
+    mpc = next(
+        candidate
+        for candidate in ledger["candidates"]
+        if candidate["attributes"]["topics"] == ["mpc"]
+    )
     assert mpc["attributes"]["topics"] == ["mpc"]
     assert mpc["attributes"]["duration_minutes"] == []
 
@@ -234,6 +238,21 @@ def test_ability_or_status_statement_is_not_an_action_candidate():
     assert ledger["candidates"] == []
 
 
+def test_incomplete_assurance_clause_is_held_for_review():
+    ledger = build_action_ledger([_segment(0.0, 2.0, "Riley", "I need to make sure that MPC one")])
+
+    candidate = ledger["candidates"][0]
+    assert candidate["status"] == "review"
+    assert "commitment_incomplete" in candidate["review_reasons"]
+
+
+def test_complete_assurance_clause_remains_publishable():
+    ledger = build_action_ledger([_segment(0.0, 2.0, "Riley", "I need to make sure that MPC one is restored.")])
+
+    candidate = ledger["candidates"][0]
+    assert candidate["status"] == "accepted"
+
+
 def test_segment_id_is_independent_of_list_position_and_name_relabeling():
     segment = _segment(10.0, 12.0, "Speaker 1", "I will set the MPC upgrade timing.", name="Riley")
     relabeled = {**segment, "name": "Different Display Name"}
@@ -241,7 +260,7 @@ def test_segment_id_is_independent_of_list_position_and_name_relabeling():
     assert stable_segment_id(segment, 0) == stable_segment_id(relabeled, 99)
 
 
-def test_explicit_named_assignment_is_publishable_when_owner_and_topic_share_a_source():
+def test_explicit_named_assignment_waits_for_verified_owner_acceptance():
     ledger = build_action_ledger(
         [
             _segment(0.0, 2.0, "Alex Example", "Riley will set the MPC upgrade timing."),
@@ -250,9 +269,10 @@ def test_explicit_named_assignment_is_publishable_when_owner_and_topic_share_a_s
     )
 
     candidate = ledger["candidates"][0]
-    assert candidate["status"] == "accepted"
+    assert candidate["status"] == "review"
     assert candidate["owner"] == "Riley"
     assert candidate["owner_evidence"] == "explicit_name_assignment"
+    assert "owner_acceptance_unverified" in candidate["review_reasons"]
     assert candidate["attributes"]["topics"] == ["mpc"]
 
 
@@ -291,3 +311,207 @@ def test_conflicting_downtime_constraints_are_rejected():
     )
 
     assert "downtime_constraint_conflict" in errors
+
+
+def test_weak_named_intent_is_recalled_but_never_auto_promoted_to_an_action():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                4890.0,
+                4903.0,
+                "Armando",
+                "And then I would like to create an issue to show the response in zero confirmation.",
+            )
+        ]
+    )
+
+    candidate = ledger["candidates"][0]
+    signal = ledger["intent_recall"]["signals"][0]
+    assert candidate["status"] == "review"
+    assert candidate["owner"] == "Armando"
+    assert candidate["commitment_kind"] == "weak_intent"
+    assert "weak_intent_cue" in candidate["review_reasons"]
+    assert signal["participant"] == "Armando"
+    assert signal["candidate_ids"] == [candidate["candidate_id"]]
+    assert signal["candidate_statuses"] == ["review"]
+
+
+def test_weak_group_intent_never_assigns_the_speaker_as_owner():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                4.0,
+                "Armando",
+                "I would like us to create an issue for zero confirmation.",
+            )
+        ]
+    )
+
+    candidate = ledger["candidates"][0]
+    assert candidate["status"] == "review"
+    assert candidate["owner"] is None
+    assert set(candidate["review_reasons"]) >= {"weak_intent_cue", "owner_unresolved"}
+
+
+def test_independent_recall_surfaces_broader_named_intent_without_auto_candidate():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                4.0,
+                "Armando",
+                "I want to create an issue for zero confirmation.",
+            )
+        ]
+    )
+
+    assert ledger["candidates"] == []
+    signals = ledger["intent_recall"]["signals"]
+    assert len(signals) == 1
+    assert signals[0]["candidate_ids"] == []
+    assert ledger["intent_recall"]["summary"]["unmatched_signals"] == 1
+
+
+def test_recall_does_not_treat_discourse_wishes_or_past_counterfactuals_as_actions():
+    ledger = build_action_ledger(
+        [
+            _segment(0.0, 2.0, "Riley", "I would have liked to create an issue for zero confirmation."),
+            _segment(3.0, 5.0, "Riley", "I want to add one thing before we continue."),
+            _segment(6.0, 8.0, "Riley", "I wish we could create an issue for zero confirmation."),
+        ]
+    )
+
+    assert ledger["candidates"] == []
+    assert ledger["intent_recall"]["signals"] == []
+
+
+def test_conditional_weak_intent_is_preserved_for_review_with_the_condition_flag():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                5.0,
+                "Riley",
+                "If the response stays hidden, I would like to create an issue for zero confirmation.",
+            )
+        ]
+    )
+
+    candidate = ledger["candidates"][0]
+    signal = ledger["intent_recall"]["signals"][0]
+    assert candidate["status"] == "review"
+    assert "conditional_or_hypothetical" in candidate["review_reasons"]
+    assert signal["cue_kind"] == "conditional_self_intent"
+
+
+def test_explicit_gonna_commitment_with_business_requirements_is_publishable():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                8.0,
+                "John",
+                "I'm gonna work on what the business needs and get the requirements ready.",
+            )
+        ]
+    )
+
+    candidate = ledger["candidates"][0]
+    assert candidate["status"] == "accepted"
+    assert candidate["owner"] == "John"
+    assert candidate["attributes"]["topics"] == ["business_requirements"]
+
+
+def test_let_me_invoice_review_is_publishable_for_a_trusted_speaker():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                8.0,
+                "Billy",
+                "Let me review the last invoice and calculate the development and support percentages.",
+            )
+        ]
+    )
+
+    candidate = ledger["candidates"][0]
+    assert candidate["status"] == "accepted"
+    assert candidate["owner"] == "Billy"
+    assert candidate["attributes"]["topics"] == ["invoice_review"]
+
+
+def test_conversational_let_me_cue_is_not_a_follow_up_commitment():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                8.0,
+                "Billy",
+                "Let me think, we are going to have a merchant use the API gateway.",
+            ),
+            _segment(
+                9.0,
+                15.0,
+                "Billy",
+                "Let me ask you about the latest invoice.",
+            ),
+        ]
+    )
+
+    assert ledger["candidates"] == []
+
+
+def test_anonymous_self_commitment_never_becomes_an_accepted_owner():
+    ledger = build_action_ledger(
+        [_segment(0.0, 8.0, "Speaker 4", "I will send the meeting notes.")]
+    )
+
+    candidate = ledger["candidates"][0]
+    assert candidate["status"] == "review"
+    assert candidate["owner"] is None
+    assert "owner_unresolved" in candidate["review_reasons"]
+
+
+def test_negated_self_commitment_is_not_an_action_candidate():
+    ledger = build_action_ledger(
+        [_segment(0.0, 8.0, "Billy", "I will not review the latest invoice.")]
+    )
+
+    assert ledger["candidates"] == []
+
+
+def test_conditional_strong_commitment_stays_in_review():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                8.0,
+                "Billy",
+                "If Xin agrees, I will review the latest invoice.",
+            )
+        ]
+    )
+
+    candidate = ledger["candidates"][0]
+    assert candidate["status"] == "review"
+    assert "conditional_or_hypothetical" in candidate["review_reasons"]
+
+
+def test_questioned_named_assignment_never_becomes_accepted():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                8.0,
+                "Alex",
+                "Do you think Billy will review the latest invoice?",
+            ),
+            _segment(9.0, 12.0, "Billy", "I am still checking the numbers."),
+        ]
+    )
+
+    candidate = ledger["candidates"][0]
+    assert candidate["status"] == "review"
+    assert candidate["owner"] == "Billy"
+    assert "owner_acceptance_unverified" in candidate["review_reasons"]

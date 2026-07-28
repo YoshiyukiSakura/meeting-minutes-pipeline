@@ -1,4 +1,4 @@
-from meeting_minutes.report import write_minutes, write_quality_report, write_review_queue
+from meeting_minutes.report import write_extractive_minutes, write_quality_report, write_review_queue
 
 
 def test_quality_report_counts_anonymous_speaker_labels(tmp_path):
@@ -74,7 +74,7 @@ def test_minutes_action_section_uses_only_the_action_ledger(tmp_path):
         ]
     }
 
-    write_minutes(path, segments=[keyword_only_segment], keyframes=[], metadata={}, action_ledger=ledger)
+    write_extractive_minutes(path, segments=[keyword_only_segment], keyframes=[], metadata={}, action_ledger=ledger)
     action_section = path.read_text(encoding="utf-8").split("## Action Items", maxsplit=1)[1].split("## Key Frames", maxsplit=1)[0]
 
     assert "I will set the MPC upgrade timing." in action_section
@@ -101,3 +101,27 @@ def test_review_queue_includes_action_candidates_that_need_review(tmp_path):
     assert "## Action Items Needing Review" in text
     assert "owner_unresolved, topic_unresolved" in text
     assert "I will handle it." in text
+
+
+def test_review_queue_includes_independently_recalled_action_intent(tmp_path):
+    path = tmp_path / "review_queue.md"
+    ledger = {
+        "intent_recall": {
+            "signals": [
+                {
+                    "start": 10.0,
+                    "end": 12.0,
+                    "cue_kind": "self_intent",
+                    "candidate_ids": [],
+                    "source_quote": "I want to create an issue for zero confirmation.",
+                }
+            ]
+        }
+    }
+
+    write_review_queue(path, [], action_ledger=ledger)
+
+    text = path.read_text(encoding="utf-8")
+    assert "## Independently Recalled Action Intent" in text
+    assert "unmatched_recall" in text
+    assert "I want to create an issue" in text

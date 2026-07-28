@@ -78,6 +78,7 @@ def transcribe_audio(audio_path: Path, *, model: str, language: str) -> tuple[li
         kwargs: dict[str, Any] = {
             "path_or_hf_repo": model,
             "verbose": False,
+            "word_timestamps": True,
         }
         if language and language.lower() not in {"auto", "detect"}:
             kwargs["language"] = language
@@ -86,13 +87,28 @@ def transcribe_audio(audio_path: Path, *, model: str, language: str) -> tuple[li
             **kwargs,
         )
     except TypeError:
-        kwargs = {"path_or_hf_repo": model}
+        # Older mlx-whisper releases may not accept ``verbose``. Keep word
+        # timings in the compatibility call because downstream diarization
+        # needs them to split mixed-speaker ASR chunks safely.
+        kwargs = {"path_or_hf_repo": model, "word_timestamps": True}
         if language and language.lower() not in {"auto", "detect"}:
             kwargs["language"] = language
-        result = mlx_whisper.transcribe(
-            str(audio_path),
-            **kwargs,
-        )
+        try:
+            result = mlx_whisper.transcribe(
+                str(audio_path),
+                **kwargs,
+            )
+        except TypeError:
+            # A legacy runtime without word-timestamp support can still
+            # produce a transcript. The splitter will preserve those raw
+            # segments rather than inventing a speaker boundary.
+            kwargs = {"path_or_hf_repo": model}
+            if language and language.lower() not in {"auto", "detect"}:
+                kwargs["language"] = language
+            result = mlx_whisper.transcribe(
+                str(audio_path),
+                **kwargs,
+            )
     except Exception as exc:  # pragma: no cover - model/runtime dependent
         return [], {
             "engine": "mlx-whisper",
@@ -131,6 +147,7 @@ def transcribe_audio(audio_path: Path, *, model: str, language: str) -> tuple[li
         )
 
     segments, dropped_short_repetitions = _dedupe_short_repetitions(segments)
+    timed_segments = sum(1 for segment in segments if segment.get("words"))
 
     return segments, {
         "engine": "mlx-whisper",
@@ -139,6 +156,7 @@ def transcribe_audio(audio_path: Path, *, model: str, language: str) -> tuple[li
         "status": "ok",
         "ffmpeg": ffmpeg_status,
         "segments": len(segments),
+        "segments_with_word_timestamps": timed_segments,
         "dropped_hallucinations": dropped_hallucinations,
         "dropped_short_repetitions": dropped_short_repetitions,
     }

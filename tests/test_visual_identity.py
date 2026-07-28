@@ -18,10 +18,12 @@ def _profile(tmp_path, *, people=True):
         "left": {
             "tile": [0.05, 0.08, 0.45, 0.75],
             "nameplate": [0.05, 0.65, 0.25, 0.75],
+            "active_signal": "highlight_border",
         },
         "right": {
             "tile": [0.55, 0.08, 0.95, 0.75],
             "nameplate": [0.55, 0.65, 0.75, 0.75],
+            "active_signal": "highlight_border",
         },
     }
     if people:
@@ -99,8 +101,32 @@ def test_profile_rejects_reviewed_slot_outside_participant_whitelist(tmp_path):
         load_visual_profile(path)
 
 
+def test_direct_profile_requires_explicit_active_signal(tmp_path):
+    path = tmp_path / "missing-signal-profile.json"
+    path.write_text(
+        json.dumps(
+            {
+                "settings": {"allow_direct_assignment": True},
+                "participants": ["Alice"],
+                "layouts": [
+                    {
+                        "name": "one",
+                        "slots": {"left": {"tile": [0.05, 0.08, 0.45, 0.75], "person": "Alice"}},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(VisualProfileError, match="active_signal is required"):
+        load_visual_profile(path)
+
+
 def test_visual_identity_uses_profiled_green_speaker_cue(tmp_path):
     profile = _profile(tmp_path)
+    profile["layouts"][0]["slots"]["left"]["active_signal"] = "green_speaker_cue"
+    profile["layouts"][0]["slots"]["right"]["active_signal"] = "green_speaker_cue"
     profile["layouts"][0]["slots"]["left"]["speaker_cue"] = (0.05, 0.66, 0.21, 0.93)
     profile["layouts"][0]["slots"]["right"]["speaker_cue"] = (0.55, 0.66, 0.71, 0.93)
     frame = tmp_path / "green-cue.jpg"
@@ -248,9 +274,8 @@ def test_visual_identity_assigns_only_consistent_active_evidence(tmp_path):
     assert len(segments[0]["frame_refs"]) == 2
 
 
-def test_visual_identity_accepts_two_of_three_samples_and_calculates_confidence(tmp_path):
+def test_visual_identity_accepts_two_active_samples_when_the_third_is_neutral(tmp_path):
     profile = _profile(tmp_path)
-    profile["settings"]["minimum_segment_vote_share"] = 0.66
     requests = build_segment_sample_requests([{"start": 2.0, "end": 5.2, "speaker": "Speaker 1", "text": "hello"}], profile, duration=30)
     frames = [
         {
@@ -267,7 +292,7 @@ def test_visual_identity_accepts_two_of_three_samples_and_calculates_confidence(
     summary = attach_visual_identity(segments, requests, scored, profile)
 
     matched_scores = [float(frame["score"]) for frame in scored if frame.get("active") and frame.get("name") == "Alice"]
-    expected = round(min(0.94, 0.62 + 0.16 * (2 / 3) + 0.22 * (sum(matched_scores) / len(matched_scores))), 3)
+    expected = round(min(0.94, 0.62 + 0.16 + 0.22 * (sum(matched_scores) / len(matched_scores))), 3)
     assert summary["assigned"] == 1
     assert segments[0]["name"] == "Alice"
     assert segments[0]["name_confidence"] == expected
@@ -346,7 +371,7 @@ def test_visual_identity_defaults_to_audit_only(tmp_path):
     assert segments[0]["name_source"] == "visual_identity_unvalidated_candidate"
 
 
-def test_visual_identity_preserves_voice_registry_identity(tmp_path):
+def test_visual_identity_direct_visual_evidence_overrides_voice_registry_identity(tmp_path):
     profile = _profile(tmp_path)
     requests = build_segment_sample_requests(
         [{"start": 2.0, "end": 2.8, "speaker": "Speaker 1", "text": "hello"}],
@@ -373,7 +398,45 @@ def test_visual_identity_preserves_voice_registry_identity(tmp_path):
 
     summary = attach_visual_identity(segments, requests, scored, profile)
 
-    assert summary["preserved_trusted_identity"] == 1
-    assert summary["conflicts"] == 1
+    assert summary["overridden_voice_registry"] == 1
+    assert summary["assigned"] == 1
+    assert segments[0]["name"] == "Bob"
+    assert segments[0]["name_source"] == "visual_active_speaker_highlight"
+    assert segments[0]["visual_identity_override"] == {
+        "reason": "direct_visual_evidence_overrides_voice_registry",
+        "previous_name": "Alice",
+        "previous_source": "voice_registry",
+        "previous_confidence": 0.8,
+        "visual_name": "Bob",
+    }
+
+
+def test_visual_identity_retains_voice_registry_without_active_visual_cue(tmp_path):
+    profile = _profile(tmp_path)
+    requests = build_segment_sample_requests(
+        [{"start": 2.0, "end": 2.8, "speaker": "Speaker 1", "text": "hello"}],
+        profile,
+        duration=30,
+    )
+    frames = [
+        {"time": request["video_time"], "actualTime": request["video_time"], "path": str(_frame(tmp_path, "inactive.jpg", None))}
+        for request in requests
+    ]
+    scored = score_visual_frames(frames, profile, resolve_slot_names(profile, []))
+    segments = [
+        {
+            "start": 2.0,
+            "end": 2.8,
+            "speaker": "Speaker 1",
+            "name": "Alice",
+            "name_source": "voice_registry",
+            "name_confidence": 0.8,
+            "text": "hello",
+        }
+    ]
+
+    summary = attach_visual_identity(segments, requests, scored, profile)
+
+    assert summary["preserved_voice_registry_without_visual"] == 1
     assert segments[0]["name"] == "Alice"
     assert segments[0]["name_source"] == "voice_registry"

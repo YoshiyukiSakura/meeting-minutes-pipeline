@@ -149,6 +149,10 @@ def load_visual_profile(path: Path) -> dict[str, Any]:
                     f"layouts[{index}].slots.{label}.active_signal must be green_speaker_cue, "
                     "green_highlight_border, or highlight_border"
                 )
+            if settings["allow_direct_assignment"] and signal is None:
+                raise VisualProfileError(
+                    f"layouts[{index}].slots.{label}.active_signal is required when direct assignment is enabled"
+                )
             if signal == "green_speaker_cue" and slots[label]["speaker_cue"] is None:
                 raise VisualProfileError(
                     f"layouts[{index}].slots.{label}.speaker_cue is required for active_signal=green_speaker_cue"
@@ -406,7 +410,35 @@ def score_visual_frames(
     return records
 
 
-_TRUSTED_SOURCES = {"voice_enrollment", "voice_registry", "participant_map", "user_confirmed_speaker_volume_mapping"}
+_TRUSTED_SOURCES = {
+    "voice_enrollment",
+    "voice_registry",
+    "participant_map",
+    "user_confirmed_speaker_volume_mapping",
+    "manual_review",
+    "human_review",
+}
+_REVIEWED_SOURCE_PREFIXES = ("reviewed_", "manual_", "user_confirmed_")
+
+
+def has_trusted_identity(segment: dict[str, Any]) -> bool:
+    """Return whether a reviewed, enrolled, or registry identity must not be replaced by weaker visual evidence."""
+
+    source = str(segment.get("name_source") or "")
+    return bool(segment.get("name")) and (
+        source in _TRUSTED_SOURCES or source.startswith(_REVIEWED_SOURCE_PREFIXES)
+    )
+
+
+def has_direct_visual_authority_identity(segment: dict[str, Any]) -> bool:
+    """Return whether a direct active-speaker cue must defer to a human-reviewed identity.
+
+    A calibrated profile combines a stable reviewed slot with a same-time speaker cue.
+    That is stronger than cross-recording voice-registry inference, but not stronger
+    than a direct human map or explicitly reviewed enrollment.
+    """
+
+    return str(segment.get("name_source") or "") != "voice_registry" and has_trusted_identity(segment)
 
 
 def attach_visual_identity(
@@ -427,6 +459,9 @@ def attach_visual_identity(
         "unresolved": 0,
         "conflicts": 0,
         "preserved_trusted_identity": 0,
+        "overridden_voice_registry": 0,
+        "preserved_voice_registry_without_visual": 0,
+        "corroborated_voice_registry": 0,
         "unvalidated_candidates": 0,
         "assignment_mode": "direct" if profile["settings"]["allow_direct_assignment"] else "audit_only",
         "by_source": Counter(),
@@ -459,7 +494,8 @@ def attach_visual_identity(
             segment["visual_identity_evidence"] = evidence
         existing_source = str(segment.get("name_source") or "")
         existing_name = segment.get("name")
-        trusted = existing_name and existing_source in _TRUSTED_SOURCES and float(segment.get("name_confidence", 0.0)) >= 0.6
+        registry_identity = bool(existing_name) and existing_source == "voice_registry"
+        trusted = has_direct_visual_authority_identity(segment)
         if trusted:
             summary["preserved_trusted_identity"] += 1
             if votes and any(name != existing_name for name in votes):
@@ -480,6 +516,11 @@ def attach_visual_identity(
             summary["by_reason"]["multiple_active_names_in_segment"] += 1
             continue
         if not votes:
+            if registry_identity:
+                # A registry label remains useful when this UI frame has no active-speaker cue.
+                # It is not, however, allowed to veto direct visual evidence in another segment.
+                summary["preserved_voice_registry_without_visual"] += 1
+                continue
             segment["name"] = None
             segment["name_source"] = "visual_identity_unresolved"
             segment["name_confidence"] = 0.0
@@ -497,7 +538,12 @@ def attach_visual_identity(
             summary["unvalidated_candidates"] += 1
             summary["by_reason"]["direct_visual_assignment_disabled"] += 1
             continue
-        vote_share = count / len(sample_frames) if sample_frames else 0.0
+        # An inactive sample frame is not contradictory identity evidence. In
+        # call UIs the highlight can lag a spoken word or briefly disappear,
+        # so consensus is measured among frames that actually resolve a named
+        # active speaker. The separate required-count gate still demands
+        # repeated evidence for longer utterances.
+        vote_share = count / len(named_frames) if named_frames else 0.0
         segment_duration = float(segment["end"]) - float(segment["start"])
         required_count = 1 if segment_duration <= short_seconds else min(2, len(sample_frames))
         matched_frames = [frame for frame in named_frames if frame.get("name") == name]
@@ -511,6 +557,19 @@ def attach_visual_identity(
             summary["by_reason"]["insufficient_visual_consensus"] += 1
             continue
         confidence = min(0.94, 0.62 + 0.16 * vote_share + 0.22 * average_score)
+        if registry_identity:
+            if existing_name == name:
+                summary["corroborated_voice_registry"] += 1
+            else:
+                segment["visual_identity_override"] = {
+                    "reason": "direct_visual_evidence_overrides_voice_registry",
+                    "previous_name": existing_name,
+                    "previous_source": existing_source,
+                    "previous_confidence": segment.get("name_confidence"),
+                    "visual_name": name,
+                }
+                summary["overridden_voice_registry"] += 1
+                summary["by_reason"]["direct_visual_evidence_overrides_voice_registry"] += 1
         segment["name"] = name
         segment["name_source"] = "visual_active_speaker_highlight"
         segment["name_confidence"] = round(confidence, 3)
@@ -549,6 +608,27 @@ def write_visual_identity_report(
         lines.append(
             f"- `{label}`: {item.get('name') or 'unresolved'} source={item.get('source')} observations={item.get('observations', 0)} share={float(item.get('share', 0.0)):.2f} candidates={candidates}"
         )
+    lines += ["", "## Active Signal Diagnostics"]
+    for layout in profile["layouts"]:
+        layout_name = str(layout["name"])
+        layout_frames = [record for record in scored_frames if record.get("layout") == layout_name]
+        for slot_name, slot in sorted(layout["slots"].items()):
+            values = [float(record.get("scores", {}).get(slot_name, 0.0)) for record in layout_frames]
+            nonzero = sum(value > 0.0 for value in values)
+            active = sum(
+                1
+                for record in layout_frames
+                if record.get("active") and record.get("slot") == slot_name
+            )
+            maximum = max(values, default=0.0)
+            average = sum(values) / len(values) if values else 0.0
+            signal = slot.get("active_signal") or (
+                "green_speaker_cue" if slot.get("speaker_cue") else "highlight_border"
+            )
+            lines.append(
+                f"- `{layout_name}::{slot_name}`: signal={signal} frames={len(values)} nonzero={nonzero} "
+                f"max_score={maximum:.4f} mean_score={average:.4f} active_frames={active}"
+            )
     lines += [
         "",
         "## Segment Results",
@@ -556,6 +636,9 @@ def write_visual_identity_report(
         f"- Unresolved segments: {summary['unresolved']}",
         f"- Visual or trusted-identity conflicts: {summary['conflicts']}",
         f"- Preserved enrollment or reviewed-map identities: {summary['preserved_trusted_identity']}",
+        f"- Direct visual corrections of voice-registry identities: {summary['overridden_voice_registry']}",
+        f"- Voice-registry identities retained without an active visual cue: {summary['preserved_voice_registry_without_visual']}",
+        f"- Voice-registry identities corroborated by direct visual evidence: {summary['corroborated_voice_registry']}",
         f"- Unvalidated visual candidates retained for audit only: {summary['unvalidated_candidates']}",
         "",
         "## Limits",

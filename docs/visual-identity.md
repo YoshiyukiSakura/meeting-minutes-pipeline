@@ -25,6 +25,7 @@ A profile has non-overlapping time-bounded layouts. Every coordinate is normaliz
       "slots": {
         "slot_1": {
           "tile": [0.633, 0.12, 0.844, 0.262],
+          "active_signal": "green_highlight_border",
           "nameplate": [0.638, 0.212, 0.81, 0.261]
         }
       }
@@ -35,6 +36,7 @@ A profile has non-overlapping time-bounded layouts. Every coordinate is normaliz
 
 - `participants` is strongly recommended. It is a local whitelist for resolving small OCR mistakes such as `Wiliam` to `William`. Without it, OCR output is retained only as a candidate.
 - A slot may use `person` instead of `nameplate` only after a reviewer has calibrated that slot to a named participant.
+- `active_signal` is one of `green_highlight_border`, `green_speaker_cue`, or `highlight_border`. When direct visual assignment is enabled, every slot must declare it explicitly; the pipeline rejects a profile that would otherwise silently fall back to a generic scorer.
 - A layout is never applied before `start`, after `end`, or across an overlapping layout window.
 - `allow_direct_assignment` defaults to `false`. Enable it only after a reviewed sample shows that the UI cue tracks active speech rather than presenter, focus, or another tile state.
 
