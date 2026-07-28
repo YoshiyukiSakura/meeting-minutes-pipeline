@@ -840,6 +840,10 @@ def test_publish_minutes_binds_reviewed_context_evidence_to_current_transcript_a
     write_json(tmp_path / "transcript.json", transcript)
     write_json(tmp_path / "action_items.json", ledger)
     write_json(tmp_path / "metadata.json", {"duration": 60.0})
+    write_json(
+        tmp_path / "summary_status.json",
+        {"status": "reviewed_draft", "actions": 7, "project_updates": 0},
+    )
 
     args = SimpleNamespace(
         output_dir=tmp_path,
@@ -855,6 +859,11 @@ def test_publish_minutes_binds_reviewed_context_evidence_to_current_transcript_a
     assert publish_status["transcript_sha256"] == transcript_fingerprint(transcript)
     assert publish_status["action_ledger_sha256"] == action_ledger_fingerprint(ledger)
     assert publish_status["action_evidence_sha256"]
+    summary_status = read_json(tmp_path / "summary_status.json")
+    assert summary_status["status"] == "published"
+    assert summary_status["actions"] == 1
+    assert summary_status["project_updates"] == 0
+    assert summary_status["publication"]["format"] == "meeting-minutes/shareable-minutes-v4"
 
 
 def test_publish_minutes_rejects_a_duration_that_disagrees_with_metadata(tmp_path, capsys):

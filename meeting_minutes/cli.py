@@ -2245,6 +2245,26 @@ def publish_minutes_file(args: argparse.Namespace) -> int:
         "project_evidence_bound": bool(project_evidence_sha256),
     }
     write_json(run_status_path, {**run_status, "statuses": statuses})
+    summary_status_path = output_dir / "summary_status.json"
+    if summary_status_path.is_file():
+        try:
+            summary_status = read_json(summary_status_path)
+        except (OSError, ValueError):
+            summary_status = None
+        if isinstance(summary_status, dict):
+            write_json(
+                summary_status_path,
+                {
+                    **summary_status,
+                    "status": "published",
+                    "actions": len(rows),
+                    "project_updates": len(project_rows),
+                    "publication": {
+                        "format": publish_status["format"],
+                        "languages": publish_status["languages"],
+                    },
+                },
+            )
     print(str(destinations["zh"]))
     print(str(destinations["en"]))
     return 0
