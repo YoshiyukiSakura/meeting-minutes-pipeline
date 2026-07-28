@@ -1,4 +1,5 @@
 import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -78,3 +79,63 @@ def test_run_cmd_wraps_timeout(monkeypatch):
 
     with pytest.raises(media.PipelineError, match="timed out after 5s: slow-tool"):
         media.run_cmd(["slow-tool"], timeout=5)
+
+
+def test_ocr_frames_filters_malformed_records_without_rewriting_raw_manifest(monkeypatch, tmp_path):
+    payloads: list[tuple[Path, list[dict]]] = []
+
+    def fake_run(args, **_kwargs):
+        payload_path = Path(args[-1])
+        payloads.append((payload_path, media.json.loads(payload_path.read_text(encoding="utf-8"))))
+        return SimpleNamespace(stdout="[]")
+
+    monkeypatch.setattr(media, "run_cmd", fake_run)
+    frames = [
+        {"time": 1.0, "actualTime": 0.99, "path": "/tmp/valid.jpg"},
+        {"time": 2.0, "error": "AVFoundation Cannot Open"},
+        {"time": "3.0", "actualTime": 3.0, "path": "/tmp/string-time.jpg"},
+        {"time": True, "actualTime": 4.0, "path": "/tmp/bool-time.jpg"},
+        {"time": 5.0, "actualTime": float("nan"), "path": "/tmp/nonfinite.jpg"},
+    ]
+
+    with pytest.warns(RuntimeWarning, match="AVFoundation Cannot Open"):
+        assert media.ocr_frames(frames, tmp_path) == []
+
+    payload_path, payload = payloads[0]
+    assert payload == [{"time": 1.0, "actualTime": 0.99, "path": "/tmp/valid.jpg"}]
+    assert not payload_path.exists()
+    assert media.json.loads((tmp_path / "frames_for_ocr.json").read_text(encoding="utf-8"))[1]["error"] == "AVFoundation Cannot Open"
+    diagnostics = media.ocr_manifest_diagnostics(tmp_path)
+    assert diagnostics["status"] == "ok"
+    assert diagnostics["accepted_records"] == 1
+    assert diagnostics["dropped_record_count"] == 4
+    assert diagnostics["dropped_records"][0] == {
+        "index": 1,
+        "reason": "invalid_actual_time",
+        "time": 2.0,
+        "error": "AVFoundation Cannot Open",
+    }
+
+
+def test_ocr_frames_fails_distinctly_when_no_valid_records(monkeypatch, tmp_path):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(media, "run_cmd", lambda args, **_kwargs: commands.append(args))
+
+    with pytest.raises(media.PipelineError, match="all 1 frame records were malformed"):
+        media.ocr_frames([{"time": 1.0, "error": "Cannot Open"}], tmp_path)
+
+    assert commands == []
+    diagnostics = media.ocr_manifest_diagnostics(tmp_path)
+    assert diagnostics["status"] == "all_records_invalid"
+    assert diagnostics["dropped_record_count"] == 1
+
+
+def test_ocr_frames_fails_distinctly_when_no_frames_were_extracted(monkeypatch, tmp_path):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(media, "run_cmd", lambda args, **_kwargs: commands.append(args))
+
+    with pytest.raises(media.PipelineError, match="no frames extracted"):
+        media.ocr_frames([], tmp_path)
+
+    assert commands == []
+    assert media.ocr_manifest_diagnostics(tmp_path)["status"] == "no_frames_extracted"

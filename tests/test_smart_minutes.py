@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 
+import meeting_minutes.smart_minutes as smart_minutes
 from meeting_minutes.deepseek import DeepSeekConfig
 from meeting_minutes.minutes_contract import validate_bilingual_minutes
 from meeting_minutes.smart_minutes import (
@@ -64,6 +65,23 @@ def _segments() -> list[dict]:
             "text": "We also need merge request visibility in GitLab.",
         },
     ]
+
+
+def _action_scout_chunk_records(count: int = 8) -> list[dict]:
+    return canonical_transcript_records(
+        [
+            {
+                "id": f"action-scout-{index}",
+                "start": float(index * 10),
+                "end": float(index * 10 + 8),
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": f"Technical discussion record {index}.",
+            }
+            for index in range(count)
+        ]
+    )
 
 
 def _minutes_payload(segment_ids: list[str]) -> dict:
@@ -218,6 +236,34 @@ def _action_scout(records: list[dict]) -> dict:
 
 def _implicit_follow_up_scout() -> dict:
     return {"judgments": []}
+
+
+def _negative_implicit_judgment(hint_index: int) -> dict:
+    return {
+        "hint_index": hint_index,
+        "qualifies": False,
+        "owner": "",
+        "item": "",
+        "segment_ids": [],
+        "reason": "The supplied context does not establish an owned follow-up.",
+    }
+
+
+def _two_follow_up_hints(records: list[dict]) -> list[dict]:
+    return [
+        {
+            "anchor_segment_id": records[0]["segment_id"],
+            "anchor_speaker": "Billy",
+            "signals": {"strong_local_signal": False},
+            "context": [records[0]],
+        },
+        {
+            "anchor_segment_id": records[1]["segment_id"],
+            "anchor_speaker": "Billy",
+            "signals": {"strong_local_signal": False},
+            "context": [records[1]],
+        },
+    ]
 
 
 def _theme_outline(records: list[dict]) -> dict:
@@ -667,6 +713,109 @@ def test_theme_chunk_normalization_trims_short_overlap_and_misplaced_anchor():
     ]
 
 
+def test_theme_chunk_normalization_partitions_large_crossing_overlap():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": f"crossing-overlap-{index}",
+                "start": float(index * 40),
+                "end": float(index * 40 + 30),
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": f"Discussion section {index}.",
+            }
+            for index in range(6)
+        ]
+    )
+    chunk = transcript_record_chunks(
+        records,
+        target_chars=100_000,
+        hard_chars=120_000,
+        overlap_records=0,
+    )[0]
+    payload = {
+        "chunk_index": 1,
+        "read_marker": {
+            "record_count": len(records),
+            "last_segment_id": records[-1]["segment_id"],
+        },
+        "topics": [
+            {
+                "title": "Earlier topic",
+                "summary": "The earlier discussion begins first.",
+                "importance": "substantive",
+                "start_segment_id": records[0]["segment_id"],
+                "end_segment_id": records[3]["segment_id"],
+                "anchor_segment_ids": [records[0]["segment_id"]],
+            },
+            {
+                "title": "Later topic",
+                "summary": "The later discussion overlaps then continues.",
+                "importance": "substantive",
+                "start_segment_id": records[2]["segment_id"],
+                "end_segment_id": records[5]["segment_id"],
+                "anchor_segment_ids": [records[2]["segment_id"]],
+            },
+        ],
+    }
+
+    normalized, changes = normalize_theme_chunk_coverage(
+        payload,
+        chunk=chunk,
+        transcript_records=records,
+    )
+    topics, errors = validate_theme_chunk(
+        normalized,
+        chunk=chunk,
+        transcript_records=records,
+    )
+
+    assert errors == []
+    assert topics is not None
+    assert normalized["topics"][0]["end_segment_id"] == records[1]["segment_id"]
+    assert changes == ["partitioned_crossing_overlap_before:2"]
+
+
+def test_theme_chunk_topology_fallback_covers_the_full_core_range():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": f"fallback-topic-{index}",
+                "start": float(index * 20),
+                "end": float(index * 20 + 10),
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": f"Discussion section {index}." + (" detail" * index),
+            }
+            for index in range(6)
+        ]
+    )
+    chunk = transcript_record_chunks(
+        records,
+        target_chars=100_000,
+        hard_chars=120_000,
+        overlap_records=0,
+    )[0]
+
+    fallback = smart_minutes._fallback_theme_chunk_payload(
+        chunk=chunk,
+        transcript_records=records,
+    )
+    topics, errors = validate_theme_chunk(
+        fallback,
+        chunk=chunk,
+        transcript_records=records,
+    )
+
+    assert errors == []
+    assert topics is not None
+    assert fallback["topics"][0]["title"] == "Operational discussion"
+    assert fallback["topics"][0]["start_segment_id"] == records[0]["segment_id"]
+    assert fallback["topics"][0]["end_segment_id"] == records[-1]["segment_id"]
+
+
 def test_theme_chunk_normalization_expands_into_uncovered_anchor_gap():
     records = canonical_transcript_records(
         [
@@ -912,7 +1061,7 @@ def test_theme_chunk_normalization_merges_equal_ranges_and_deduplicates_anchors(
     assert changes == ["merged_nested_topics:1:2"]
 
 
-def test_theme_chunk_normalization_keeps_long_partial_overlap_invalid():
+def test_theme_chunk_normalization_partitions_long_partial_overlap():
     records = canonical_transcript_records(
         [
             {
@@ -970,9 +1119,10 @@ def test_theme_chunk_normalization_keeps_long_partial_overlap_invalid():
         transcript_records=records,
     )
 
-    assert topics is None
-    assert errors == ["theme_chunk:1:topics_overlap"]
-    assert changes == []
+    assert errors == []
+    assert topics is not None
+    assert normalized["topics"][0]["end_segment_id"] == records[2]["segment_id"]
+    assert changes == ["partitioned_crossing_overlap_before:2"]
 
 
 def test_theme_chunk_normalization_folds_gap_when_topic_limit_is_reached():
@@ -1151,6 +1301,156 @@ def test_theme_merge_consumes_every_candidate_and_rejects_omitted_tail():
         min_theme_count=1,
         max_theme_count=2,
     )[1]["content"]
+
+
+def test_theme_reduction_relaxes_only_intermediate_long_meeting_span():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "short-local-topic",
+                "start": 120.0,
+                "end": 170.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "A short local topic that still needs global merging.",
+            },
+            {
+                "id": "meeting-tail",
+                "start": 4500.0,
+                "end": 4510.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "Later meeting evidence establishes a long meeting duration.",
+            },
+        ]
+    )
+    candidate = {
+        "candidate_index": 1,
+        "chunk_index": 1,
+        "local_topic_index": 1,
+        "title": "Short local topic",
+        "summary": "A compact intermediate topic.",
+        "importance": "substantive",
+        "start_segment_id": records[0]["segment_id"],
+        "end_segment_id": records[0]["segment_id"],
+        "anchor_segment_ids": [records[0]["segment_id"]],
+        "start_position": 0,
+        "end_position": 0,
+        "start": records[0]["start"],
+        "end": records[0]["end"],
+    }
+    payload = {
+        "read_marker": {"candidate_count": 1, "last_candidate_index": 1},
+        "themes": [
+            {
+                "title": "Short local topic",
+                "start_segment_id": records[0]["segment_id"],
+                "end_segment_id": records[0]["segment_id"],
+                "anchor_segment_ids": [records[0]["segment_id"]],
+                "boundary_reason": "This is an intermediate local candidate.",
+                "source_candidate_indexes": [1],
+            }
+        ],
+    }
+
+    strict_outline, strict_errors = validate_theme_merge(
+        payload,
+        candidates=[candidate],
+        transcript_records=records,
+        min_theme_count=1,
+        max_theme_count=1,
+        require_meeting_edge_coverage=False,
+    )
+    relaxed_outline, relaxed_errors = validate_theme_merge(
+        payload,
+        candidates=[candidate],
+        transcript_records=records,
+        min_theme_count=1,
+        max_theme_count=1,
+        require_meeting_edge_coverage=False,
+        enforce_min_long_theme_span=False,
+    )
+
+    assert strict_outline is None
+    assert strict_errors == ["theme_outline:1:span_too_short"]
+    assert relaxed_errors == []
+    assert relaxed_outline is not None
+
+
+def test_theme_candidate_reduction_accepts_short_intermediate_macro_topic(
+    monkeypatch,
+):
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "short-reduction-topic",
+                "start": 120.0,
+                "end": 170.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "A short local topic that should remain an intermediate candidate.",
+            },
+            {
+                "id": "reduction-tail",
+                "start": 4500.0,
+                "end": 4510.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "Long meeting tail.",
+            },
+        ]
+    )
+    candidate = {
+        "candidate_index": 1,
+        "chunk_index": 1,
+        "local_topic_index": 1,
+        "title": "Short intermediate topic",
+        "summary": "A compact local candidate.",
+        "importance": "substantive",
+        "start_segment_id": records[0]["segment_id"],
+        "end_segment_id": records[0]["segment_id"],
+        "anchor_segment_ids": [records[0]["segment_id"]],
+        "start_position": 0,
+        "end_position": 0,
+        "start": records[0]["start"],
+        "end": records[0]["end"],
+    }
+    response = {
+        "read_marker": {"candidate_count": 1, "last_candidate_index": 1},
+        "themes": [
+            {
+                "title": "Short intermediate topic",
+                "start_segment_id": records[0]["segment_id"],
+                "end_segment_id": records[0]["segment_id"],
+                "anchor_segment_ids": [records[0]["segment_id"]],
+                "boundary_reason": "Preserve the local topic for the global merge.",
+                "source_candidate_indexes": [1],
+            }
+        ],
+    }
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+    macro_candidates, reduced_themes, status = (
+        smart_minutes._run_theme_candidate_reductions(
+            candidates=[candidate],
+            records=records,
+            config=DeepSeekConfig(model="test-model"),
+            cache={"theme_outline_reductions": []},
+            save_checkpoint=lambda: None,
+        )
+    )
+
+    assert status["status"] == "ok"
+    assert macro_candidates is not None
+    assert len(macro_candidates) == 1
+    assert len(reduced_themes) == 1
 
 
 def test_long_meeting_theme_count_range_and_compact_evidence_packet():
@@ -1405,6 +1705,465 @@ def test_hierarchical_long_meeting_never_sends_full_transcript_and_resumes(
 
     assert resumed is not None
     assert resumed_status["status"] == "reviewed_draft"
+
+
+def test_hierarchical_action_scout_recovers_truncated_json_and_resumes(monkeypatch):
+    records = _action_scout_chunk_records()
+    chunk = transcript_record_chunks(
+        records,
+        target_chars=100_000,
+        hard_chars=120_000,
+        overlap_records=0,
+    )[0]
+    cache = {
+        "action_scout_chunks": [],
+        "action_scout": None,
+        "last_rejected_action_scout_chunk": None,
+    }
+    checkpoints: list[dict] = []
+    requests: list[list[str]] = []
+
+    monkeypatch.setattr(
+        smart_minutes,
+        "ACTION_SCOUT_TRUNCATION_SPLIT_MIN_RECORDS",
+        1,
+    )
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        transcript = json.loads(messages[1]["content"])["transcript"]
+        requests.append([record["segment_id"] for record in transcript])
+        if len(transcript) == len(records):
+            return None, {
+                "status": "invalid_model_json",
+                "starts_with_object": True,
+                "ends_with_object": False,
+            }
+        return {"actions": []}, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+    actions, status = smart_minutes._run_hierarchical_action_scout(
+        records=records,
+        chunks=[chunk],
+        required_action_groups=[],
+        follow_up_hints=[],
+        intent_recall_hints=[],
+        config=DeepSeekConfig(model="test-model"),
+        cache=cache,
+        save_checkpoint=lambda: checkpoints.append(copy.deepcopy(cache)),
+    )
+
+    assert actions == []
+    assert status["status"] == "ok"
+    assert len(requests) == 3
+    assert requests[0] == [record["segment_id"] for record in records]
+    assert not set(requests[1]).intersection(requests[2])
+    assert requests[1] + requests[2] == requests[0]
+    entry = cache["action_scout_chunks"][0]
+    assert entry["split"]["initial_truncation"]["status"] == "invalid_model_json"
+    assert entry["status"]["status"] == "recovered_after_truncation"
+    assert checkpoints
+
+    def unexpected_request(**kwargs):
+        raise AssertionError("recovered action-scout chunk should resume from cache")
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", unexpected_request)
+    resumed_actions, resumed_status = smart_minutes._run_hierarchical_action_scout(
+        records=records,
+        chunks=[chunk],
+        required_action_groups=[],
+        follow_up_hints=[],
+        intent_recall_hints=[],
+        config=DeepSeekConfig(model="test-model"),
+        cache=cache,
+        save_checkpoint=lambda: None,
+    )
+
+    assert resumed_actions == []
+    assert resumed_status["status"] == "cached"
+
+
+def test_hierarchical_action_scout_does_not_split_generic_invalid_json(monkeypatch):
+    records = _action_scout_chunk_records()
+    chunk = transcript_record_chunks(
+        records,
+        target_chars=100_000,
+        hard_chars=120_000,
+        overlap_records=0,
+    )[0]
+    cache = {
+        "action_scout_chunks": [],
+        "action_scout": None,
+        "last_rejected_action_scout_chunk": None,
+    }
+    calls = 0
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        nonlocal calls
+        calls += 1
+        return None, {
+            "status": "invalid_model_json",
+            "starts_with_object": True,
+            "ends_with_object": True,
+        }
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+    actions, status = smart_minutes._run_hierarchical_action_scout(
+        records=records,
+        chunks=[chunk],
+        required_action_groups=[],
+        follow_up_hints=[],
+        intent_recall_hints=[],
+        config=DeepSeekConfig(model="test-model"),
+        cache=cache,
+        save_checkpoint=lambda: None,
+    )
+
+    assert actions is None
+    assert status["status"] == "action_scout_failed"
+    assert calls == 1
+    assert "split" not in cache["action_scout_chunks"][0]
+
+
+def test_hierarchical_action_scout_stops_at_bounded_truncation_depth(monkeypatch):
+    records = _action_scout_chunk_records()
+    chunk = transcript_record_chunks(
+        records,
+        target_chars=100_000,
+        hard_chars=120_000,
+        overlap_records=0,
+    )[0]
+    cache = {
+        "action_scout_chunks": [],
+        "action_scout": None,
+        "last_rejected_action_scout_chunk": None,
+    }
+
+    monkeypatch.setattr(
+        smart_minutes,
+        "ACTION_SCOUT_TRUNCATION_SPLIT_MIN_RECORDS",
+        1,
+    )
+    monkeypatch.setattr(
+        smart_minutes,
+        "ACTION_SCOUT_TRUNCATION_SPLIT_MAX_DEPTH",
+        1,
+    )
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return None, {
+            "status": "invalid_model_json",
+            "starts_with_object": True,
+            "ends_with_object": False,
+        }
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+    actions, status = smart_minutes._run_hierarchical_action_scout(
+        records=records,
+        chunks=[chunk],
+        required_action_groups=[],
+        follow_up_hints=[],
+        intent_recall_hints=[],
+        config=DeepSeekConfig(model="test-model"),
+        cache=cache,
+        save_checkpoint=lambda: None,
+    )
+
+    assert actions is None
+    assert status["status"] == "action_scout_truncation_unresolved"
+    assert status["depth"] == 1
+
+
+def test_hierarchical_action_scout_rejects_evidence_outside_child_chunk(monkeypatch):
+    records = _action_scout_chunk_records()
+    chunk = transcript_record_chunks(
+        records,
+        target_chars=100_000,
+        hard_chars=120_000,
+        overlap_records=0,
+    )[0]
+    cache = {
+        "action_scout_chunks": [],
+        "action_scout": None,
+        "last_rejected_action_scout_chunk": None,
+    }
+    calls = 0
+
+    monkeypatch.setattr(
+        smart_minutes,
+        "ACTION_SCOUT_TRUNCATION_SPLIT_MIN_RECORDS",
+        1,
+    )
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None, {
+                "status": "invalid_model_json",
+                "starts_with_object": True,
+                "ends_with_object": False,
+            }
+        return {
+            "actions": [
+                {
+                    "owner": "Billy",
+                    "item": "在子片段外引用的事项。",
+                    "segment_ids": [records[-1]["segment_id"]],
+                    "basis": "self_commitment",
+                }
+            ]
+        }, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+    actions, status = smart_minutes._run_hierarchical_action_scout(
+        records=records,
+        chunks=[chunk],
+        required_action_groups=[],
+        follow_up_hints=[],
+        intent_recall_hints=[],
+        config=DeepSeekConfig(model="test-model"),
+        cache=cache,
+        save_checkpoint=lambda: None,
+    )
+
+    assert actions is None
+    assert status["status"] == "action_scout_invalid"
+    assert any("evidence_unknown" in error for error in status["errors"])
+
+
+def test_hierarchical_action_scout_drops_post_repair_owner_evidence_mismatch(
+    monkeypatch,
+):
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "owner-billy",
+                "start": 0.0,
+                "end": 10.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "We discussed the deployment plan.",
+            },
+            {
+                "id": "owner-xin",
+                "start": 12.0,
+                "end": 22.0,
+                "speaker": "Speaker 2",
+                "name": "Xin",
+                "name_confidence": 0.95,
+                "text": "I will update the deployment configuration.",
+            },
+        ]
+    )
+    chunk = transcript_record_chunks(
+        records,
+        target_chars=100_000,
+        hard_chars=120_000,
+        overlap_records=0,
+    )[0]
+    cache = {
+        "action_scout_chunks": [],
+        "action_scout": None,
+        "last_rejected_action_scout_chunk": None,
+    }
+    invalid = {
+        "actions": [
+            {
+                "owner": "Billy",
+                "item": "更新部署配置。",
+                "segment_ids": [records[1]["segment_id"]],
+                "basis": "self_commitment",
+            }
+        ]
+    }
+    responses = [invalid, invalid]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+    actions, status = smart_minutes._run_hierarchical_action_scout(
+        records=records,
+        chunks=[chunk],
+        required_action_groups=[],
+        follow_up_hints=[],
+        intent_recall_hints=[],
+        config=DeepSeekConfig(model="test-model"),
+        cache=cache,
+        save_checkpoint=lambda: None,
+    )
+
+    assert actions == []
+    assert status["status"] == "ok"
+    entry = cache["action_scout_chunks"][0]
+    drop = entry["status"]["deterministic_owner_evidence_drop"]
+    assert drop["dropped_action_count"] == 1
+    assert drop["dropped_actions"] == [
+        {
+            "original_position": 1,
+            "owner": "Billy",
+            "evidence_speakers": ["Xin"],
+            "validation_error": "action_scout:1:owner_evidence_mismatch",
+        }
+    ]
+    assert entry["payload"] == {"actions": []}
+
+
+def test_action_scout_owner_evidence_drop_is_bounded():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": f"bounded-{index}",
+                "start": float(index * 10),
+                "end": float(index * 10 + 8),
+                "speaker": "Speaker 1",
+                "name": "Xin",
+                "name_confidence": 0.95,
+                "text": f"I will update item {index}.",
+            }
+            for index in range(3)
+        ]
+    )
+    payload = {
+        "actions": [
+            {
+                "owner": "Billy",
+                "item": f"错误归属事项 {index}",
+                "segment_ids": [records[index]["segment_id"]],
+                "basis": "self_commitment",
+            }
+            for index in range(3)
+        ]
+    }
+
+    recovered, actions, status = (
+        smart_minutes._drop_deterministically_mismatched_action_scout_actions(
+            payload=payload,
+            validation_errors=[
+                f"action_scout:{index}:owner_evidence_mismatch"
+                for index in range(1, 4)
+            ],
+            transcript_records=records,
+            required_action_groups=[],
+        )
+    )
+
+    assert recovered is None
+    assert actions is None
+    assert status["status"] == "owner_evidence_drop_threshold_exceeded"
+
+
+def test_hierarchical_action_scout_persists_owner_drop_failure_details(monkeypatch):
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "threshold-billy",
+                "start": 0.0,
+                "end": 8.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "We reviewed the deployment work.",
+            },
+            *[
+                {
+                    "id": f"threshold-xin-{index}",
+                    "start": float(10 + index * 10),
+                    "end": float(18 + index * 10),
+                    "speaker": "Speaker 2",
+                    "name": "Xin",
+                    "name_confidence": 0.95,
+                    "text": f"I will update deployment item {index}.",
+                }
+                for index in range(3)
+            ],
+        ]
+    )
+    chunk = transcript_record_chunks(
+        records,
+        target_chars=100_000,
+        hard_chars=120_000,
+        overlap_records=0,
+    )[0]
+    cache = {
+        "action_scout_chunks": [],
+        "action_scout": None,
+        "last_rejected_action_scout_chunk": None,
+    }
+    invalid = {
+        "actions": [
+            {
+                "owner": "Billy",
+                "item": f"错误归属事项 {index}",
+                "segment_ids": [records[index + 1]["segment_id"]],
+                "basis": "self_commitment",
+            }
+            for index in range(3)
+        ]
+    }
+    responses = [invalid, invalid]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+    actions, status = smart_minutes._run_hierarchical_action_scout(
+        records=records,
+        chunks=[chunk],
+        required_action_groups=[],
+        follow_up_hints=[],
+        intent_recall_hints=[],
+        config=DeepSeekConfig(model="test-model"),
+        cache=cache,
+        save_checkpoint=lambda: None,
+    )
+
+    assert actions is None
+    assert status["status"] == "action_scout_invalid"
+    rejected = cache["action_scout_chunks"][0]["rejected"]
+    assert rejected["owner_evidence_drop"]["status"] == (
+        "owner_evidence_drop_threshold_exceeded"
+    )
+    assert rejected["owner_evidence_drop"]["mismatched_action_positions"] == [1, 2, 3]
+    assert rejected["payload"] == invalid
+
+
+def test_action_scout_chunk_merge_is_deterministic_deduplicated_and_capped():
+    records = _action_scout_chunk_records(28)
+    actions = [
+        {
+            "owner": "Billy",
+            "item": f"行动 {index}",
+            "segment_ids": [records[index]["segment_id"]],
+            "basis": "self_commitment",
+        }
+        for index in range(26)
+    ]
+    actions.append(
+        {
+            "owner": "Billy",
+            "item": "行动 0",
+            "segment_ids": [records[26]["segment_id"]],
+            "basis": "self_commitment",
+        }
+    )
+
+    merged = smart_minutes._deduplicate_chunk_actions(
+        actions,
+        transcript_records=records,
+        required_action_groups=[],
+    )
+
+    assert len(merged) == MAX_ACTION_SCOUT_ACTIONS
+    assert [action["item"] for action in merged] == [
+        f"行动 {index}"
+        for index in range(MAX_ACTION_SCOUT_ACTIONS)
+    ]
+    assert merged[0]["segment_ids"] == [
+        records[0]["segment_id"],
+        records[26]["segment_id"],
+    ]
 
 
 def test_canonical_transcript_propagates_high_confidence_cluster_name():
@@ -1687,6 +2446,669 @@ def test_started_work_plus_owned_outcome_is_a_hint_not_a_forced_judgment():
 
     assert actions == []
     assert errors == []
+
+
+def test_partial_implicit_follow_up_validation_preserves_original_hint_indexes():
+    records = canonical_transcript_records(_segments())
+    hints = _two_follow_up_hints(records)
+
+    actions, errors = validate_implicit_follow_up_judgments(
+        {"judgments": [_negative_implicit_judgment(2)]},
+        follow_up_hints=hints,
+        transcript_records=records,
+        hint_indexes=[2],
+    )
+
+    assert actions == []
+    assert errors == []
+
+
+def test_implicit_follow_up_prompt_fingerprint_binds_full_hint_content():
+    records = canonical_transcript_records(_segments())
+    first_hints = _two_follow_up_hints(records)
+    second_hints = copy.deepcopy(first_hints)
+    second_hints[1]["context"][0]["text"] = "A changed follow-up context."
+
+    first_messages = smart_minutes.build_implicit_follow_up_messages(
+        first_hints,
+        explicit_actions=[],
+    )
+    second_messages = smart_minutes.build_implicit_follow_up_messages(
+        second_hints,
+        explicit_actions=[],
+    )
+
+    assert smart_minutes._messages_fingerprint(first_messages) != (
+        smart_minutes._messages_fingerprint(second_messages)
+    )
+
+
+def test_implicit_follow_up_coverage_requeries_only_the_missing_hint(monkeypatch):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    responses = [
+        _action_scout(records),
+        {"judgments": [_negative_implicit_judgment(1)]},
+        {"judgments": [_negative_implicit_judgment(2)]},
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+    calls: list[list[dict[str, str]]] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        calls.append(messages)
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+    )
+
+    assert result is not None, status
+    assert len(calls) == 7
+    focused_input = json.loads(calls[2][1]["content"])
+    assert [
+        hint["hint_index"]
+        for hint in focused_input["follow_up_context_hints"]
+    ] == [2]
+    recovery = result.audit["implicit_follow_up_scout"]["status"][
+        "coverage_recovery"
+    ]
+    assert recovery["status"] == "focused_missing_hint_requery"
+    assert recovery["missing_hint_indexes"] == [2]
+    assert recovery["deterministic_negative_hint_indexes"] == []
+    assert result.audit["implicit_follow_up_scout"]["actions"] == []
+
+
+def test_implicit_follow_up_coverage_fallback_is_auditable_and_non_promoting(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    responses = [
+        _action_scout(records),
+        {"judgments": [_negative_implicit_judgment(1)]},
+        None,
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+    checkpoints: list[dict] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        response = responses.pop(0)
+        if response is None:
+            return None, {"status": "temporary_failure"}
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+        checkpoint_callback=lambda payload: checkpoints.append(copy.deepcopy(payload)),
+    )
+
+    assert result is not None, status
+    recovery = result.audit["implicit_follow_up_scout"]["status"][
+        "coverage_recovery"
+    ]
+    assert recovery["status"] == "deterministic_negative_coverage_fill"
+    assert recovery["deterministic_negative_hint_indexes"] == [2]
+    assert result.audit["implicit_follow_up_scout"]["actions"] == []
+    cached = checkpoints[-1]["implicit_follow_up_scout"]
+    assert cached["status"]["coverage_recovery"][
+        "deterministic_negative_hint_indexes"
+    ] == [2]
+    assert [
+        judgment["hint_index"]
+        for judgment in cached["payload"]["judgments"]
+    ] == [1, 2]
+
+    def unexpected_request(**kwargs):
+        raise AssertionError("cached deterministic fill must not call the model")
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", unexpected_request)
+    resumed, resumed_status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+        checkpoint=checkpoints[-1],
+    )
+
+    assert resumed is not None, resumed_status
+    assert resumed_status["implicit_follow_up_scout"]["status"] == "cached"
+    assert resumed_status["implicit_follow_up_scout"]["coverage_recovery"][
+        "deterministic_negative_hint_indexes"
+    ] == [2]
+
+
+def test_implicit_follow_up_repair_preserves_failed_coverage_recovery_audit(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    ungrounded = {
+        "hint_index": 1,
+        "qualifies": True,
+        "owner": "Billy",
+        "item": "复核最新发票并计算开发与支持占比。",
+        "segment_ids": [records[0]["segment_id"]],
+        "reason": "Billy 承诺复核发票。",
+    }
+    responses = [
+        _action_scout(records),
+        {"judgments": [ungrounded]},
+        None,
+        {
+            "judgments": [
+                ungrounded,
+                _negative_implicit_judgment(2),
+            ]
+        },
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        response = responses.pop(0)
+        if response is None:
+            return None, {"status": "temporary_failure"}
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+    )
+
+    assert result is not None, status
+    implicit_status = result.audit["implicit_follow_up_scout"]["status"]
+    assert implicit_status["repair_attempted"] is True
+    assert implicit_status["coverage_recovery"]["status"] == (
+        "coverage_recovery_failed"
+    )
+    assert implicit_status["deterministic_grounding_downgrade"][
+        "downgraded_hint_indexes"
+    ] == [1]
+    assert any(
+        error.endswith("owned_follow_up_not_grounded")
+        for error in implicit_status["coverage_recovery"]["fallback_validation_errors"]
+    )
+
+
+def test_implicit_follow_up_repair_failure_downgrades_complete_coverage_candidate(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    ungrounded = {
+        "hint_index": 1,
+        "qualifies": True,
+        "owner": "Billy",
+        "item": "复核最新发票并计算开发与支持占比。",
+        "segment_ids": [records[0]["segment_id"]],
+        "reason": "Billy 承诺复核发票。",
+    }
+    responses = [
+        _action_scout(records),
+        {"judgments": [ungrounded]},
+        None,
+        None,
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        response = responses.pop(0)
+        if response is None:
+            return None, {"status": "temporary_failure"}
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+    )
+
+    assert result is not None, status
+    implicit_status = result.audit["implicit_follow_up_scout"]["status"]
+    assert implicit_status["status"] == (
+        "deterministic_grounding_downgrade_after_repair_request_failure"
+    )
+    assert implicit_status["repair_status"]["status"] == "temporary_failure"
+    assert implicit_status["grounding_downgrade_source"] == (
+        "coverage_recovery_candidate"
+    )
+    assert implicit_status["coverage_recovery"]["status"] == (
+        "coverage_recovery_failed"
+    )
+    assert implicit_status["deterministic_grounding_downgrade"][
+        "downgraded_hint_indexes"
+    ] == [1]
+    assert result.audit["implicit_follow_up_scout"]["actions"] == []
+
+
+def test_implicit_follow_up_repair_failure_downgrades_complete_original_candidate(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    ungrounded = {
+        "hint_index": 1,
+        "qualifies": True,
+        "owner": "Billy",
+        "item": "复核最新发票并计算开发与支持占比。",
+        "segment_ids": [records[0]["segment_id"]],
+        "reason": "Billy 承诺复核发票。",
+    }
+    responses = [
+        _action_scout(records),
+        {
+            "judgments": [
+                ungrounded,
+                _negative_implicit_judgment(2),
+            ]
+        },
+        None,
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        response = responses.pop(0)
+        if response is None:
+            return None, {"status": "temporary_failure"}
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+    )
+
+    assert result is not None, status
+    implicit_status = result.audit["implicit_follow_up_scout"]["status"]
+    assert implicit_status["status"] == (
+        "deterministic_grounding_downgrade_after_repair_request_failure"
+    )
+    assert implicit_status["grounding_downgrade_source"] == (
+        "original_complete_candidate"
+    )
+    assert implicit_status["deterministic_grounding_downgrade"][
+        "downgraded_hint_indexes"
+    ] == [1]
+
+
+def test_implicit_follow_up_invalid_repair_downgrades_complete_original_candidate(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    original = {
+        "judgments": [
+            {
+                "hint_index": 1,
+                "qualifies": True,
+                "owner": "Billy",
+                "item": "复核最新发票并计算开发与支持占比。",
+                "segment_ids": [records[0]["segment_id"]],
+                "reason": "Billy 承诺复核发票。",
+            },
+            _negative_implicit_judgment(2),
+        ]
+    }
+    incomplete_repair = {
+        "judgments": [
+            _negative_implicit_judgment(2),
+        ]
+    }
+    responses = [
+        _action_scout(records),
+        original,
+        incomplete_repair,
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+    )
+
+    assert result is not None, status
+    implicit_status = result.audit["implicit_follow_up_scout"]["status"]
+    assert implicit_status["status"] == (
+        "deterministic_grounding_downgrade_after_invalid_repair_original_candidate"
+    )
+    assert implicit_status["grounding_downgrade_source"] == (
+        "original_complete_candidate_after_invalid_repair"
+    )
+    assert implicit_status["repair_validation_errors"] == [
+        "implicit_follow_up_hint_coverage_invalid"
+    ]
+    assert implicit_status["repair_payload_deterministic_grounding_downgrade"][
+        "status"
+    ] == "grounding_downgrade_not_applicable"
+    assert implicit_status["deterministic_grounding_downgrade"][
+        "downgraded_hint_indexes"
+    ] == [1]
+
+
+def test_implicit_follow_up_invalid_repair_preserves_dual_downgrade_failures(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    original = {
+        "judgments": [
+            {
+                "hint_index": 1,
+                "qualifies": True,
+                "owner": "Billy",
+                "item": "复核最新发票并计算开发与支持占比。",
+                "segment_ids": [records[0]["segment_id"]],
+                "reason": "Billy 承诺复核发票。",
+            },
+            _negative_implicit_judgment(2),
+        ]
+    }
+    incomplete_repair = {
+        "judgments": [
+            _negative_implicit_judgment(2),
+        ]
+    }
+    responses = [
+        _action_scout(records),
+        original,
+        incomplete_repair,
+    ]
+    checkpoints: list[dict] = []
+    downgrade_payloads: list[object] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    def fake_downgrade(*, payload, validation_errors, follow_up_hints, transcript_records):
+        downgrade_payloads.append(payload)
+        if len(downgrade_payloads) == 1:
+            return None, None, {
+                "status": "grounding_downgrade_not_applicable",
+                "validation_errors": validation_errors,
+            }
+        return None, None, {
+            "status": "grounding_downgrade_revalidation_failed",
+            "validation_errors": validation_errors,
+            "revalidation_errors": ["implicit_follow_up_hint_coverage_invalid"],
+        }
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes._downgrade_deterministically_rejected_implicit_judgments",
+        fake_downgrade,
+    )
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+        checkpoint_callback=lambda payload: checkpoints.append(copy.deepcopy(payload)),
+    )
+
+    assert result is None
+    assert status["status"] == "implicit_follow_up_scout_invalid"
+    assert downgrade_payloads == [incomplete_repair, original]
+    assert status["implicit_follow_up_scout"][
+        "deterministic_grounding_downgrade"
+    ]["status"] == "grounding_downgrade_not_applicable"
+    assert status["implicit_follow_up_scout"][
+        "original_candidate_deterministic_grounding_downgrade"
+    ]["status"] == "grounding_downgrade_revalidation_failed"
+    rejected = checkpoints[-1]["last_rejected_implicit_follow_up_scout"]
+    assert rejected["payload"] == original
+    assert rejected["repair_payload"] == incomplete_repair
+    assert rejected["initial_validation_errors"] == [
+        "implicit_follow_up:1:owned_follow_up_not_grounded"
+    ]
+    assert rejected["deterministic_grounding_downgrade"]["status"] == (
+        "grounding_downgrade_not_applicable"
+    )
+    assert rejected["original_candidate_deterministic_grounding_downgrade"][
+        "status"
+    ] == "grounding_downgrade_revalidation_failed"
+
+
+def test_implicit_follow_up_post_repair_downgrades_only_deterministic_rejections(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    ungrounded = {
+        "hint_index": 1,
+        "qualifies": True,
+        "owner": "Billy",
+        "item": "复核最新发票并计算开发与支持占比。",
+        "segment_ids": [records[0]["segment_id"]],
+        "reason": "Billy 承诺复核发票。",
+    }
+    rejected_payload = {
+        "judgments": [
+            ungrounded,
+            _negative_implicit_judgment(2),
+        ]
+    }
+    responses = [
+        _action_scout(records),
+        rejected_payload,
+        rejected_payload,
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+    )
+
+    assert result is not None, status
+    implicit_status = result.audit["implicit_follow_up_scout"]["status"]
+    assert implicit_status["status"] == (
+        "deterministic_grounding_downgrade_after_repair"
+    )
+    downgrade = implicit_status["deterministic_grounding_downgrade"]
+    assert downgrade["downgraded_hint_indexes"] == [1]
+    assert any(
+        error.endswith("owned_follow_up_not_grounded")
+        for error in downgrade["rejected_by_hint"][1]
+    )
+    assert result.audit["implicit_follow_up_scout"]["actions"] == []
+    assert "original_candidate_deterministic_grounding_downgrade" not in (
+        implicit_status
+    )
+
+
+def test_implicit_grounding_downgrade_rejects_mixed_validation_errors():
+    records = canonical_transcript_records(_segments())
+    hints = _two_follow_up_hints(records)
+    payload = {
+        "judgments": [
+            _negative_implicit_judgment(1),
+            _negative_implicit_judgment(2),
+        ]
+    }
+
+    downgraded, actions, status = (
+        smart_minutes._downgrade_deterministically_rejected_implicit_judgments(
+            payload=payload,
+            validation_errors=[
+                "implicit_follow_up:1:owned_follow_up_not_grounded",
+                "implicit_follow_up:2:owner_not_anchor",
+            ],
+            follow_up_hints=hints,
+            transcript_records=records,
+        )
+    )
+
+    assert downgraded is None
+    assert actions is None
+    assert status["status"] == "grounding_downgrade_not_applicable"
+
+
+def test_implicit_grounding_downgrade_rejects_inconsistent_payload_safely():
+    records = canonical_transcript_records(_segments())
+    hints = _two_follow_up_hints(records)
+    payload = {
+        "judgments": [
+            _negative_implicit_judgment(1),
+            "invalid judgment",
+        ]
+    }
+
+    downgraded, actions, status = (
+        smart_minutes._downgrade_deterministically_rejected_implicit_judgments(
+            payload=payload,
+            validation_errors=[
+                "implicit_follow_up:1:owned_follow_up_not_grounded",
+            ],
+            follow_up_hints=hints,
+            transcript_records=records,
+        )
+    )
+
+    assert downgraded is None
+    assert actions is None
+    assert status["status"] == "grounding_downgrade_payload_invalid"
+
+
+def test_implicit_follow_up_non_deterministic_post_repair_error_fails_closed(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    original = {
+        "judgments": [
+            {
+                "hint_index": 1,
+                "qualifies": True,
+                "owner": "Xin",
+                "item": "原始候选错误地指定了另一位负责人。",
+                "segment_ids": [records[0]["segment_id"]],
+                "reason": "原始候选未通过负责人验证。",
+            },
+            _negative_implicit_judgment(2),
+        ]
+    }
+    repair_invalid = {
+        "judgments": [
+            {
+                "hint_index": 1,
+                "qualifies": True,
+                "owner": "Xin",
+                "item": "复核最新发票并计算开发与支持占比。",
+                "segment_ids": [records[0]["segment_id"]],
+                "reason": "错误地指定了另一位负责人。",
+            },
+            _negative_implicit_judgment(2),
+        ]
+    }
+    responses = [
+        _action_scout(records),
+        original,
+        repair_invalid,
+    ]
+    checkpoints: list[dict] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.follow_up_context_hints",
+        _two_follow_up_hints,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+        checkpoint_callback=lambda payload: checkpoints.append(copy.deepcopy(payload)),
+    )
+
+    assert result is None
+    assert status["status"] == "implicit_follow_up_scout_invalid"
+    assert status["errors"] == ["implicit_follow_up:1:owner_not_anchor"]
+    assert status["implicit_follow_up_scout"][
+        "deterministic_grounding_downgrade"
+    ]["status"] == "grounding_downgrade_not_applicable"
+    rejected = checkpoints[-1]["last_rejected_implicit_follow_up_scout"]
+    assert rejected["payload"] == original
+    assert rejected["repair_payload"] == repair_invalid
+    assert rejected["original_candidate_deterministic_grounding_downgrade"] is None
 
 
 def test_action_scout_ignores_non_public_top_level_metadata(monkeypatch):
@@ -2188,6 +3610,27 @@ def test_final_gate_rejects_negated_self_commitment_support():
     ]
 
 
+def test_positive_self_commitment_uses_contiguous_action_evidence():
+    assert smart_minutes._positive_self_commitment(
+        [
+            {"text": "I'll continue to"},
+            {"text": "work on the integration."},
+        ]
+    )
+    assert smart_minutes._positive_self_commitment(
+        [{"text": "I gotta check why it failed."}]
+    )
+    assert smart_minutes._positive_self_commitment(
+        [{"text": "I need to create the application first."}]
+    )
+    assert smart_minutes._positive_self_commitment(
+        [{"text": "I will wait for the response and talk to John."}]
+    )
+    assert not smart_minutes._positive_self_commitment(
+        [{"text": "Could you say I will check it?"}]
+    )
+
+
 def test_final_gate_rejects_wontfix_for_material_prior_finding():
     records = canonical_transcript_records(_segments())
     minutes = _source_payload([record["segment_id"] for record in records])
@@ -2241,6 +3684,100 @@ def test_final_review_prompt_is_a_precision_first_publication_gate():
     assert "within a 120-second window" in messages[0]["content"]
     assert "candidate_dispositions" in messages[0]["content"]
     assert "prior_finding_dispositions" in messages[0]["content"]
+
+
+def test_prior_review_findings_are_severity_bounded_with_audit_index():
+    findings = [
+        {
+            "severity": "low",
+            "category": "wording",
+            "description": "Low-priority wording cleanup.",
+        },
+        {
+            "severity": "material",
+            "category": "action_recall",
+            "description": "A material action might be missing.",
+        },
+        {
+            "severity": "high",
+            "category": "speaker_attribution",
+            "description": "A speaker attribution requires correction.",
+        },
+        {
+            "severity": "medium",
+            "category": "decision_precision",
+            "description": "A decision needs tighter wording.",
+        },
+        {
+            "severity": "blocker",
+            "category": "unsupported_action",
+            "description": "An action lacks direct evidence.",
+        },
+        {
+            "severity": "invalid",
+            "category": "bad category",
+            "description": "This malformed finding must not reach the final model.",
+        },
+    ]
+
+    retained, audit = smart_minutes._bounded_prior_review_findings(findings)
+
+    assert [finding["severity"] for finding in retained] == [
+        "blocker",
+        "high",
+        "material",
+        "medium",
+    ]
+    assert audit["retained_source_indexes"] == [5, 3, 2, 4]
+    assert audit["discarded_count"] == 2
+    assert audit["discarded_findings"] == [
+        {
+            "source_index": 1,
+            "severity": "low",
+            "category": "wording",
+            "description_sha256": smart_minutes._review_finding_digest(
+                "Low-priority wording cleanup."
+            ),
+            "reason": "over_budget",
+        },
+        {
+            "source_index": 6,
+            "severity": "invalid",
+            "category": "bad category",
+            "description_sha256": smart_minutes._review_finding_digest(
+                "This malformed finding must not reach the final model."
+            ),
+            "reason": "invalid_severity",
+        },
+    ]
+
+
+def test_final_review_prompt_includes_prior_finding_budget():
+    records = canonical_transcript_records(_segments())
+    draft = _source_payload([record["segment_id"] for record in records])
+    findings, budget = smart_minutes._bounded_prior_review_findings(
+        [
+            {
+                "severity": "high",
+                "category": "speaker_attribution",
+                "description": "Verify the named speaker.",
+            }
+        ]
+    )
+
+    messages = build_review_messages(
+        records,
+        draft,
+        required_project_participants=["Billy"],
+        prior_findings=findings,
+        prior_finding_budget=budget,
+        pass_index=2,
+    )
+    payload = json.loads(messages[1]["content"])
+
+    assert payload["prior_findings"] == findings
+    assert payload["prior_finding_budget"] == budget
+    assert "omitted advisory findings" in messages[0]["content"]
 
 
 def test_final_review_repair_uses_targeted_evidence_packet():
@@ -2338,6 +3875,62 @@ def test_deterministic_final_repair_drops_invalid_action_and_rebuilds_update():
         transcript_records=records,
         action_scout=scout,
     ) == []
+
+
+def test_deterministic_final_repair_neutralizes_entities_and_deduplicates_updates():
+    records = canonical_transcript_records(_segments())
+    minutes = _source_payload([record["segment_id"] for record in records])
+    minutes["actions"][0]["item"] = "继续推进 GitLab 集成"
+    minutes["project_updates"][0].update(
+        {
+            "project": "GitLab 集成",
+            "update": "继续推进 GitLab 集成。",
+        }
+    )
+    minutes["project_updates"].append(
+        {
+            "participant": "Billy",
+            "project": "重复更新",
+            "update": "这是一条重复的项目更新。",
+            "segment_ids": [records[1]["segment_id"]],
+        }
+    )
+    review = _publication_review(minutes)
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=[
+            "action:1:named_entity_ungrounded:GitLab",
+            "project_update:1:named_entity_ungrounded:GitLab",
+            "project_update:2:participant_duplicate",
+        ],
+        action_scout=_action_scout(records)["actions"],
+    )
+
+    assert repaired is not None
+    assert "neutralized_ungrounded_action_entities:1" in changes
+    assert "rebuilt_project_update:1" in changes
+    assert "dropped_duplicate_project_update:2" in changes
+    assert "GitLab" not in repaired["minutes"]["actions"][0]["item"]
+    assert repaired["minutes"]["project_updates"] == [
+        {
+            "participant": "Billy",
+            "project": "后续跟进",
+            "update": "继续推进集成工作",
+            "segment_ids": [records[0]["segment_id"]],
+        }
+    ]
+
+
+def test_entity_neutralization_removes_empty_related_modifiers_in_both_languages():
+    assert smart_minutes._neutralize_ungrounded_entities(
+        "排查并修复相关集成中的认证失败问题",
+        {"GitLab"},
+    ) == "排查并修复集成中的认证失败问题"
+    assert smart_minutes._neutralize_ungrounded_entities(
+        "Create related applications and configure interconnections.",
+        {"Authentik"},
+    ) == "Create applications and configure interconnections."
 
 
 def test_deterministic_final_repair_drops_out_of_outline_theme_point():
@@ -2810,6 +4403,49 @@ def test_validator_rejects_entity_rewrite_not_present_in_action_evidence():
     assert "action:1:named_entity_ungrounded:Xin" in errors
 
 
+def test_validator_grounds_entities_from_short_asr_context_without_weakening_owner_evidence():
+    segments = [
+        {
+            "id": "commitment",
+            "start": 0.0,
+            "end": 1.0,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_confidence": 0.95,
+            "text": "I'll continue to work on it.",
+        },
+        {
+            "id": "context",
+            "start": 1.0,
+            "end": 3.0,
+            "speaker": "Speaker 2",
+            "name": "Xin",
+            "name_confidence": 0.95,
+            "text": "The authentic and GitLab integration.",
+        },
+        {
+            "id": "distant",
+            "start": 30.0,
+            "end": 32.0,
+            "speaker": "Speaker 2",
+            "name": "Xin",
+            "name_confidence": 0.95,
+            "text": "The unrelated Proxmox migration.",
+        },
+    ]
+    records = canonical_transcript_records(segments)
+    errors = smart_minutes._claim_fidelity_errors(
+        "继续完成 GitLab 与 Authentik 集成，并推进 Proxmox 迁移。",
+        [records[0]["segment_id"]],
+        records={record["segment_id"]: record for record in records},
+        canonical_names={"Billy", "Xin"},
+        field="action:1",
+    )
+
+    assert "action:1:named_entity_ungrounded:Proxmox" in errors
+    assert not any("GitLab" in error or "Authentik" in error for error in errors)
+
+
 def test_validator_rejects_ungrounded_weekday_in_action():
     records = canonical_transcript_records(_segments())
     payload = _minutes_payload([record["segment_id"] for record in records])
@@ -3134,6 +4770,332 @@ def test_second_review_disposes_every_first_review_finding(monkeypatch):
             "reason": "The final action contains one outcome.",
         }
     ]
+
+
+def test_final_review_retries_with_smaller_prior_findings_after_json_truncation(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    first_findings = [
+        {
+            "severity": "low",
+            "category": "wording",
+            "description": "Low-priority wording cleanup.",
+        },
+        {
+            "severity": "material",
+            "category": "action_recall",
+            "description": "A material action might be missing.",
+        },
+        {
+            "severity": "high",
+            "category": "speaker_attribution",
+            "description": "A speaker attribution requires correction.",
+        },
+        {
+            "severity": "medium",
+            "category": "decision_precision",
+            "description": "A decision needs tighter wording.",
+        },
+        {
+            "severity": "blocker",
+            "category": "unsupported_action",
+            "description": "An action lacks direct evidence.",
+        },
+        {
+            "severity": "low",
+            "category": "coverage",
+            "description": "A minor topic could use more detail.",
+        },
+    ]
+    final_review = _publication_review(
+        valid,
+        prior_finding_dispositions=[
+            {
+                "finding_index": 1,
+                "disposition": "addressed",
+                "reason": "The action evidence was checked and retained.",
+            },
+            {
+                "finding_index": 2,
+                "disposition": "addressed",
+                "reason": "The speaker attribution was checked and retained.",
+            },
+        ],
+    )
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {"findings": first_findings, "minutes": valid},
+        None,
+        final_review,
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+    calls: list[tuple[list[dict[str, str]], int]] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        calls.append((messages, max_tokens))
+        response = responses.pop(0)
+        if response is None:
+            return None, {
+                "status": "invalid_model_json",
+                "starts_with_object": True,
+                "ends_with_object": False,
+            }
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+    )
+
+    assert result is not None, status
+    initial_final_payload = json.loads(calls[5][0][1]["content"])
+    retried_final_payload = json.loads(calls[6][0][1]["content"])
+    assert len(initial_final_payload["prior_findings"]) == 4
+    assert len(retried_final_payload["prior_findings"]) == 2
+    assert calls[5][1] == smart_minutes.FINAL_REVIEW_MAX_TOKENS
+    assert calls[6][1] == smart_minutes.FINAL_REVIEW_MAX_TOKENS
+    assert result.audit["reviews"][0]["finding_budget"]["retained_source_indexes"] == [
+        5,
+        3,
+        2,
+        4,
+    ]
+    final_audit = result.audit["reviews"][1]
+    assert final_audit["prior_finding_budget"]["truncation_retry"] == {
+        "initial_prior_finding_count": 4,
+        "retry_prior_finding_count": 2,
+    }
+    assert final_audit["prior_finding_budget"]["retained_count"] == 2
+    assert final_audit["prior_finding_budget"]["discarded_count"] == 4
+    assert (
+        final_audit["prior_finding_budget"]["valid_count"]
+        == final_audit["prior_finding_budget"]["retained_count"]
+        + final_audit["prior_finding_budget"]["discarded_count"]
+    )
+    assert final_audit["status"]["truncation_retry"][
+        "retry_prior_finding_count"
+    ] == 2
+    assert smart_minutes.FINAL_REVIEW_MAX_TOKENS == 12_000
+
+
+def test_final_review_blocks_publication_when_truncation_retry_is_exhausted(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    first_findings = [
+        {
+            "severity": "high",
+            "category": "speaker_attribution",
+            "description": "A speaker attribution requires correction.",
+        },
+        {
+            "severity": "material",
+            "category": "action_recall",
+            "description": "A material action might be missing.",
+        },
+    ]
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {"findings": first_findings, "minutes": valid},
+        None,
+        None,
+    ]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        response = responses.pop(0)
+        if response is None:
+            return None, {
+                "status": "invalid_model_json",
+                "starts_with_object": True,
+                "ends_with_object": False,
+            }
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+    )
+
+    assert result is None
+    assert status["status"] == "review_truncation_retry_exhausted"
+    assert status["review"]["truncation_retry"]["initial_prior_finding_count"] == 2
+    assert status["review"]["truncation_retry"]["retry_prior_finding_count"] == 1
+
+
+def test_final_review_retry_cache_resumes_from_reduced_context(monkeypatch):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    first_findings = [
+        {
+            "severity": "blocker",
+            "category": "unsupported_action",
+            "description": "An action lacks direct evidence.",
+        },
+        {
+            "severity": "high",
+            "category": "speaker_attribution",
+            "description": "A speaker attribution requires correction.",
+        },
+        {
+            "severity": "material",
+            "category": "action_recall",
+            "description": "A material action might be missing.",
+        },
+        {
+            "severity": "medium",
+            "category": "decision_precision",
+            "description": "A decision needs tighter wording.",
+        },
+    ]
+    final_review = _publication_review(
+        valid,
+        prior_finding_dispositions=[
+            {
+                "finding_index": 1,
+                "disposition": "addressed",
+                "reason": "The action evidence was checked and retained.",
+            },
+            {
+                "finding_index": 2,
+                "disposition": "addressed",
+                "reason": "The speaker attribution was checked and retained.",
+            },
+        ],
+    )
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {"findings": first_findings, "minutes": valid},
+        None,
+        final_review,
+        None,
+    ]
+    checkpoints: list[dict] = []
+
+    def first_request(*, messages, config, max_tokens=16000):
+        response = responses.pop(0)
+        if response is None:
+            return None, {
+                "status": "invalid_model_json",
+                "starts_with_object": True,
+                "ends_with_object": False,
+            }
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", first_request)
+
+    first, first_status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+        checkpoint_callback=lambda payload: checkpoints.append(copy.deepcopy(payload)),
+    )
+
+    assert first is None
+    assert first_status["status"] == "translation_failed"
+    checkpoint = checkpoints[-1]
+    cached_final = checkpoint["reviews"][1]
+    assert "truncation_retry" in cached_final["status"]
+
+    resumed_calls: list[list[dict[str, str]]] = []
+
+    def resumed_request(*, messages, config, max_tokens=16000):
+        resumed_calls.append(messages)
+        return _source_payload(
+            [record["segment_id"] for record in records],
+            english=True,
+        ), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.request_deepseek_json",
+        resumed_request,
+    )
+    resumed, resumed_status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+        checkpoint=checkpoint,
+    )
+
+    assert resumed is not None, resumed_status
+    assert len(resumed_calls) == 1
+    assert "source_minutes_zh" in resumed_calls[0][1]["content"]
+    final_audit = resumed.audit["reviews"][1]
+    assert final_audit["status"]["status"] == "cached"
+    assert final_audit["prior_finding_budget"]["retained_count"] == 2
+    assert final_audit["prior_finding_budget"]["discarded_count"] == 2
+
+
+def test_final_review_uses_baseline_when_first_review_minutes_are_invalid(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    invalid_review = copy.deepcopy(valid)
+    invalid_review["themes"][0]["unexpected"] = "invalid"
+    final_review = _publication_review(
+        valid,
+        prior_finding_dispositions=[
+            {
+                "finding_index": 1,
+                "disposition": "addressed",
+                "reason": "The final minutes use the valid baseline wording.",
+            }
+        ],
+    )
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {
+            "findings": [
+                {
+                    "severity": "medium",
+                    "category": "wording",
+                    "description": "The draft needs a concise wording check.",
+                }
+            ],
+            "minutes": invalid_review,
+        },
+        final_review,
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+    calls: list[list[dict[str, str]]] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        calls.append(messages)
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+    )
+
+    assert result is not None, status
+    final_review_payload = json.loads(calls[5][1]["content"])
+    assert final_review_payload["draft_minutes"] == valid
+    assert "unexpected" not in final_review_payload["draft_minutes"]["themes"][0]
 
 
 def test_final_review_repairs_local_schema_failure_once(monkeypatch):

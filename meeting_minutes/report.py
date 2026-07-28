@@ -111,6 +111,12 @@ def write_quality_report(
     ]
     for name, status in statuses.items():
         lines.append(f"- {name}: `{status.get('status')}` {status.get('reason') or status.get('error') or ''}".rstrip())
+    ocr_diagnostics = statuses.get("ocr", {}).get("manifest_diagnostics", {})
+    if isinstance(ocr_diagnostics, dict) and int(ocr_diagnostics.get("dropped_record_count", 0)):
+        lines.append(
+            "- OCR manifest skipped records: "
+            f"{ocr_diagnostics['dropped_record_count']}; diagnostics: `{ocr_diagnostics.get('diagnostics_path', '')}`"
+        )
     lines += [
         "",
         "## Metrics",

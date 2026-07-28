@@ -53,7 +53,7 @@ from .dynamic_visual_identity import (
 from .identity import attach_names, load_participant_map
 from .jsonio import read_json, write_json
 from .keyframes import choose_keyframes, keyword_times, regular_times
-from .media import extract_audio, extract_frames, make_clip, ocr_frames, ocr_regions, probe_media
+from .media import extract_audio, extract_frames, make_clip, ocr_frames, ocr_manifest_diagnostics, ocr_regions, probe_media
 from .minutes_contract import (
     parse_shareable_action_rows,
     parse_shareable_project_update_rows,
@@ -708,7 +708,11 @@ def _run_dynamic_visual_identity(
     write_json(output_dir / "dynamic_visual_identity_ocr_manifest.json", ocr_manifest)
     try:
         ocr_records = ocr_frames(ocr_manifest, output_dir / "work") if ocr_manifest else []
-        ocr_status: dict[str, Any] = {"status": "ok", "frames": len(ocr_records)}
+        ocr_status: dict[str, Any] = {
+            "status": "ok",
+            "frames": len(ocr_records),
+            "manifest_diagnostics": ocr_manifest_diagnostics(output_dir / "work"),
+        }
     except Exception as exc:
         ocr_records = []
         ocr_status = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
@@ -871,7 +875,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
     else:
         try:
             ocr_records = ocr_frames(frames, work_dir)
-            statuses["ocr"] = {"status": "ok", "frames": len(ocr_records)}
+            statuses["ocr"] = {
+                "status": "ok",
+                "frames": len(ocr_records),
+                "manifest_diagnostics": ocr_manifest_diagnostics(work_dir),
+            }
         except Exception as exc:
             ocr_records = []
             statuses["ocr"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
