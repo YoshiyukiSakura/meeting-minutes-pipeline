@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -14,6 +13,14 @@ from .diarization import (
     _load_speechbrain_classifier,
     _normalize_rows,
     _read_wav,
+)
+from .identity_authority import (
+    ACTIVE_SPEAKER_HIGHLIGHT_SOURCE,
+    DIRECT_VISUAL_CLUSTER_SOURCE,
+    DYNAMIC_NAMEPLATE_SOURCE,
+    REVIEWED_SLOT_SOURCE,
+    ROSTER_AVATAR_SOURCE,
+    SAME_SESSION_VISUAL_VOICE_SOURCE,
 )
 
 
@@ -35,18 +42,20 @@ _DEFAULTS: dict[str, Any] = {
     "short_segment_seconds": 1.8,
 }
 
-_DYNAMIC_NAMEPLATE_SOURCE = "dynamic_visual_in_tile_nameplate_ocr"
-_REVIEWED_SLOT_SOURCE = "visual_profile_reviewed_slot"
+_DYNAMIC_NAMEPLATE_SOURCE = DYNAMIC_NAMEPLATE_SOURCE
+_REVIEWED_SLOT_SOURCE = REVIEWED_SLOT_SOURCE
+_ROSTER_AVATAR_SOURCE = ROSTER_AVATAR_SOURCE
 _DIRECT_VISUAL_FRAME_SOURCES = frozenset({_DYNAMIC_NAMEPLATE_SOURCE, _REVIEWED_SLOT_SOURCE})
-_DIRECT_VISUAL_SEGMENT_SOURCES = frozenset({_DYNAMIC_NAMEPLATE_SOURCE, "visual_active_speaker_highlight"})
-_PROPAGATED_CLUSTER_SOURCE = "direct_visual_voice_cluster_consensus"
-_VISUAL_VOICE_SOURCE = "same_session_visual_voiceprint"
+_DIRECT_VISUAL_SEGMENT_SOURCES = frozenset({_DYNAMIC_NAMEPLATE_SOURCE, ACTIVE_SPEAKER_HIGHLIGHT_SOURCE})
+_PROPAGATED_CLUSTER_SOURCE = DIRECT_VISUAL_CLUSTER_SOURCE
+_VISUAL_VOICE_SOURCE = SAME_SESSION_VISUAL_VOICE_SOURCE
 _PRESERVED_SOURCES = {
     "voice_enrollment",
     "voice_registry",
     "participant_map",
     "user_confirmed_speaker_volume_mapping",
     *_DIRECT_VISUAL_SEGMENT_SOURCES,
+    _ROSTER_AVATAR_SOURCE,
 }
 
 

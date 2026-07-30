@@ -79,6 +79,60 @@ def test_attach_registry_scores_keeps_mixed_long_segment_anonymous():
     assert "name" not in segments[0]
 
 
+def test_attach_registry_scores_preserves_calibrated_roster_avatar_identity():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 2.0,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_source": "visual_roster_avatar_match",
+            "name_confidence": 0.81,
+        }
+    ]
+
+    summary = attach_registry_scores(
+        segments,
+        [{"start": 0.0, "end": 1.0}, {"start": 1.0, "end": 2.0}],
+        ["Billy", "Xin"],
+        [[0.1, 0.95], [0.1, 0.95]],
+        threshold=0.8,
+        margin=0.2,
+    )
+
+    assert summary["assigned_segments"] == 0
+    assert summary["skipped_trusted_segments"] == 1
+    assert segments[0]["name"] == "Billy"
+    assert segments[0]["name_source"] == "visual_roster_avatar_match"
+
+
+def test_attach_registry_scores_preserves_direct_active_visual_identity():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 2.0,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_source": "visual_active_speaker_highlight",
+            "name_confidence": 0.9,
+        }
+    ]
+
+    summary = attach_registry_scores(
+        segments,
+        [{"start": 0.0, "end": 1.0}, {"start": 1.0, "end": 2.0}],
+        ["Billy", "Xin"],
+        [[0.1, 0.95], [0.1, 0.95]],
+        threshold=0.8,
+        margin=0.2,
+    )
+
+    assert summary["assigned_segments"] == 0
+    assert summary["skipped_trusted_segments"] == 1
+    assert segments[0]["name"] == "Billy"
+    assert segments[0]["name_source"] == "visual_active_speaker_highlight"
+
+
 def test_load_voice_registry_rejects_mismatched_dimensions(tmp_path):
     registry = tmp_path / "registry.json"
     registry.write_text(

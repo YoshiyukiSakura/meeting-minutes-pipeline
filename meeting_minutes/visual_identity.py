@@ -8,6 +8,15 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from .identity_authority import (
+    ACTIVE_SPEAKER_HIGHLIGHT_SOURCE,
+    VOICE_REGISTRY_SOURCE,
+    has_human_reviewed_identity,
+)
+from .identity_authority import (
+    has_roster_avatar_identity as _has_roster_avatar_identity,
+)
+from .sample_evidence import unique_frames_for_requests
 from .visual_highlight import Box, score_green_highlight_border, score_green_speaker_cue, score_highlight_border
 
 
@@ -200,7 +209,7 @@ def build_segment_sample_requests(
             fractions = [0.2, 0.5, 0.8]
         for fraction in fractions:
             timeline_time = start + segment_duration * fraction
-            video_time = min(max(0.0, timeline_time + offset), duration)
+            video_time = min(max(0.0, timeline_time + offset), max(0.0, duration - 0.001))
             requests.append(
                 {
                     "segment_index": segment_index,
@@ -410,24 +419,17 @@ def score_visual_frames(
     return records
 
 
-_TRUSTED_SOURCES = {
-    "voice_enrollment",
-    "voice_registry",
-    "participant_map",
-    "user_confirmed_speaker_volume_mapping",
-    "manual_review",
-    "human_review",
-}
-_REVIEWED_SOURCE_PREFIXES = ("reviewed_", "manual_", "user_confirmed_")
-
-
 def has_trusted_identity(segment: dict[str, Any]) -> bool:
     """Return whether a reviewed, enrolled, or registry identity must not be replaced by weaker visual evidence."""
 
     source = str(segment.get("name_source") or "")
-    return bool(segment.get("name")) and (
-        source in _TRUSTED_SOURCES or source.startswith(_REVIEWED_SOURCE_PREFIXES)
-    )
+    return bool(segment.get("name")) and (source == VOICE_REGISTRY_SOURCE or has_human_reviewed_identity(segment))
+
+
+def has_roster_avatar_identity(segment: dict[str, Any]) -> bool:
+    """Return whether a calibrated same-frame roster identity is present."""
+
+    return _has_roster_avatar_identity(segment)
 
 
 def has_direct_visual_authority_identity(segment: dict[str, Any]) -> bool:
@@ -438,7 +440,25 @@ def has_direct_visual_authority_identity(segment: dict[str, Any]) -> bool:
     than a direct human map or explicitly reviewed enrollment.
     """
 
-    return str(segment.get("name_source") or "") != "voice_registry" and has_trusted_identity(segment)
+    return str(segment.get("name_source") or "") != VOICE_REGISTRY_SOURCE and has_trusted_identity(segment)
+
+
+def _preserve_roster_avatar_identity(
+    segment: dict[str, Any],
+    summary: dict[str, Any],
+    *,
+    reason: str,
+    visual_names: set[str] | None = None,
+) -> None:
+    summary["preserved_roster_avatar_identity"] += 1
+    summary["by_reason"][f"roster_avatar_preserved:{reason}"] += 1
+    if visual_names:
+        segment["visual_identity_conflict"] = {
+            "reason": reason,
+            "roster_avatar_name": segment.get("name"),
+            "visual_names": sorted(visual_names),
+        }
+        summary["conflicts"] += 1
 
 
 def attach_visual_identity(
@@ -462,6 +482,9 @@ def attach_visual_identity(
         "overridden_voice_registry": 0,
         "preserved_voice_registry_without_visual": 0,
         "corroborated_voice_registry": 0,
+        "preserved_roster_avatar_identity": 0,
+        "overridden_roster_avatar_identity": 0,
+        "corroborated_roster_avatar_identity": 0,
         "unvalidated_candidates": 0,
         "assignment_mode": "direct" if profile["settings"]["allow_direct_assignment"] else "audit_only",
         "by_source": Counter(),
@@ -472,8 +495,7 @@ def attach_visual_identity(
     for index, segment in enumerate(segments):
         segment.pop("visual_identity_evidence", None)
         segment.pop("visual_identity_conflict", None)
-        sample_frames = [frame_by_time.get(round(float(request["video_time"]), 3)) for request in requests_by_segment.get(index, [])]
-        sample_frames = [frame for frame in sample_frames if frame]
+        sample_frames = unique_frames_for_requests(requests_by_segment.get(index, []), frame_by_time)
         named_frames = [frame for frame in sample_frames if frame.get("active") and frame.get("name")]
         votes = Counter(str(frame["name"]) for frame in named_frames)
         conflicting = len(votes) > 1
@@ -494,7 +516,9 @@ def attach_visual_identity(
             segment["visual_identity_evidence"] = evidence
         existing_source = str(segment.get("name_source") or "")
         existing_name = segment.get("name")
-        registry_identity = bool(existing_name) and existing_source == "voice_registry"
+        existing_confidence = segment.get("name_confidence")
+        registry_identity = bool(existing_name) and existing_source == VOICE_REGISTRY_SOURCE
+        roster_identity = has_roster_avatar_identity(segment)
         trusted = has_direct_visual_authority_identity(segment)
         if trusted:
             summary["preserved_trusted_identity"] += 1
@@ -507,6 +531,14 @@ def attach_visual_identity(
                 summary["by_reason"]["trusted_identity_disagrees_with_visual_evidence"] += 1
             continue
         if conflicting:
+            if roster_identity:
+                _preserve_roster_avatar_identity(
+                    segment,
+                    summary,
+                    reason="multiple_active_names_in_segment",
+                    visual_names=set(votes),
+                )
+                continue
             segment["name"] = None
             segment["name_source"] = "visual_identity_conflict"
             segment["name_confidence"] = 0.0
@@ -516,6 +548,9 @@ def attach_visual_identity(
             summary["by_reason"]["multiple_active_names_in_segment"] += 1
             continue
         if not votes:
+            if roster_identity:
+                _preserve_roster_avatar_identity(segment, summary, reason="no_named_active_visual_evidence")
+                continue
             if registry_identity:
                 # A registry label remains useful when this UI frame has no active-speaker cue.
                 # It is not, however, allowed to veto direct visual evidence in another segment.
@@ -530,6 +565,14 @@ def attach_visual_identity(
             continue
         name, count = votes.most_common(1)[0]
         if not profile["settings"]["allow_direct_assignment"]:
+            if roster_identity:
+                _preserve_roster_avatar_identity(
+                    segment,
+                    summary,
+                    reason="direct_visual_assignment_disabled",
+                    visual_names={name},
+                )
+                continue
             segment["name"] = None
             segment["name_source"] = "visual_identity_unvalidated_candidate"
             segment["name_confidence"] = 0.0
@@ -550,6 +593,14 @@ def attach_visual_identity(
         average_score = sum(float(frame.get("score", 0.0)) for frame in matched_frames) / len(matched_frames)
         strong_single = len(sample_frames) == 1 and average_score >= float(profile["settings"]["min_active_score"]) + float(profile["settings"]["min_active_margin"])
         if count < required_count or vote_share < vote_share_required or (required_count == 1 and not strong_single):
+            if roster_identity:
+                _preserve_roster_avatar_identity(
+                    segment,
+                    summary,
+                    reason="insufficient_visual_consensus",
+                    visual_names={name},
+                )
+                continue
             segment["name"] = None
             segment["name_source"] = "visual_identity_unresolved"
             segment["name_confidence"] = 0.0
@@ -570,8 +621,21 @@ def attach_visual_identity(
                 }
                 summary["overridden_voice_registry"] += 1
                 summary["by_reason"]["direct_visual_evidence_overrides_voice_registry"] += 1
+        if roster_identity:
+            if existing_name == name:
+                summary["corroborated_roster_avatar_identity"] += 1
+            else:
+                segment["visual_identity_override"] = {
+                    "reason": "direct_visual_evidence_overrides_roster_avatar",
+                    "previous_name": existing_name,
+                    "previous_source": existing_source,
+                    "previous_confidence": existing_confidence,
+                    "visual_name": name,
+                }
+                summary["overridden_roster_avatar_identity"] += 1
+                summary["by_reason"]["direct_visual_evidence_overrides_roster_avatar"] += 1
         segment["name"] = name
-        segment["name_source"] = "visual_active_speaker_highlight"
+        segment["name_source"] = ACTIVE_SPEAKER_HIGHLIGHT_SOURCE
         segment["name_confidence"] = round(confidence, 3)
         refs = [str(frame["path"]) for frame in matched_frames if frame.get("path")]
         segment["frame_refs"] = sorted(set(refs))[:4]
@@ -639,6 +703,9 @@ def write_visual_identity_report(
         f"- Direct visual corrections of voice-registry identities: {summary['overridden_voice_registry']}",
         f"- Voice-registry identities retained without an active visual cue: {summary['preserved_voice_registry_without_visual']}",
         f"- Voice-registry identities corroborated by direct visual evidence: {summary['corroborated_voice_registry']}",
+        f"- Preserved roster-avatar identities: {summary['preserved_roster_avatar_identity']}",
+        f"- Direct visual overrides of roster-avatar identities: {summary['overridden_roster_avatar_identity']}",
+        f"- Roster-avatar identities corroborated by direct visual evidence: {summary['corroborated_roster_avatar_identity']}",
         f"- Unvalidated visual candidates retained for audit only: {summary['unvalidated_candidates']}",
         "",
         "## Limits",

@@ -135,7 +135,7 @@ def test_unvalidated_template_is_audit_only_and_multi_active_abstains(monkeypatc
     assert scored[2]["avatar_template_identity"]["decision"] == "multiple_active_tiles"
 
 
-def test_avatar_evidence_does_not_overwrite_direct_nameplate_or_conflicting_voiceprint():
+def test_avatar_evidence_does_not_overwrite_direct_nameplate_voiceprint_or_roster_identity():
     profile = {"settings": _settings()}
     segments = [
         {"start": 0.0, "end": 1.0, "speaker": "Speaker 1"},
@@ -152,6 +152,13 @@ def test_avatar_evidence_does_not_overwrite_direct_nameplate_or_conflicting_voic
             "speaker": "Speaker 3",
             "name": "Billy",
             "name_source": "dynamic_visual_in_tile_nameplate_ocr",
+        },
+        {
+            "start": 6.0,
+            "end": 7.0,
+            "speaker": "Speaker 4",
+            "name": "Billy",
+            "name_source": "visual_roster_avatar_match",
         },
     ]
     scored_frames = [
@@ -176,11 +183,19 @@ def test_avatar_evidence_does_not_overwrite_direct_nameplate_or_conflicting_voic
             "active_tiles": [{"tile": [0.1, 0.1, 0.5, 0.5]}],
             "avatar_template_identity": {"decision": "accepted", "candidate_name": "Xin", "score": 0.90, "margin": 0.50},
         },
+        {
+            "time": 6.5,
+            "actualTime": 6.5,
+            "path": "/tmp/xin-roster-conflict.jpg",
+            "active_tiles": [{"tile": [0.1, 0.1, 0.5, 0.5]}],
+            "avatar_template_identity": {"decision": "accepted", "candidate_name": "Xin", "score": 0.90, "margin": 0.50},
+        },
     ]
     requests = [
         {"segment_index": 0, "video_time": 0.5},
         {"segment_index": 1, "video_time": 2.5},
         {"segment_index": 2, "video_time": 4.5},
+        {"segment_index": 3, "video_time": 6.5},
     ]
 
     summary = attach_avatar_template_identity(segments, requests, scored_frames, profile)
@@ -193,7 +208,11 @@ def test_avatar_evidence_does_not_overwrite_direct_nameplate_or_conflicting_voic
     assert segments[2]["name"] == "Billy"
     assert segments[2]["name_source"] == "dynamic_visual_in_tile_nameplate_ocr"
     assert segments[2]["avatar_template_identity_conflict"]["reason"] == "direct_nameplate_disagrees_with_avatar_template"
+    assert segments[3]["name"] == "Billy"
+    assert segments[3]["name_source"] == "visual_roster_avatar_match"
+    assert segments[3]["avatar_template_identity_conflict"]["reason"] == "roster_avatar_disagrees_with_avatar_template"
     assert summary["voiceprint_conflicts_preserved"] == 1
+    assert summary["roster_avatar_conflicts_preserved"] == 1
     assert summary["direct_nameplate_conflicts"] == 1
 
 

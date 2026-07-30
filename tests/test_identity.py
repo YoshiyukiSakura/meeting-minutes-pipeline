@@ -64,6 +64,52 @@ def test_voice_registry_name_has_priority_over_ocr_candidates():
     assert segments[0]["name_source"] == "voice_registry"
 
 
+def test_calibrated_roster_avatar_identity_has_priority_over_ocr_candidates():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 2.0,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_source": "visual_roster_avatar_match",
+            "name_confidence": 0.81,
+            "text": "hello",
+        }
+    ]
+
+    attach_names(
+        segments,
+        [{"time": 1.0, "text": "Xin Chen", "path": "/tmp/frame.jpg"}],
+        allow_ocr_names=True,
+    )
+
+    assert segments[0]["name"] == "Billy"
+    assert segments[0]["name_source"] == "visual_roster_avatar_match"
+
+
+def test_participant_map_identity_has_priority_over_ocr_candidates():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 2.0,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_source": "participant_map",
+            "name_confidence": 0.95,
+            "text": "hello",
+        }
+    ]
+
+    attach_names(
+        segments,
+        [{"time": 1.0, "text": "Xin Chen", "path": "/tmp/frame.jpg"}],
+        allow_ocr_names=True,
+    )
+
+    assert segments[0]["name"] == "Billy"
+    assert segments[0]["name_source"] == "participant_map"
+
+
 def test_participant_map_overrides_voice_registry_name():
     segments = [
         {

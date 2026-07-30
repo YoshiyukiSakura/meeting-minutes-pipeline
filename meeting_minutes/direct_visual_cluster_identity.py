@@ -6,6 +6,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from .identity_authority import (
+    DIRECT_VISUAL_CLUSTER_SOURCE,
+    DYNAMIC_NAMEPLATE_SOURCE,
+    REVIEWED_SLOT_SOURCE,
+)
+
 
 class DirectVisualClusterIdentityError(ValueError):
     pass
@@ -28,12 +34,12 @@ _DEFAULTS: dict[str, Any] = {
 
 _DIRECT_FRAME_SOURCES = frozenset(
     {
-        "dynamic_visual_in_tile_nameplate_ocr",
-        "visual_profile_reviewed_slot",
+        DYNAMIC_NAMEPLATE_SOURCE,
+        REVIEWED_SLOT_SOURCE,
     }
 )
 
-_PROPAGATED_SOURCE = "direct_visual_voice_cluster_consensus"
+_PROPAGATED_SOURCE = DIRECT_VISUAL_CLUSTER_SOURCE
 
 
 def load_direct_visual_cluster_config(path: Path | None = None) -> dict[str, Any]:

@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 from meeting_minutes.dynamic_visual_identity import (
     attach_dynamic_ocr,
     attach_dynamic_visual_identity,
+    build_dynamic_sample_requests,
     detect_active_tiles,
     load_dynamic_visual_profile,
 )
@@ -58,6 +59,18 @@ def test_detect_active_tiles_without_static_person_coordinates(tmp_path):
 
     assert len(tiles) == 2
     assert all(tile["score"] >= 0.75 for tile in tiles)
+
+
+def test_dynamic_samples_avoid_the_exact_duration_boundary(tmp_path):
+    profile = _profile(tmp_path)
+
+    requests = build_dynamic_sample_requests(
+        [{"start": 99.8, "end": 100.0, "speaker": "Speaker 1"}],
+        profile,
+        duration=100.0,
+    )
+
+    assert all(request["video_time"] < 100.0 for request in requests)
 
 
 def test_same_person_can_move_to_a_new_tile_when_ocr_evidence_moves(tmp_path):
@@ -150,3 +163,54 @@ def test_static_visual_name_is_cleared_when_dynamic_evidence_is_absent(tmp_path)
 
     assert segments[0]["name"] is None
     assert segments[0]["name_source"] == "dynamic_visual_identity_unresolved"
+
+
+def test_dynamic_visual_rerun_preserves_roster_identity_without_direct_nameplate(tmp_path):
+    profile = _profile(tmp_path)
+    segments = [
+        {
+            "start": 0.8,
+            "end": 1.2,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_source": "visual_roster_avatar_match",
+            "name_confidence": 0.81,
+        }
+    ]
+    frame = {"time": 1.0, "actualTime": 1.0, "path": "/tmp/no-active.jpg", "active": False, "active_tiles": [], "reason": "no_active_tile"}
+
+    summary = attach_dynamic_visual_identity(segments, [{"segment_index": 0, "video_time": 1.0}], [frame], profile)
+
+    assert summary["preserved_roster_avatar_identity"] == 1
+    assert segments[0]["name"] == "Billy"
+    assert segments[0]["name_source"] == "visual_roster_avatar_match"
+
+
+def test_dynamic_visual_direct_nameplate_can_override_roster_identity(tmp_path):
+    profile = _profile(tmp_path)
+    segments = [
+        {
+            "start": 0.8,
+            "end": 1.2,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_source": "visual_roster_avatar_match",
+            "name_confidence": 0.81,
+        }
+    ]
+    frame = {
+        "time": 1.0,
+        "actualTime": 1.0,
+        "path": "/tmp/xin.jpg",
+        "active": True,
+        "active_tiles": [{"tile": [0.2, 0.2, 0.5, 0.6], "score": 0.99}],
+        "name": "Xin",
+        "reason": "active_named_tile_nameplate_ocr",
+    }
+
+    summary = attach_dynamic_visual_identity(segments, [{"segment_index": 0, "video_time": 1.0}], [frame], profile)
+
+    assert summary["overridden_roster_avatar_identity"] == 1
+    assert segments[0]["name"] == "Xin"
+    assert segments[0]["name_source"] == "dynamic_visual_in_tile_nameplate_ocr"
+    assert segments[0]["dynamic_visual_identity_override"]["previous_name"] == "Billy"

@@ -123,6 +123,18 @@ def test_direct_profile_requires_explicit_active_signal(tmp_path):
         load_visual_profile(path)
 
 
+def test_visual_samples_avoid_the_exact_duration_boundary(tmp_path):
+    profile = _profile(tmp_path)
+
+    requests = build_segment_sample_requests(
+        [{"start": 29.8, "end": 30.0, "speaker": "Speaker 1"}],
+        profile,
+        duration=30.0,
+    )
+
+    assert all(request["video_time"] < 30.0 for request in requests)
+
+
 def test_visual_identity_uses_profiled_green_speaker_cue(tmp_path):
     profile = _profile(tmp_path)
     profile["layouts"][0]["slots"]["left"]["active_signal"] = "green_speaker_cue"
@@ -440,3 +452,64 @@ def test_visual_identity_retains_voice_registry_without_active_visual_cue(tmp_pa
     assert summary["preserved_voice_registry_without_visual"] == 1
     assert segments[0]["name"] == "Alice"
     assert segments[0]["name_source"] == "voice_registry"
+
+
+def test_visual_identity_rerun_preserves_roster_identity_without_active_nameplate(tmp_path):
+    profile = _profile(tmp_path)
+    segments = [
+        {
+            "start": 2.0,
+            "end": 2.8,
+            "speaker": "Speaker 1",
+            "name": "Alice",
+            "name_source": "visual_roster_avatar_match",
+            "name_confidence": 0.81,
+        }
+    ]
+    frame = {
+        "time": 2.4,
+        "actualTime": 2.4,
+        "path": str(_frame(tmp_path, "inactive-roster.jpg", None)),
+        "active": False,
+        "name": None,
+        "reason": "no_active_signal",
+    }
+
+    summary = attach_visual_identity(segments, [{"segment_index": 0, "video_time": 2.4}], [frame], profile)
+
+    assert summary["preserved_roster_avatar_identity"] == 1
+    assert segments[0]["name"] == "Alice"
+    assert segments[0]["name_source"] == "visual_roster_avatar_match"
+
+
+def test_visual_identity_direct_evidence_can_override_roster_identity(tmp_path):
+    profile = _profile(tmp_path)
+    segments = [
+        {
+            "start": 2.0,
+            "end": 2.8,
+            "speaker": "Speaker 1",
+            "name": "Alice",
+            "name_source": "visual_roster_avatar_match",
+            "name_confidence": 0.81,
+        }
+    ]
+    frame = {
+        "time": 2.4,
+        "actualTime": 2.4,
+        "path": str(_frame(tmp_path, "active-roster-override.jpg", "right")),
+        "active": True,
+        "name": "Bob",
+        "score": 0.99,
+        "margin": 0.20,
+        "layout": "grid",
+        "slot": "right",
+        "reason": "active_named_slot",
+    }
+
+    summary = attach_visual_identity(segments, [{"segment_index": 0, "video_time": 2.4}], [frame], profile)
+
+    assert summary["overridden_roster_avatar_identity"] == 1
+    assert segments[0]["name"] == "Bob"
+    assert segments[0]["name_source"] == "visual_active_speaker_highlight"
+    assert segments[0]["visual_identity_override"]["previous_name"] == "Alice"

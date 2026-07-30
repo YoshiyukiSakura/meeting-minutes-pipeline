@@ -7,9 +7,9 @@ green-highlighted tile independently.  A failed match is an explicit abstention.
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
 import json
 import math
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,12 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import binary_dilation, label
 
+from .identity_authority import (
+    DYNAMIC_NAMEPLATE_SOURCE,
+    ROSTER_AVATAR_SOURCE,
+    SAME_SESSION_VISUAL_VOICE_SOURCE,
+)
+from .sample_evidence import unique_frames_for_requests
 from .visual_identity import has_trusted_identity
 
 
@@ -24,8 +30,9 @@ class AvatarTemplateProfileError(ValueError):
     """Raised when a reviewed avatar-template profile is invalid."""
 
 
-_DIRECT_NAMEPLATE_SOURCE = "dynamic_visual_in_tile_nameplate_ocr"
-_VOICEPRINT_SOURCE = "same_session_visual_voiceprint"
+_DIRECT_NAMEPLATE_SOURCE = DYNAMIC_NAMEPLATE_SOURCE
+_ROSTER_AVATAR_SOURCE = ROSTER_AVATAR_SOURCE
+_VOICEPRINT_SOURCE = SAME_SESSION_VISUAL_VOICE_SOURCE
 _DEFAULTS: dict[str, Any] = {
     "minimum_similarity": 0.60,
     "minimum_margin": 0.30,
@@ -156,13 +163,14 @@ def load_avatar_template_profile(path: Path) -> dict[str, Any]:
     return {"templates": normalized_templates, "negative_samples": normalized_negatives, "settings": settings}
 
 
-def extract_avatar_signature(path: Path, box: tuple[float, float, float, float], settings: dict[str, Any]) -> dict[str, Any]:
-    """Extract a centered, scale-normalized avatar signature from one tile box."""
+def extract_avatar_signature_from_image(
+    image: Image.Image,
+    box: tuple[float, float, float, float],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract a centered, scale-normalized avatar signature from an RGB frame."""
 
-    if not path.exists():
-        raise FileNotFoundError(f"Avatar source frame does not exist: {path}")
-    with Image.open(path) as source:
-        image = source.convert("RGB")
+    image = image.convert("RGB")
     width, height = image.size
     x1, y1, x2, y2 = box
     left = max(0, min(width - 1, round(x1 * width)))
@@ -243,6 +251,16 @@ def extract_avatar_signature(path: Path, box: tuple[float, float, float, float],
     }
 
 
+def extract_avatar_signature(path: Path, box: tuple[float, float, float, float], settings: dict[str, Any]) -> dict[str, Any]:
+    """Extract a centered, scale-normalized avatar signature from one tile box."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Avatar source frame does not exist: {path}")
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+    return extract_avatar_signature_from_image(image, box, settings)
+
+
 def _similarity(left: np.ndarray, right: np.ndarray) -> float:
     normalized_left = left - float(left.mean())
     normalized_right = right - float(right.mean())
@@ -310,7 +328,7 @@ def calibrate_avatar_templates(
         try:
             signature = extract_avatar_signature(path, tuple(float(value) for value in frame["active_tiles"][0]["tile"]), settings)
             ranked = _rank_avatar(np.asarray(signature["vector"]), templates)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - calibration failures are retained as evidence
             validation.append(
                 {
                     "path": str(path),
@@ -359,7 +377,7 @@ def calibrate_avatar_templates(
                     "decision": "false_accept" if accepted else "rejected",
                 }
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - invalid negative evidence blocks the calibration gate
             negatives.append(
                 {
                     "description": sample["description"],
@@ -477,7 +495,7 @@ def score_avatar_template_frames(
                     "reference_frame": str(templates[top_name]["path"]),
                     "reference_tile": list(templates[top_name]["box"]),
                 }
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - per-frame template failures must abstain
                 detail = {"decision": "signature_error", "error": f"{type(exc).__name__}: {exc}"}
         record["avatar_template_identity"] = detail
         scored.append(record)
@@ -502,17 +520,14 @@ def attach_avatar_template_identity(
         "assigned": 0,
         "corroborated_voiceprint": 0,
         "voiceprint_conflicts_preserved": 0,
+        "roster_avatar_conflicts_preserved": 0,
         "direct_nameplate_conflicts": 0,
         "reviewed_identity_conflicts_preserved": 0,
         "unresolved": 0,
         "by_decision": Counter(),
     }
     for index, segment in enumerate(segments):
-        sample_frames = [
-            frame_by_time.get(round(float(request["video_time"]), 3))
-            for request in requests_by_segment.get(index, [])
-        ]
-        sample_frames = [frame for frame in sample_frames if frame]
+        sample_frames = unique_frames_for_requests(requests_by_segment.get(index, []), frame_by_time)
         evidence = []
         for frame in sample_frames:
             detail = dict(frame.get("avatar_template_identity") or {})
@@ -578,6 +593,17 @@ def attach_avatar_template_identity(
             else:
                 segment["avatar_template_identity_corroborates"] = existing_source
             continue
+        if existing_source == _ROSTER_AVATAR_SOURCE and existing_name:
+            if str(existing_name) != name:
+                segment["avatar_template_identity_conflict"] = {
+                    "reason": "roster_avatar_disagrees_with_avatar_template",
+                    "roster_avatar_name": existing_name,
+                    "avatar_name": name,
+                }
+                summary["roster_avatar_conflicts_preserved"] += 1
+            else:
+                segment["avatar_template_identity_corroborates"] = _ROSTER_AVATAR_SOURCE
+            continue
         if existing_source == _VOICEPRINT_SOURCE and existing_name and str(existing_name) != name:
             segment["avatar_template_identity_conflict"] = {
                 "reason": "voiceprint_disagrees_with_avatar_template",
@@ -639,6 +665,7 @@ def write_avatar_template_identity_report(
         "assigned",
         "corroborated_voiceprint",
         "voiceprint_conflicts_preserved",
+        "roster_avatar_conflicts_preserved",
         "direct_nameplate_conflicts",
         "reviewed_identity_conflicts_preserved",
         "unresolved",

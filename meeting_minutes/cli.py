@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 import hashlib
 import sys
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ from .deepseek import (
     generate_deepseek_review,
     write_deepseek_review,
 )
+from .diarization import attach_speakers, diarize_audio, split_segments_by_turns
 from .direct_visual_cluster_identity import (
     apply_direct_visual_cluster_identity,
     build_direct_visual_cluster_identity,
@@ -38,7 +39,6 @@ from .direct_visual_cluster_identity import (
     load_direct_visual_cluster_config,
     write_direct_visual_cluster_report,
 )
-from .diarization import attach_speakers, diarize_audio, split_segments_by_turns
 from .doctor import collect_environment_checks, doctor_exit_code, render_doctor_report
 from .dynamic_visual_identity import (
     attach_dynamic_ocr,
@@ -53,7 +53,15 @@ from .dynamic_visual_identity import (
 from .identity import attach_names, load_participant_map
 from .jsonio import read_json, write_json
 from .keyframes import choose_keyframes, keyword_times, regular_times
-from .media import extract_audio, extract_frames, make_clip, ocr_frames, ocr_manifest_diagnostics, ocr_regions, probe_media
+from .media import (
+    extract_audio,
+    extract_frames,
+    make_clip,
+    ocr_frames,
+    ocr_manifest_diagnostics,
+    ocr_regions,
+    probe_media,
+)
 from .minutes_contract import (
     parse_shareable_action_rows,
     parse_shareable_project_update_rows,
@@ -86,6 +94,18 @@ from .report import (
     write_review_queue,
     write_speaker_samples,
     write_transcript_markdown,
+)
+from .roster_avatar_identity import (
+    attach_roster_avatar_identity,
+    build_reviewed_anchor_requests,
+    build_roster_ocr_manifest,
+    build_roster_sample_requests,
+    calibrate_roster_avatar_identity,
+    detect_roster_active_frames,
+    load_roster_avatar_profile,
+    score_roster_avatar_frames,
+    unique_roster_video_times,
+    write_roster_avatar_identity_report,
 )
 from .smart_minutes import (
     SMART_MINUTES_AUDIT_FORMAT,
@@ -295,6 +315,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     avatar_template_identify.add_argument("--output-dir", required=True, type=Path)
     avatar_template_identify.add_argument("--avatar-template-profile", required=True, type=Path)
+
+    roster_avatar_identify = sub.add_parser(
+        "roster-avatar-identify",
+        help="Apply reviewed same-frame Discord roster-avatar identity evidence to an existing run.",
+    )
+    roster_avatar_identify.add_argument("--output-dir", required=True, type=Path)
+    roster_avatar_identify.add_argument("--roster-avatar-profile", required=True, type=Path)
+    roster_avatar_identify.add_argument("--input", type=Path, help="Override the effective input recorded in metadata.json.")
+    roster_avatar_identify.add_argument("--max-frame-width", type=int, default=1280)
 
     visual_voice_identify = sub.add_parser(
         "visual-voice-identify",
@@ -1847,6 +1876,159 @@ def avatar_template_identify_existing(args: argparse.Namespace) -> int:
     return 0
 
 
+def roster_avatar_identify_existing(args: argparse.Namespace) -> int:
+    """Apply calibrated same-frame roster-avatar evidence to an existing run."""
+
+    output_dir = args.output_dir.expanduser().resolve()
+    metadata = read_json(output_dir / "metadata.json")
+    input_path = (
+        args.input.expanduser().resolve()
+        if args.input
+        else Path(str(metadata.get("effective_input") or metadata.get("input"))).expanduser().resolve()
+    )
+    if not input_path.exists():
+        raise FileNotFoundError(f"Roster avatar identity input does not exist: {input_path}")
+    transcript_path = output_dir / "transcript.json"
+    if not transcript_path.exists():
+        raise FileNotFoundError(f"Expected transcript at {transcript_path}")
+    duration = float(metadata.get("duration", 0.0))
+    if duration <= 0.0:
+        raise ValueError("Roster avatar identity requires a positive recording duration in metadata.json")
+    profile_path = args.roster_avatar_profile.expanduser().resolve()
+    profile = load_roster_avatar_profile(profile_path)
+    segments = read_json(transcript_path)
+    had_active_roster_identity = any(
+        segment.get("name") and str(segment.get("name_source") or "") == "visual_roster_avatar_match"
+        for segment in segments
+    )
+    sample_requests = build_roster_sample_requests(segments, profile, duration=duration)
+    anchor_requests = build_reviewed_anchor_requests(profile, duration=duration)
+    all_requests = [*sample_requests, *anchor_requests]
+    if not all_requests:
+        raise ValueError("Roster avatar identity has no transcript samples or reviewed anchors to inspect")
+    frame_dir = output_dir / "work" / "roster_avatar_identity_frames"
+    frames = extract_frames(
+        input_path,
+        unique_roster_video_times(all_requests),
+        frame_dir,
+        max_width=args.max_frame_width,
+    )
+    detected_frames = detect_roster_active_frames(frames, profile)
+    ocr_manifest = build_roster_ocr_manifest(frames, profile)
+    ocr_dir = output_dir / "work" / "roster_avatar_identity_ocr"
+    roster_ocr = ocr_regions(ocr_manifest, ocr_dir) if ocr_manifest else []
+    anchor_names_by_time: dict[float, list[str]] = {}
+    for request in anchor_requests:
+        time = round(float(request["video_time"]), 3)
+        anchor_names_by_time.setdefault(time, []).append(str(request["expected_name"]))
+    scored_frames = score_roster_avatar_frames(
+        detected_frames,
+        roster_ocr,
+        profile,
+        anchor_names_by_time=anchor_names_by_time,
+    )
+    calibration = calibrate_roster_avatar_identity(scored_frames, profile)
+    attachment_summary = attach_roster_avatar_identity(
+        segments,
+        sample_requests,
+        scored_frames,
+        profile,
+        calibration,
+    )
+    blocked_preserving_active_identity = (
+        calibration.get("gate", {}).get("status") != "passed" and had_active_roster_identity
+    )
+    serializable_layouts = [
+        {
+            **layout,
+            "end": None if str(layout["end"]) == "inf" else layout["end"],
+        }
+        for layout in profile["layouts"]
+    ]
+    artifact = {
+        "format": "meeting-minutes.roster-avatar-identity.v1",
+        "profile": str(profile_path),
+        "recording": _visual_recording_provenance(input_path, duration),
+        "participants": profile["participants"],
+        "settings": profile["settings"],
+        "layouts": serializable_layouts,
+        "reviewed_anchors": profile["reviewed_anchors"],
+        "calibration": calibration,
+        "summary": attachment_summary,
+        "frames": scored_frames,
+        "application": {
+            "status": "blocked_preserved_active_identity"
+            if blocked_preserving_active_identity
+            else "applied",
+            "active_roster_segments_preserved": attachment_summary["preserved_prior_roster_identity"],
+        },
+    }
+    artifact_suffix = ".attempt" if blocked_preserving_active_identity else ""
+    artifact_path = output_dir / f"roster_avatar_identity{artifact_suffix}.json"
+    samples_path = output_dir / f"roster_avatar_identity_samples{artifact_suffix}.json"
+    anchors_path = output_dir / f"roster_avatar_identity_anchors{artifact_suffix}.json"
+    ocr_manifest_path = output_dir / f"roster_avatar_identity_ocr_manifest{artifact_suffix}.json"
+    ocr_path = output_dir / f"roster_avatar_identity_ocr{artifact_suffix}.json"
+    report_path = (
+        output_dir / "roster_avatar_identity_attempt_report.md"
+        if blocked_preserving_active_identity
+        else output_dir / "roster_avatar_identity_report.md"
+    )
+    write_json(artifact_path, artifact)
+    write_json(samples_path, sample_requests)
+    write_json(anchors_path, anchor_requests)
+    write_json(ocr_manifest_path, ocr_manifest)
+    write_json(ocr_path, roster_ocr)
+    write_roster_avatar_identity_report(
+        report_path,
+        profile_path=profile_path,
+        calibration=calibration,
+        attachment_summary=attachment_summary,
+    )
+    keyframes = read_json(output_dir / "keyframes.json") if (output_dir / "keyframes.json").exists() else []
+    ocr_records = read_json(output_dir / "ocr.json") if (output_dir / "ocr.json").exists() else []
+    run_status = read_json(output_dir / "run_status.json") if (output_dir / "run_status.json").exists() else {}
+    statuses = dict(run_status.get("statuses", {}))
+    if blocked_preserving_active_identity:
+        statuses["roster_avatar_identity_attempt"] = {
+            "status": "blocked_preserved_active_identity",
+            "gate": calibration["gate"],
+            "reviewed_anchors": len(calibration["anchors"]),
+            "distinct_anchor_identities": calibration["distinct_anchor_identities"],
+            **attachment_summary,
+        }
+        write_json(output_dir / "run_status.json", {**run_status, "statuses": statuses})
+        print(str(report_path))
+        return 0
+    statuses["roster_avatar_identity"] = {
+        "gate": calibration["gate"],
+        "reviewed_anchors": len(calibration["anchors"]),
+        "distinct_anchor_identities": calibration["distinct_anchor_identities"],
+        **attachment_summary,
+    }
+    action_ledger = _write_action_artifacts(output_dir, segments, statuses)
+    write_json(transcript_path, segments)
+    write_transcript_markdown(output_dir / "transcript.md", segments)
+    write_speaker_samples(output_dir / "speaker_samples.md", segments)
+    write_quality_report(output_dir / "quality_report.md", segments=segments, ocr_records=ocr_records, keyframes=keyframes, statuses=statuses)
+    write_review_queue(output_dir / "review_queue.md", segments, action_ledger=action_ledger)
+    report_meta = {
+        "input": metadata.get("input"),
+        "duration": duration,
+        "source_offset": metadata.get("source_offset", 0.0),
+    }
+    write_extractive_minutes(
+        output_dir / "minutes.extractive.md",
+        segments=segments,
+        keyframes=keyframes,
+        metadata=report_meta,
+        action_ledger=action_ledger,
+    )
+    write_json(output_dir / "run_status.json", {**run_status, "statuses": statuses})
+    print(str(report_path))
+    return 0
+
+
 def relabel_existing(args: argparse.Namespace) -> int:
     """Apply a reviewed speaker map to an already processed recording.
 
@@ -2368,6 +2550,8 @@ def main(argv: list[str] | None = None) -> int:
         return direct_visual_cluster_identify_existing(args)
     if args.command == "avatar-template-identify":
         return avatar_template_identify_existing(args)
+    if args.command == "roster-avatar-identify":
+        return roster_avatar_identify_existing(args)
     if args.command == "relabel":
         return relabel_existing(args)
     if args.command == "audit-actions":

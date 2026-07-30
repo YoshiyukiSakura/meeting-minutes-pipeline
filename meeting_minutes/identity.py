@@ -5,8 +5,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .identity_authority import (
+    USER_CONFIRMED_SPEAKER_VOLUME_SOURCE,
+    VOICE_ENROLLMENT_SOURCE,
+    has_operator_locked_identity,
+    is_protected_from_ocr_overwrite,
+    name_source,
+)
 from .jsonio import read_json
-
 
 UI_STOPWORDS = {
     "gmt",
@@ -107,11 +113,17 @@ def attach_names(
     participant_map = participant_map or {}
     name_index = build_ocr_name_index(ocr_records)
     for segment in segments:
+        existing_source = name_source(segment)
         if (
-            segment.get("name")
-            and segment.get("name_source") in {"voice_enrollment", "user_confirmed_speaker_volume_mapping"}
+            has_operator_locked_identity(segment)
+            and existing_source in {VOICE_ENROLLMENT_SOURCE, USER_CONFIRMED_SPEAKER_VOLUME_SOURCE}
             and float(segment.get("name_confidence", 0.0)) >= 0.6
         ):
+            continue
+        if has_operator_locked_identity(segment) and existing_source not in {
+            VOICE_ENROLLMENT_SOURCE,
+            USER_CONFIRMED_SPEAKER_VOLUME_SOURCE,
+        }:
             continue
 
         mapped = participant_map.get(str(segment.get("speaker")))
@@ -121,11 +133,7 @@ def attach_names(
             segment["name_confidence"] = 0.95
             continue
 
-        if (
-            segment.get("name")
-            and segment.get("name_source") == "voice_registry"
-            and float(segment.get("name_confidence", 0.0)) >= 0.6
-        ):
+        if is_protected_from_ocr_overwrite(segment):
             continue
 
         midpoint = (float(segment["start"]) + float(segment["end"])) / 2

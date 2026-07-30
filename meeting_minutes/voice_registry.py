@@ -17,13 +17,11 @@ from .diarization import (
     _windows_from_ranges,
     load_voice_enrollment,
 )
+from .identity_authority import is_protected_from_voice_registry_overwrite
 from .media import extract_audio
 
 VOICE_REGISTRY_FORMAT = "meeting-minutes/voice-registry-v1"
 VOICE_REGISTRY_SOURCES_FORMAT = "meeting-minutes/voice-registry-sources-v1"
-_TRUSTED_NAME_SOURCES = {"voice_enrollment", "voice_registry", "user_confirmed_speaker_volume_mapping"}
-
-
 def _read_json_object(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -350,7 +348,7 @@ def attach_registry_scores(
     for segment, candidates in zip(segments, evidence_by_segment):
         if not candidates:
             continue
-        if str(segment.get("name_source") or "") in _TRUSTED_NAME_SOURCES:
+        if is_protected_from_voice_registry_overwrite(segment):
             skipped_trusted += 1
             continue
         ranked_candidates = sorted(

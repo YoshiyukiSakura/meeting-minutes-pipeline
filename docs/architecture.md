@@ -32,7 +32,8 @@ flowchart LR
 | ASR | `meeting_minutes/asr.py` | `mlx-whisper` invocation and transcript segment normalization. |
 | Diarization | `meeting_minutes/diarization.py` | SpeechBrain, pyannote, voice enrollment, speaker attachment. |
 | Identity | `meeting_minutes/identity.py` | Participant maps, OCR candidates, evidence-preserving name attachment. |
-| Visual identity | `meeting_minutes/visual_identity.py`, `meeting_minutes/visual_highlight.py`, and `meeting_minutes/cli.py` | Time-bounded layout profiles, active-speaker border scoring, cropped nameplate OCR, segment-level identity assignment, calibration evidence, and recording provenance bound to path, duration, size, and content SHA-256. |
+| Visual identity | `meeting_minutes/visual_identity.py`, `meeting_minutes/visual_highlight.py`, and `meeting_minutes/cli.py` | Time-bounded layout profiles, active-speaker border scoring, cropped nameplate OCR, segment-level identity assignment, calibration evidence, and recording provenance bound to path, duration, size, and content SHA-256. A later direct-nameplate consensus may correct roster-avatar evidence; absent or ambiguous visual evidence preserves it. |
+| Same-frame roster avatar identity | `meeting_minutes/roster_avatar_identity.py` and `meeting_minutes/cli.py` | Isolated Discord-style side-roster evidence path. It uses exact whitelisted roster OCR and same-frame dual-scale avatar matching only after three reviewed distinct anchors open a calibration gate; default, indistinguishable, camera, screen-share, absent, multi-active, and ambiguous candidates abstain. Automatic names default to the identities represented by accepted anchors; calibrated results can correct cluster or same-session voiceprint propagation but never direct labels, confirmation, or enrolled voice identities. Later visual, template, and voiceprint stages preserve it unless stronger direct identity evidence passes its own consensus gate. |
 | Action guard | `meeting_minutes/action_items.py` | Atomic commitment extraction, stable source IDs, topic and attribute normalization, constraint facts, and deterministic publication validation. |
 | Reporting | `meeting_minutes/report.py` | Markdown transcript, minutes, quality report, review queue, speaker samples. |
 | Summarization | `meeting_minutes/summarizer.py`, `meeting_minutes/deepseek.py` | Optional local or explicit remote LLM review drafts. Neither is an identity source or action-item publisher. DeepSeek accepts only `text` plus exact segment IDs, fingerprints exactly those transmitted records, derives quotes and times locally, blocks redirects, and never changes canonical minutes. |
@@ -49,6 +50,8 @@ flowchart LR
 | `ocr.json` | OCR stage | Frame path, timestamp, recognized text records. |
 | `visual_identity.json` | Visual identity command | Recording provenance, profile settings, slot-name resolution, per-frame highlight scores, and segment assignment summary. |
 | `visual_identity_report.md` | Visual identity command | Human-readable calibration evidence, resolved slots, assignment counts, and explicit limits. |
+| `roster_avatar_identity.json` | Roster avatar identity command | Recording provenance, reviewed anchors, calibration verdict, exact roster OCR, per-frame candidates, rejection reasons, and assignment summary. |
+| `roster_avatar_identity_report.md` | Roster avatar identity command | Human-readable gate verdict and assignment summary for the same-frame roster-avatar path. |
 | `action_items.json` | Action guard | Transcript fingerprint, candidates, exact quotes, bounded evidence, source-topic-bound normalized attributes, contradiction constraints, and an independent weak-intent recall audit. |
 | `action_items.md` | Action guard | Human-readable publishable and review-required action ledger. |
 | `minutes.md` | Reporting | Evidence-backed summary candidates, timestamp links, and action rows rendered only from the action ledger. |
@@ -74,12 +77,15 @@ The action guard is a fail-closed publication boundary:
 From strongest to weakest:
 
 1. Voice enrollment from clear non-overlapping known-speaker ranges.
-2. Segment-level visual active-speaker evidence with calibrated UI boxes.
-3. Reviewed cluster fallback, clearly marked as cluster-level evidence.
-4. Human participant map from `Speaker N` to a name.
-5. OCR candidate names, retained as candidates unless explicitly allowed.
+2. Explicit human-reviewed participant map from `Speaker N` to a name.
+3. Segment-level visual active-speaker evidence with calibrated UI boxes and an in-tile nameplate.
+4. Calibrated same-frame side-roster avatar evidence with reviewed anchors.
+5. Reviewed cluster fallback, clearly marked as cluster-level evidence.
+6. OCR candidate names, retained as candidates unless explicitly allowed.
 
-The pipeline never promotes an anonymous voice cluster to a real name without one of these evidence sources.
+An explicit participant map is operator-supplied review, not a cluster inference. The pipeline preserves it when visual evidence disagrees and records the conflict for audit. The pipeline never promotes an anonymous voice cluster to a real name without one of these evidence sources.
+
+All identity stages use one shared provenance authority table. A later generic OCR pass or cross-recording voice-registry pass cannot overwrite a reviewed map, calibrated active-speaker evidence, same-frame roster-avatar evidence, or another accepted registry label. A later direct active-speaker nameplate may supersede roster-avatar evidence only when its own segment-level consensus gate passes, and the replacement records the earlier identity and source. A failed roster-avatar recalibration is an attempt-only audit and cannot replace an already active, calibrated roster identity artifact or transcript. A passing rerun likewise preserves a prior roster identity for any segment whose new same-frame evidence is absent, ambiguous, unanchored, or below the configured consensus gate.
 
 ## Platform Matrix
 

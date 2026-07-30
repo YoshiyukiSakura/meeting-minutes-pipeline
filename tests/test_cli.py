@@ -374,6 +374,71 @@ def test_visual_refresh_invalidates_prior_cluster_artifacts(tmp_path, monkeypatc
     assert read_json(tmp_path / "direct_visual_cluster_identity.json")["status"] == "invalidated_by_visual_identity_refresh"
 
 
+def test_roster_avatar_failed_rerun_preserves_active_artifacts(tmp_path, monkeypatch):
+    recording = tmp_path / "recording.mov"
+    recording.write_bytes(b"recording")
+    transcript = [
+        {
+            "start": 1.0,
+            "end": 2.0,
+            "speaker": "Speaker 1",
+            "text": "Current status.",
+            "name": "Billy",
+            "name_source": "visual_roster_avatar_match",
+            "name_confidence": 0.81,
+        }
+    ]
+    write_json(tmp_path / "metadata.json", {"effective_input": str(recording), "duration": 10.0, "source_offset": 0.0})
+    write_json(tmp_path / "transcript.json", transcript)
+    write_json(
+        tmp_path / "run_status.json",
+        {"statuses": {"roster_avatar_identity": {"gate": {"status": "passed"}}}},
+    )
+    write_json(tmp_path / "roster_avatar_identity.json", {"active": True})
+    (tmp_path / "roster_avatar_identity_report.md").write_text("active report\n", encoding="utf-8")
+
+    calibration = {
+        "gate": {"status": "blocked", "requirements": {"all_reviewed_anchors_matched": False}},
+        "anchors": [],
+        "accepted_anchors": 0,
+        "distinct_anchor_identities": [],
+        "eligible_identities": [],
+    }
+    monkeypatch.setattr(
+        cli,
+        "load_roster_avatar_profile",
+        lambda _path: {"participants": ["Billy"], "settings": {}, "layouts": [], "reviewed_anchors": []},
+    )
+    monkeypatch.setattr(cli, "build_roster_sample_requests", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        cli,
+        "build_reviewed_anchor_requests",
+        lambda *_args, **_kwargs: [{"kind": "reviewed_anchor", "expected_name": "Billy", "video_time": 1.0}],
+    )
+    monkeypatch.setattr(cli, "unique_roster_video_times", lambda _requests: [1.0])
+    monkeypatch.setattr(cli, "extract_frames", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "detect_roster_active_frames", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "build_roster_ocr_manifest", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "score_roster_avatar_frames", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "calibrate_roster_avatar_identity", lambda *_args, **_kwargs: calibration)
+
+    assert cli.roster_avatar_identify_existing(
+        SimpleNamespace(
+            output_dir=tmp_path,
+            input=None,
+            roster_avatar_profile=tmp_path / "profile.json",
+            max_frame_width=1280,
+        )
+    ) == 0
+
+    assert read_json(tmp_path / "transcript.json") == transcript
+    assert read_json(tmp_path / "roster_avatar_identity.json") == {"active": True}
+    assert (tmp_path / "roster_avatar_identity_report.md").read_text(encoding="utf-8") == "active report\n"
+    attempt = read_json(tmp_path / "roster_avatar_identity.attempt.json")
+    assert attempt["application"]["status"] == "blocked_preserved_active_identity"
+    assert read_json(tmp_path / "run_status.json")["statuses"]["roster_avatar_identity_attempt"]["status"] == "blocked_preserved_active_identity"
+
+
 def test_direct_visual_cluster_failure_persists_retraction(tmp_path):
     recording = tmp_path / "recording.mov"
     recording.write_bytes(b"recording")

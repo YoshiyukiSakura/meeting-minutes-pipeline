@@ -35,6 +35,7 @@ The repository now treats product scope, evidence boundaries, and verification a
 - [docs/adr/0001-local-first-evidence-pipeline.md](docs/adr/0001-local-first-evidence-pipeline.md): decision record for the local-first evidence pipeline.
 - [docs/acceptance-matrix.md](docs/acceptance-matrix.md): acceptance items mapped to automated tests and manual evidence.
 - [docs/project-plan.md](docs/project-plan.md): canonical implementation plan and backlog.
+- [docs/roster-avatar-identity.md](docs/roster-avatar-identity.md): calibrated same-frame side-roster avatar evidence for Discord Huddles and similar UIs.
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow, privacy gate, and verification rules.
 
 ## Pipeline
@@ -243,6 +244,18 @@ uv run meeting-minutes visual-identify \
 To apply visual evidence during a new run, add `--visual-profile "$HOME/Documents/meeting-output/visual-profile.json"` to `meeting-minutes run`.
 
 The command writes `visual_identity.json`, `visual_identity_report.md`, nameplate OCR evidence, and referenced frames. An OCR result without a participant whitelist remains a candidate, not a real name. See [docs/visual-identity.md](docs/visual-identity.md) for the profile contract and review rules.
+
+### Side-Roster Avatar Identity
+
+`roster-avatar-identify` is a separate, calibrated evidence path for interfaces such as Discord Huddles where the active tile has no readable nameplate but the same frame exposes a named participant roster. It matches the active tile avatar against roster avatars visible in that exact frame. It is intentionally isolated from the direct-nameplate and same-session voiceprint paths.
+
+The profile must define a participant whitelist, a time-bounded roster region, three manually reviewed and distinct anchor identities, and avatar geometry. The command opens its gate only when all anchors are recovered correctly. By default it can name only identities represented by accepted anchors. It rejects default or indistinguishable avatars, camera or screen-share tiles, zero or multiple active highlights, insufficient roster names, and ambiguous matches. Calibrated same-frame roster evidence may correct weaker cluster or same-session voiceprint labels, but it never overrides a direct nameplate, human confirmation, or enrolled voice identity. Later visual, template, and voiceprint passes preserve the roster identity unless they have a stronger direct active-speaker nameplate consensus. If a recalibration fails while roster identities are already active, it writes attempt-only artifacts and preserves the active transcript, roster evidence, and published minutes. See [docs/roster-avatar-identity.md](docs/roster-avatar-identity.md) for the full contract.
+
+```bash
+uv run meeting-minutes roster-avatar-identify \
+  --output-dir "$HOME/Documents/meeting-output" \
+  --roster-avatar-profile "$HOME/Documents/meeting-output/roster-avatar-profile.json"
+```
 
 ## Privacy
 

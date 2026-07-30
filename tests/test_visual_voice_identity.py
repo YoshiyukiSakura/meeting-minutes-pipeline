@@ -137,6 +137,35 @@ def test_voice_scores_preserve_direct_static_visual_identity():
     assert segments[0]["name_source"] == "visual_active_speaker_highlight"
 
 
+def test_voice_scores_preserve_calibrated_roster_avatar_identity():
+    registry = {
+        "format": "same-session-visual-voice-registry/v1",
+        "settings": {"minimum_segment_vote_share": 0.8, "short_segment_seconds": 1.8},
+        "calibration": {"status": "precision_calibrated", "threshold": 0.5, "margin": 0.12},
+    }
+    segments = [
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_source": "visual_roster_avatar_match",
+        }
+    ]
+
+    status = attach_visual_voice_scores(
+        segments,
+        [{"segment_index": 0, "start": 0.0, "end": 1.0}],
+        np.asarray([[0.10, 0.90]], dtype="float32"),
+        ["Billy", "Xin"],
+        registry,
+    )
+
+    assert status["preserved_direct_visual_segments"] == 1
+    assert segments[0]["name"] == "Billy"
+    assert segments[0]["name_source"] == "visual_roster_avatar_match"
+
+
 def test_voice_scores_can_correct_cluster_propagated_identity_after_precision_gate():
     registry = {
         "format": "same-session-visual-voice-registry/v2",

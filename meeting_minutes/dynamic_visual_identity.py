@@ -11,8 +11,10 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from .identity_authority import ROSTER_AVATAR_SOURCE
+from .sample_evidence import unique_frames_for_requests
 from .visual_highlight import score_green_highlight_border
-from .visual_identity import _resolve_candidate, has_trusted_identity
+from .visual_identity import _resolve_candidate, has_roster_avatar_identity, has_trusted_identity
 
 
 class DynamicVisualProfileError(ValueError):
@@ -121,7 +123,7 @@ def build_dynamic_sample_requests(
             fractions = [0.2, 0.5, 0.8]
         for fraction in fractions:
             timeline_time = start + segment_duration * fraction
-            video_time = min(max(0.0, timeline_time + offset), duration)
+            video_time = min(max(0.0, timeline_time + offset), max(0.0, duration - 0.001))
             requests.append(
                 {
                     "segment_index": segment_index,
@@ -354,7 +356,7 @@ def attach_dynamic_ocr(
 
 def _clear_stale_visual_identity(segment: dict[str, Any]) -> None:
     source = str(segment.get("name_source") or "")
-    if source.startswith("visual_") or source.startswith("dynamic_visual_"):
+    if source != ROSTER_AVATAR_SOURCE and source.startswith(("visual_", "dynamic_visual_")):
         segment["name"] = None
         segment["name_source"] = None
         segment["name_confidence"] = 0.0
@@ -366,6 +368,24 @@ def _clear_stale_visual_identity(segment: dict[str, Any]) -> None:
         "dynamic_visual_identity_conflict",
     ):
         segment.pop(key, None)
+
+
+def _preserve_roster_avatar_identity(
+    segment: dict[str, Any],
+    summary: dict[str, Any],
+    *,
+    reason: str,
+    visual_names: set[str] | None = None,
+) -> None:
+    summary["preserved_roster_avatar_identity"] += 1
+    summary["by_reason"][f"roster_avatar_preserved:{reason}"] += 1
+    if visual_names:
+        segment["dynamic_visual_identity_conflict"] = {
+            "reason": reason,
+            "roster_avatar_name": segment.get("name"),
+            "visual_names": sorted(visual_names),
+        }
+        summary["conflicts"] += 1
 
 
 def attach_dynamic_visual_identity(
@@ -387,15 +407,21 @@ def attach_dynamic_visual_identity(
         "unresolved": 0,
         "conflicts": 0,
         "preserved_trusted_identity": 0,
+        "preserved_roster_avatar_identity": 0,
+        "overridden_roster_avatar_identity": 0,
+        "corroborated_roster_avatar_identity": 0,
         "by_reason": Counter(),
     }
     vote_share_required = float(profile["settings"]["minimum_segment_vote_share"])
     short_seconds = float(profile["settings"]["short_segment_seconds"])
     strong_single_score = float(profile["settings"]["strong_single_score"])
     for index, segment in enumerate(segments):
-        sample_frames = [frame_by_time.get(round(float(request["video_time"]), 3)) for request in requests_by_segment.get(index, [])]
-        sample_frames = [frame for frame in sample_frames if frame]
+        sample_frames = unique_frames_for_requests(requests_by_segment.get(index, []), frame_by_time)
+        existing_name = segment.get("name")
+        existing_source = str(segment.get("name_source") or "")
+        existing_confidence = segment.get("name_confidence")
         trusted = has_trusted_identity(segment)
+        roster_identity = has_roster_avatar_identity(segment)
         _clear_stale_visual_identity(segment)
         evidence = [
             {
@@ -422,6 +448,9 @@ def attach_dynamic_visual_identity(
                 summary["by_reason"]["trusted_identity_disagrees_with_dynamic_visual_evidence"] += 1
             continue
         if any(frame.get("reason") == "multiple_active_tiles" for frame in sample_frames):
+            if roster_identity:
+                _preserve_roster_avatar_identity(segment, summary, reason="multiple_active_tiles_in_segment")
+                continue
             segment["name"] = None
             segment["name_source"] = "dynamic_visual_identity_conflict"
             segment["name_confidence"] = 0.0
@@ -433,6 +462,14 @@ def attach_dynamic_visual_identity(
         named_frames = [frame for frame in sample_frames if frame.get("name")]
         votes = Counter(str(frame["name"]) for frame in named_frames)
         if len(votes) > 1:
+            if roster_identity:
+                _preserve_roster_avatar_identity(
+                    segment,
+                    summary,
+                    reason="multiple_names_in_segment",
+                    visual_names=set(votes),
+                )
+                continue
             segment["name"] = None
             segment["name_source"] = "dynamic_visual_identity_conflict"
             segment["name_confidence"] = 0.0
@@ -445,6 +482,9 @@ def attach_dynamic_visual_identity(
             summary["by_reason"]["multiple_names_in_segment"] += 1
             continue
         if not votes:
+            if roster_identity:
+                _preserve_roster_avatar_identity(segment, summary, reason="no_named_active_visual_evidence")
+                continue
             segment["name"] = None
             segment["name_source"] = "dynamic_visual_identity_unresolved"
             segment["name_confidence"] = 0.0
@@ -459,6 +499,14 @@ def attach_dynamic_visual_identity(
         matched = [frame for frame in named_frames if frame.get("name") == name]
         mean_score = sum(float(frame["active_tiles"][0]["score"]) for frame in matched) / len(matched)
         if count < required_count or vote_share < vote_share_required or (required_count == 1 and mean_score < strong_single_score):
+            if roster_identity:
+                _preserve_roster_avatar_identity(
+                    segment,
+                    summary,
+                    reason="insufficient_dynamic_visual_consensus",
+                    visual_names={name},
+                )
+                continue
             segment["name"] = None
             segment["name_source"] = "dynamic_visual_identity_unresolved"
             segment["name_confidence"] = 0.0
@@ -466,6 +514,18 @@ def attach_dynamic_visual_identity(
             summary["by_reason"]["insufficient_dynamic_visual_consensus"] += 1
             continue
         confidence = min(0.94, 0.64 + 0.16 * vote_share + 0.20 * mean_score)
+        if roster_identity:
+            if existing_name == name:
+                summary["corroborated_roster_avatar_identity"] += 1
+            else:
+                segment["dynamic_visual_identity_override"] = {
+                    "reason": "direct_visual_evidence_overrides_roster_avatar",
+                    "previous_name": existing_name,
+                    "previous_source": existing_source,
+                    "previous_confidence": existing_confidence,
+                    "visual_name": name,
+                }
+                summary["overridden_roster_avatar_identity"] += 1
         segment["name"] = name
         segment["name_source"] = "dynamic_visual_in_tile_nameplate_ocr"
         segment["name_confidence"] = round(confidence, 3)
@@ -507,6 +567,9 @@ def write_dynamic_visual_identity_report(
         f"- Unresolved segments: {summary['unresolved']}",
         f"- Conflicting segments: {summary['conflicts']}",
         f"- Preserved trusted identities: {summary['preserved_trusted_identity']}",
+        f"- Preserved roster-avatar identities: {summary['preserved_roster_avatar_identity']}",
+        f"- Direct visual overrides of roster-avatar identities: {summary['overridden_roster_avatar_identity']}",
+        f"- Roster-avatar identities corroborated by direct visual evidence: {summary['corroborated_roster_avatar_identity']}",
         "",
         "## Limits",
         "- Sidebar names, static layout profiles, and voice-cluster labels are not sufficient by themselves for a direct visual real-name assignment.",
