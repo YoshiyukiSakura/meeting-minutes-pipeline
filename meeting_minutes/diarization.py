@@ -9,8 +9,8 @@ SPEECHBRAIN_ECAPA_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 
 
 def _read_wav(audio_path: Path) -> tuple[int, Any]:
-    from scipy.io import wavfile  # type: ignore
     import numpy as np
+    from scipy.io import wavfile  # type: ignore
 
     sample_rate, data = wavfile.read(str(audio_path))
     if data.ndim > 1:
@@ -239,7 +239,8 @@ def _encode_windows_with_classifier(
     sample_rate: int,
     windows: list[dict[str, Any]],
     *,
-    batch_size: int = 32,
+    # Large ECAPA CPU batches hit a severe throughput cliff on Apple Silicon.
+    batch_size: int = 4,
     minimum_seconds: float = 0.45,
 ) -> tuple[Any, list[dict[str, Any]]]:
     import numpy as np

@@ -1,8 +1,24 @@
 import json
 
+import numpy as np
 import pytest
 
-from meeting_minutes.diarization import attach_speakers, diarize_audio, load_voice_enrollment, split_segments_by_turns
+from meeting_minutes.diarization import (
+    _encode_windows_with_classifier,
+    attach_speakers,
+    diarize_audio,
+    load_voice_enrollment,
+    split_segments_by_turns,
+)
+
+
+class _RecordingClassifier:
+    def __init__(self):
+        self.batch_sizes: list[int] = []
+
+    def encode_batch(self, batch, wav_lens=None, normalize=False):
+        self.batch_sizes.append(int(batch.shape[0]))
+        return batch.new_ones((batch.shape[0], 1, 2))
 
 
 def test_load_voice_enrollment_original_file_offsets_ranges(tmp_path):
@@ -164,3 +180,23 @@ def test_explicit_cluster_backend_requires_expected_speakers(tmp_path):
     assert turns == []
     assert status["status"] == "failed"
     assert "expected_speakers" in status["reason"]
+
+
+def test_speechbrain_embedding_batches_default_to_small_cpu_safe_size():
+    classifier = _RecordingClassifier()
+    data = np.zeros(80_000, dtype="float32")
+    windows = [
+        {"sample_start": index * 8_000, "sample_end": (index + 1) * 8_000}
+        for index in range(9)
+    ]
+
+    embeddings, valid_windows = _encode_windows_with_classifier(
+        classifier,
+        data,
+        sample_rate=16_000,
+        windows=windows,
+    )
+
+    assert classifier.batch_sizes == [4, 4, 1]
+    assert len(valid_windows) == 9
+    assert embeddings.shape == (9, 2)
