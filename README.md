@@ -245,6 +245,22 @@ To apply visual evidence during a new run, add `--visual-profile "$HOME/Document
 
 The command writes `visual_identity.json`, `visual_identity_report.md`, nameplate OCR evidence, and referenced frames. An OCR result without a participant whitelist remains a candidate, not a real name. See [docs/visual-identity.md](docs/visual-identity.md) for the profile contract and review rules.
 
+### Local Coding-Agent Visual Audit
+
+`visual-agent-audit` turns a bounded set of direct active-speaker frames into a read-only review package for local Codex CLI and Cursor. It is an independent calibration and veto layer: an agent may reject an unclear visual assignment, but it can never create a real-name assignment from a voice, avatar, seat position, or transcript.
+
+```bash
+uv run meeting-minutes visual-agent-audit \
+  --output-dir "$HOME/Documents/meeting-output" \
+  --calibration-frame "$HOME/Documents/meeting-output/work/visual_identity_frames/layout-with-nameplates.jpg" \
+  --calibration-layout discord_eight_person_grid \
+  --run-agent codex \
+  --run-agent cursor \
+  --cursor-model cursor-grok-4.5-high
+```
+
+For a UI where active tiles omit their own names, provide one or more `--calibration-frame` inputs that visibly show the layout's nameplates. Each calibration path must be an existing frame listed by the selected `visual_identity.json`, whose recording provenance is checked before the package is created. The agent must first confirm the calibration frame, then confirm the green active-speaker border in each enlarged tile crop. Without a confirmed calibration, an agent can confirm a real name only when that name is visible in the active tile itself. An explicit agent rejection creates `identity_audit_veto.json`; subsequent summarization, repair, action validation, and publication run through that veto overlay while the raw `transcript.json` remains unchanged. The command writes `agent_visual_audit.json`, `agent_visual_audit_report.md`, the exact frame manifest, each agent prompt, raw response, and normalized response under `work/agent_visual_audit/`. When an existing `minutes.smart.json` contains actions, their evidence frames are sampled before general identity coverage. Successful batches remain recorded if another batch fails, but any failed batch returns a non-passing partial audit and cannot satisfy `--require-consensus`.
+
 ### Side-Roster Avatar Identity
 
 `roster-avatar-identify` is a separate, calibrated evidence path for interfaces such as Discord Huddles where the active tile has no readable nameplate but the same frame exposes a named participant roster. It matches the active tile avatar against roster avatars visible in that exact frame. It is intentionally isolated from the direct-nameplate and same-session voiceprint paths.

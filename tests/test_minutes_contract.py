@@ -160,6 +160,19 @@ def test_bilingual_contract_rejects_an_english_action_row_with_a_different_owner
     assert "bilingual_action_owner_mismatch:1" in errors
 
 
+def test_bilingual_contract_allows_an_explicit_unassigned_action_owner():
+    chinese = _minutes().replace(
+        "| 00:00-02:00 | 已接受的行动项 | Riley |",
+        "| 00:00-02:00 | 已接受的行动项 | 待确认 |",
+    )
+    english = _english_minutes().replace(
+        "| 00:00-02:00 | Complete the accepted action item. | Riley |",
+        "| 00:00-02:00 | Complete the accepted action item. | To confirm |",
+    )
+
+    assert validate_bilingual_minutes(chinese, english, duration=721.0) == []
+
+
 def test_bilingual_contract_rejects_a_project_update_with_a_different_participant():
     english = _english_minutes().replace(
         "| 00:00-02:00 | Riley | MPC | Completed the current stability work. |",

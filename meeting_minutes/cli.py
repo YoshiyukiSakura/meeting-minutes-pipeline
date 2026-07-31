@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import subprocess
 import sys
 import time
 import uuid
@@ -9,8 +10,26 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from meeting_minutes.action_items import build_action_ledger, transcript_fingerprint, validate_published_action_item
+from meeting_minutes.action_items import (
+    build_action_ledger,
+    stable_segment_id,
+    transcript_fingerprint,
+    validate_published_action_item,
+)
 
+from .agent_visual_audit import (
+    AGENT_VISUAL_AUDIT_FORMAT,
+    apply_agent_visual_audit_veto,
+    build_agent_visual_audit_veto,
+    parse_agent_visual_audit_response,
+    render_agent_visual_audit_prompt,
+    restore_direct_visual_candidates_from_manifest,
+    summarize_agent_visual_audits,
+    validate_agent_visual_audit_response,
+    validate_agent_visual_audit_manifest_content,
+    write_agent_visual_audit_bundle,
+    write_agent_visual_audit_report,
+)
 from .asr import transcribe_audio
 from .avatar_template_identity import (
     attach_avatar_template_identity,
@@ -77,6 +96,7 @@ from .publication import (
     PUBLICATION_FORMAT,
     action_intent_recall_signals,
     action_ledger_fingerprint,
+    build_reviewed_evidence_manifests,
     canonical_minutes_paths,
     payload_fingerprint,
     project_update_coverage_snapshot,
@@ -110,6 +130,7 @@ from .roster_avatar_identity import (
 from .smart_minutes import (
     SMART_MINUTES_AUDIT_FORMAT,
     generate_smart_minutes,
+    repair_reviewed_minutes_text_fields,
     sanitize_reviewed_smart_minutes,
 )
 from .summarizer import generate_ollama_minutes
@@ -129,6 +150,7 @@ from .visual_voice_identity import (
     clear_visual_voice_identity,
     direct_visual_enrollment_frame_count,
     load_visual_voice_config,
+    restrict_visual_enrollment_to_agent_confirmed_segments,
     write_visual_voice_report,
 )
 from .voice_registry import apply_voice_registry, build_voice_registry, enforce_registry_cluster_consensus
@@ -246,6 +268,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Previously reviewed minutes.smart.audit.json with a publishable final review for the same transcript.",
     )
+    smart_sanitize.add_argument(
+        "--deepseek-repair",
+        action="store_true",
+        help="Use a bounded text-only DeepSeek repair when current validation rejects an otherwise reviewed artifact.",
+    )
+    smart_sanitize.add_argument("--deepseek-model", default=DEFAULT_DEEPSEEK_MODEL)
+    smart_sanitize.add_argument("--deepseek-base-url", default=DEFAULT_DEEPSEEK_BASE_URL)
+    smart_sanitize.add_argument("--deepseek-api-key-env", default="DEEPSEEK_API_KEY")
+    smart_sanitize.add_argument(
+        "--deepseek-env-file",
+        type=Path,
+        help="Optional .env file; only the variable named by --deepseek-api-key-env is read.",
+    )
+    smart_sanitize.add_argument("--deepseek-keychain-service")
+    smart_sanitize.add_argument("--deepseek-redact-name", action="append", default=[])
+    smart_sanitize.add_argument("--deepseek-allow-unauthenticated-loopback", action="store_true")
+    smart_sanitize.add_argument("--deepseek-timeout", type=int, default=DEFAULT_DEEPSEEK_TIMEOUT_SECONDS)
+    smart_sanitize.add_argument(
+        "--deepseek-max-input-chars",
+        type=int,
+        default=DEFAULT_DEEPSEEK_MAX_INPUT_CHARS,
+    )
+    smart_sanitize.set_defaults(deepseek_output_language="zh-CN")
 
     validate_minutes = sub.add_parser("validate-minutes", help="Validate a shareable Chinese minutes document against the fixed format.")
     validate_minutes.add_argument("--path", required=True, type=Path)
@@ -299,6 +344,63 @@ def build_parser() -> argparse.ArgumentParser:
     visual_identify.add_argument("--visual-profile", required=True, type=Path)
     visual_identify.add_argument("--input", type=Path, help="Override the effective input recorded in metadata.json.")
     visual_identify.add_argument("--max-frame-width", type=int, default=1280)
+
+    agent_visual_audit = sub.add_parser(
+        "visual-agent-audit",
+        help="Package or run read-only Codex/Cursor checks over direct active-speaker highlight frames.",
+    )
+    agent_visual_audit.add_argument("--output-dir", required=True, type=Path)
+    agent_visual_audit.add_argument(
+        "--visual-identity-path",
+        type=Path,
+        help="Explicit direct visual identity artifact when both static and dynamic artifacts exist.",
+    )
+    agent_visual_audit.add_argument("--samples-per-identity", type=int, default=2)
+    agent_visual_audit.add_argument("--max-samples", type=int, default=24)
+    agent_visual_audit.add_argument(
+        "--full-coverage",
+        action="store_true",
+        help="Audit one direct same-frame nameplate crop for every active-speaker named segment. Required before named identities can be published.",
+    )
+    agent_visual_audit.add_argument(
+        "--calibration-frame",
+        action="append",
+        type=Path,
+        default=[],
+        help="Same-recording full frame that visibly maps names to fixed grid slots; repeat for multiple references.",
+    )
+    agent_visual_audit.add_argument(
+        "--calibration-layout",
+        help="Static layout name for --calibration-frame. Inferred only when the audit has one layout.",
+    )
+    agent_visual_audit.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Maximum frames sent to one agent request. Smaller batches isolate stalled agents.",
+    )
+    agent_visual_audit.add_argument(
+        "--retry-unconfirmed",
+        action="store_true",
+        help="Reuse confirmed samples from the exact content-bound manifest and rerun only uncertain or rejected samples.",
+    )
+    agent_visual_audit.add_argument(
+        "--run-agent",
+        action="append",
+        choices=["codex", "cursor"],
+        default=[],
+        help="Run one local read-only coding agent. Repeat to require independent reviews.",
+    )
+    agent_visual_audit.add_argument("--workspace", type=Path, help="Workspace supplied to the local coding agents.")
+    agent_visual_audit.add_argument("--codex-bin", default="codex")
+    agent_visual_audit.add_argument("--cursor-bin", default="cursor-agent")
+    agent_visual_audit.add_argument("--cursor-model", default="cursor-grok-4.5-high")
+    agent_visual_audit.add_argument("--timeout", type=int, default=600)
+    agent_visual_audit.add_argument(
+        "--require-consensus",
+        action="store_true",
+        help="Return a nonzero exit code unless every sampled frame is confirmed by every requested agent.",
+    )
 
     dynamic_visual_identify = sub.add_parser(
         "dynamic-visual-identify",
@@ -806,11 +908,19 @@ def _run_direct_visual_cluster_identity(
         _write_direct_visual_cluster_skip_artifact(output_dir, status)
         return status
     assert visual_path is not None and visual_payload is not None
+    visual_payload = restrict_visual_enrollment_to_agent_confirmed_segments(
+        visual_payload,
+        segments,
+    )
     if direct_visual_active_frame_count(visual_payload) == 0:
         status = {
             "status": "skipped_no_direct_visual_active_frames",
             "visual_source": str(visual_path),
             "cleared_prior_cluster_assignments": cleared,
+            "agent_visual_audit_filter": visual_payload.get(
+                "agent_visual_audit_filter",
+                {},
+            ),
         }
         _write_direct_visual_cluster_skip_artifact(output_dir, status)
         return status
@@ -1074,14 +1184,33 @@ def smart_summarize_existing(args: argparse.Namespace) -> int:
     if not transcript_path.is_file():
         print("smart_summary_transcript_missing", file=sys.stderr)
         return 1
-    segments = read_json(transcript_path)
+    segments, identity_audit_status = _load_identity_audited_segments(output_dir)
     if not isinstance(segments, list):
         print("smart_summary_transcript_invalid", file=sys.stderr)
         return 1
 
+    if identity_audit_status.get("publishable") is not True:
+        review_dir = output_dir / "work" / "review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        archived = _archive_stale_smart_reviews(review_dir)
+        status = {
+            "status": "identity_audit_not_publishable",
+            "identity_audit_gate": identity_audit_status,
+            "archived_stale_smart_reviews": archived,
+        }
+        run_status_path = output_dir / "run_status.json"
+        run_status = read_json(run_status_path) if run_status_path.is_file() else {}
+        statuses = dict(run_status.get("statuses", {}))
+        statuses["smart_summary"] = status
+        write_json(output_dir / "summary_status.json", status)
+        write_json(run_status_path, {**run_status, "statuses": statuses})
+        print("smart_summary_identity_audit_not_publishable", file=sys.stderr)
+        return 2
+
     run_status_path = output_dir / "run_status.json"
     run_status = read_json(run_status_path) if run_status_path.is_file() else {}
     statuses = dict(run_status.get("statuses", {}))
+    statuses["identity_audit_gate"] = identity_audit_status
     _write_action_artifacts(output_dir, segments, statuses)
     review_dir = output_dir / "work" / "review"
     review_dir.mkdir(parents=True, exist_ok=True)
@@ -1095,10 +1224,12 @@ def smart_summarize_existing(args: argparse.Namespace) -> int:
         review_passes=args.review_passes,
         checkpoint=checkpoint if isinstance(checkpoint, dict) else None,
         checkpoint_callback=lambda payload: write_json(checkpoint_path, payload),
+        allow_cluster_name_consensus=False,
     )
     status = {
         **status,
         "archived_stale_smart_reviews": archived,
+        "identity_audit_gate": identity_audit_status,
     }
     statuses["smart_summary"] = status
     write_json(output_dir / "summary_status.json", status)
@@ -1115,6 +1246,51 @@ def smart_summarize_existing(args: argparse.Namespace) -> int:
     _atomic_write_markdown(english_path, result.english_markdown)
     write_json(review_dir / "minutes.smart.json", result.payload)
     write_json(review_dir / "minutes.smart.audit.json", result.audit)
+    action_ledger = read_json(output_dir / "action_items.json")
+    evidence_manifests, evidence_errors = build_reviewed_evidence_manifests(
+        smart_minutes=result.payload,
+        action_rows=parse_shareable_action_rows(result.chinese_markdown),
+        project_rows=parse_shareable_project_update_rows(
+            result.chinese_markdown
+        ),
+        segments=segments,
+        action_ledger=action_ledger,
+    )
+    if evidence_manifests is None:
+        failed_status = {
+            **status,
+            "status": "review_evidence_invalid",
+            "errors": evidence_errors,
+        }
+        statuses["smart_summary"] = failed_status
+        write_json(output_dir / "summary_status.json", failed_status)
+        write_json(run_status_path, {**run_status, "statuses": statuses})
+        for error in evidence_errors:
+            print(error, file=sys.stderr)
+        return 2
+    evidence_paths = {
+        "action_evidence": review_dir / "minutes.smart.action-evidence.json",
+        "action_intent_review": (
+            review_dir / "minutes.smart.action-intent-review.json"
+        ),
+        "project_evidence": review_dir / "minutes.smart.project-evidence.json",
+    }
+    for evidence_kind, evidence_path in evidence_paths.items():
+        write_json(evidence_path, evidence_manifests[evidence_kind])
+    completed_status = {
+        **status,
+        "review_evidence": {
+            "status": "validated",
+            "action_evidence": str(evidence_paths["action_evidence"]),
+            "action_intent_review": str(
+                evidence_paths["action_intent_review"]
+            ),
+            "project_evidence": str(evidence_paths["project_evidence"]),
+        },
+    }
+    statuses["smart_summary"] = completed_status
+    write_json(output_dir / "summary_status.json", completed_status)
+    write_json(run_status_path, {**run_status, "statuses": statuses})
     print(str(chinese_path))
     print(str(english_path))
     return 0
@@ -1126,6 +1302,118 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _load_identity_audited_segments(
+    output_dir: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load direct visual names only through a current, complete agent audit."""
+
+    transcript_path = output_dir / "transcript.json"
+    segments = read_json(transcript_path)
+    if not isinstance(segments, list):
+        return [], {"status": "raw_transcript_invalid", "cleared_segments": 0}
+    requires_direct_audit = any(
+        str(segment.get("name_source") or "") == "visual_active_speaker_highlight"
+        and str(segment.get("name") or "").strip()
+        for segment in segments
+        if isinstance(segment, dict)
+    )
+    if not requires_direct_audit:
+        return segments, {
+            "status": "not_required",
+            "cleared_segments": 0,
+            "publishable": True,
+            "requires_direct_audit": False,
+        }
+
+    audit_path = output_dir / "agent_visual_audit.json"
+    if not audit_path.is_file():
+        gated_segments, status = apply_agent_visual_audit_veto(segments, None)
+        return gated_segments, {
+            **status,
+            "requires_direct_audit": True,
+            "agent_visual_audit_path": str(audit_path),
+        }
+    audit = read_json(audit_path)
+    if not isinstance(audit, dict) or audit.get("status") != "passed":
+        gated_segments, status = apply_agent_visual_audit_veto(segments, None)
+        return gated_segments, {
+            **status,
+            "status": "audit_not_passed_fail_closed",
+            "requires_direct_audit": True,
+            "agent_visual_audit_path": str(audit_path),
+        }
+    summary = audit.get("summary")
+    manifest_path_raw = str(audit.get("manifest") or "").strip()
+    if not isinstance(summary, dict) or summary.get("coverage_complete") is not True or not manifest_path_raw:
+        gated_segments, status = apply_agent_visual_audit_veto(segments, None)
+        return gated_segments, {
+            **status,
+            "status": "audit_coverage_incomplete_fail_closed",
+            "requires_direct_audit": True,
+            "agent_visual_audit_path": str(audit_path),
+        }
+    manifest_path = Path(manifest_path_raw).expanduser().resolve()
+    if not manifest_path.is_file():
+        gated_segments, status = apply_agent_visual_audit_veto(segments, None)
+        return gated_segments, {
+            **status,
+            "status": "audit_manifest_missing_fail_closed",
+            "requires_direct_audit": True,
+            "agent_visual_audit_path": str(audit_path),
+            "manifest_path": str(manifest_path),
+        }
+    manifest = read_json(manifest_path)
+    manifest_errors = (
+        validate_agent_visual_audit_manifest_content(manifest)
+        if isinstance(manifest, dict)
+        else ["manifest_invalid"]
+    )
+    expected_manifest_sha256 = str(summary.get("manifest_sha256") or "").strip()
+    manifest_matches = (
+        isinstance(manifest, dict)
+        and str(manifest.get("manifest_sha256") or "").strip() == expected_manifest_sha256
+    )
+    if manifest_errors or not manifest_matches:
+        gated_segments, status = apply_agent_visual_audit_veto(segments, None)
+        return gated_segments, {
+            **status,
+            "status": "audit_manifest_stale_fail_closed",
+            "requires_direct_audit": True,
+            "agent_visual_audit_path": str(audit_path),
+            "manifest_path": str(manifest_path),
+            "manifest_errors": manifest_errors,
+        }
+    veto_path = output_dir / "identity_audit_veto.json"
+    if not veto_path.is_file():
+        gated_segments, status = apply_agent_visual_audit_veto(segments, None)
+        return gated_segments, {
+            **status,
+            "status": "audit_veto_missing_fail_closed",
+            "requires_direct_audit": True,
+            "agent_visual_audit_path": str(audit_path),
+        }
+    veto = read_json(veto_path)
+    if (
+        not isinstance(veto, dict)
+        or str(veto.get("manifest_sha256") or "").strip() != expected_manifest_sha256
+    ):
+        gated_segments, status = apply_agent_visual_audit_veto(segments, None)
+        return gated_segments, {
+            **status,
+            "status": "audit_veto_stale_fail_closed",
+            "requires_direct_audit": True,
+            "agent_visual_audit_path": str(audit_path),
+            "veto_path": str(veto_path),
+        }
+    gated_segments, status = apply_agent_visual_audit_veto(segments, veto)
+    return gated_segments, {
+        **status,
+        "requires_direct_audit": True,
+        "agent_visual_audit_path": str(audit_path),
+        "veto_path": str(veto_path),
+    }
 
 
 def smart_sanitize_reviewed_existing(args: argparse.Namespace) -> int:
@@ -1145,7 +1433,7 @@ def smart_sanitize_reviewed_existing(args: argparse.Namespace) -> int:
             print(f"smart_repair_missing:{path}", file=sys.stderr)
         return 1
 
-    segments = read_json(transcript_path)
+    segments, identity_audit_status = _load_identity_audited_segments(output_dir)
     source_payload = read_json(source_smart_path)
     source_audit = read_json(source_audit_path)
     if not isinstance(segments, list):
@@ -1175,7 +1463,32 @@ def smart_sanitize_reviewed_existing(args: argparse.Namespace) -> int:
         source_payload,
         segments=segments,
         source_audit=source_audit,
+        allow_cluster_name_consensus=False,
     )
+    bounded_repair_status: dict[str, Any] | None = None
+    if result is None and args.deepseek_repair:
+        repaired_payload, bounded_repair_status = repair_reviewed_minutes_text_fields(
+            source_payload,
+            segments=segments,
+            config=_deepseek_config(args),
+            allow_cluster_name_consensus=False,
+        )
+        if repaired_payload is not None:
+            result, errors = sanitize_reviewed_smart_minutes(
+                repaired_payload,
+                segments=segments,
+                source_audit=source_audit,
+                allow_cluster_name_consensus=False,
+            )
+        else:
+            print("smart_repair_bounded_model_failed", file=sys.stderr)
+            print(
+                str(bounded_repair_status.get("status", "unknown")),
+                file=sys.stderr,
+            )
+            for error in bounded_repair_status.get("errors", []):
+                print(str(error), file=sys.stderr)
+            return 2
     if result is None:
         print("smart_repair_validation_failed", file=sys.stderr)
         for error in errors:
@@ -1186,8 +1499,17 @@ def smart_sanitize_reviewed_existing(args: argparse.Namespace) -> int:
     review_dir.mkdir(parents=True, exist_ok=True)
     archived = _archive_stale_smart_reviews(review_dir)
     audit = deepcopy(source_audit)
+    if "synthesis_validation_errors" in audit:
+        audit["synthesis_initial_validation_errors"] = audit.pop(
+            "synthesis_validation_errors"
+        )
+    audit["final_review_validation_errors"] = []
     audit["derivation"] = {
-        "kind": "deterministic_reviewed_minutes_repair",
+        "kind": (
+            "bounded_ai_reviewed_minutes_field_repair"
+            if bounded_repair_status is not None
+            else "deterministic_reviewed_minutes_repair"
+        ),
         "source_smart_json": source_smart_path.name,
         "source_smart_json_sha256": _file_sha256(source_smart_path),
         "source_audit_json": source_audit_path.name,
@@ -1205,6 +1527,11 @@ def smart_sanitize_reviewed_existing(args: argparse.Namespace) -> int:
             "bilingual_render_contract": "passed",
             "final_publication_gate": "passed",
         },
+        **(
+            {"bounded_field_repair": bounded_repair_status}
+            if bounded_repair_status is not None
+            else {}
+        ),
     }
     if result.final_review is not None:
         audit_reviews = audit.get("reviews")
@@ -1218,12 +1545,22 @@ def smart_sanitize_reviewed_existing(args: argparse.Namespace) -> int:
 
     status = {
         "status": "reviewed_draft",
-        "engine": "deterministic-reviewed-repair",
+        "engine": (
+            "bounded-ai-reviewed-repair"
+            if bounded_repair_status is not None
+            else "deterministic-reviewed-repair"
+        ),
         "source_final_review_publishable": True,
         "source_review_passes": len(source_reviews),
         "transcript_sha256": result.transcript_sha256,
         "deterministic_changes": result.changes,
+        **(
+            {"bounded_field_repair": bounded_repair_status}
+            if bounded_repair_status is not None
+            else {}
+        ),
         "archived_stale_smart_reviews": archived,
+        "identity_audit_gate": identity_audit_status,
     }
     chinese_path = review_dir / "minutes.smart.md"
     english_path = review_dir / "minutes.smart.en.md"
@@ -1504,6 +1841,604 @@ def visual_identify_existing(args: argparse.Namespace) -> int:
     return 0
 
 
+def _agent_visual_audit_command(
+    *,
+    agent: str,
+    args: argparse.Namespace,
+    workspace: Path,
+    output_dir: Path,
+    bundle: dict[str, Path],
+    manifest: dict[str, Any],
+    response_path: Path,
+    prompt: str,
+) -> list[str]:
+    frames: list[str] = []
+    for calibration in manifest.get("calibrations", []):
+        if isinstance(calibration, dict) and isinstance(calibration.get("frame"), str):
+            frames.append(str(calibration["frame"]))
+        if isinstance(calibration, dict) and isinstance(calibration.get("inspection_frame"), str):
+            frames.append(str(calibration["inspection_frame"]))
+    for sample in manifest.get("samples", []):
+        if isinstance(sample, dict) and isinstance(sample.get("frame"), str):
+            frames.append(str(sample["frame"]))
+        if isinstance(sample, dict) and isinstance(sample.get("inspection_frame"), str):
+            frames.append(str(sample["inspection_frame"]))
+        if isinstance(sample, dict) and isinstance(sample.get("roster_inspection_frame"), str):
+            frames.append(str(sample["roster_inspection_frame"]))
+    frames = list(dict.fromkeys(frames))
+    if agent == "codex":
+        command = [
+            args.codex_bin,
+            "exec",
+            "--ephemeral",
+            "--sandbox",
+            "read-only",
+            "-C",
+            str(workspace),
+            "--add-dir",
+            str(output_dir),
+            "--output-schema",
+            str(bundle["schema"]),
+            "--output-last-message",
+            str(response_path),
+        ]
+        for frame in frames:
+            command.extend(["--image", frame])
+        # Codex treats --image as a variadic option. The explicit separator
+        # prevents the JSON prompt from being consumed as another image path.
+        command.extend(["--", prompt])
+        return command
+    if agent == "cursor":
+        return [
+            args.cursor_bin,
+            "--trust",
+            "--model",
+            args.cursor_model,
+            "--workspace",
+            str(workspace),
+            "--add-dir",
+            str(output_dir),
+            "--print",
+            "--output-format",
+            "text",
+            "--mode",
+            "plan",
+            prompt,
+        ]
+    raise ValueError(f"Unsupported visual audit agent: {agent}")
+
+
+def _run_agent_visual_audit(
+    *,
+    agent: str,
+    args: argparse.Namespace,
+    workspace: Path,
+    output_dir: Path,
+    bundle: dict[str, Path],
+    manifest: dict[str, Any],
+    seed_response: dict[str, Any] | None = None,
+    response_tag: str | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    audit_dir = bundle["directory"]
+    response_dir = audit_dir / "responses"
+    response_dir.mkdir(parents=True, exist_ok=True)
+    normalized_path = response_dir / f"{agent}.normalized.json"
+    all_samples = [sample for sample in manifest.get("samples", []) if isinstance(sample, dict)]
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be positive")
+    normalized_samples: list[dict[str, Any]] = []
+    normalized_calibrations: list[dict[str, Any]] | None = None
+    if seed_response is not None:
+        validated_seed, seed_errors = validate_agent_visual_audit_response(
+            seed_response,
+            manifest,
+            expected_agent=agent,
+        )
+        if validated_seed is None or seed_errors:
+            status = {
+                "status": "failed",
+                "error": "retry_seed_invalid",
+                "agent": agent,
+                "validation_errors": seed_errors,
+            }
+            write_json(normalized_path, status)
+            return None, status
+        normalized_calibrations = validated_seed["calibrations"]
+        normalized_samples = [
+            sample
+            for sample in validated_seed["samples"]
+            if sample.get("confirmed") is True
+        ]
+    confirmed_sample_ids = {
+        str(sample.get("sample_id") or "")
+        for sample in normalized_samples
+        if str(sample.get("sample_id") or "")
+    }
+    samples = [
+        sample
+        for sample in all_samples
+        if str(sample.get("sample_id") or "") not in confirmed_sample_ids
+    ]
+    batches = [samples[index : index + args.batch_size] for index in range(0, len(samples), args.batch_size)]
+    if not batches:
+        if normalized_samples and len(normalized_samples) == len(all_samples):
+            normalized, validation_errors = validate_agent_visual_audit_response(
+                seed_response,
+                manifest,
+                expected_agent=agent,
+            )
+            if normalized is not None and not validation_errors:
+                status = {
+                    "status": "ok",
+                    "agent": agent,
+                    "batches": [],
+                    "reused_confirmed_samples": len(normalized_samples),
+                }
+                write_json(normalized_path, {**status, "response": normalized})
+                return normalized, status
+        status = {"status": "failed", "error": "no_auditable_frames", "agent": agent}
+        write_json(normalized_path, status)
+        return None, status
+
+    batch_statuses: list[dict[str, Any]] = []
+    failed_batches: list[dict[str, Any]] = []
+    for batch_index, batch in enumerate(batches, start=1):
+        batch_manifest = {**manifest, "samples": batch}
+        prompt = render_agent_visual_audit_prompt(batch_manifest, agent=agent)
+        batch_sample_ids = [str(sample.get("sample_id") or "") for sample in batch]
+        normalized_batch: dict[str, Any] | None = None
+        validation_errors: list[str] = []
+        batch_attempts: list[dict[str, Any]] = []
+        failed_status: dict[str, Any] | None = None
+        stop_after_failure = False
+        for attempt in range(1, 3):
+            suffix = "" if attempt == 1 else f".retry-{attempt}"
+            response_stem = (
+                f"{agent}.{response_tag}.batch-{batch_index:03d}"
+                if response_tag
+                else f"{agent}.batch-{batch_index:03d}"
+            )
+            response_path = response_dir / f"{response_stem}{suffix}.response.txt"
+            stdout_path = response_dir / f"{response_stem}{suffix}.stdout.txt"
+            stderr_path = response_dir / f"{response_stem}{suffix}.stderr.txt"
+            command = _agent_visual_audit_command(
+                agent=agent,
+                args=args,
+                workspace=workspace,
+                output_dir=output_dir,
+                bundle=bundle,
+                manifest=batch_manifest,
+                response_path=response_path,
+                prompt=prompt,
+            )
+            response_path.unlink(missing_ok=True)
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=workspace,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=args.timeout,
+                    check=False,
+                )
+            except FileNotFoundError:
+                failed_status = {
+                    "status": "failed",
+                    "error": "executable_not_found",
+                    "agent": agent,
+                    "batch": batch_index,
+                    "sample_ids": batch_sample_ids,
+                }
+                stop_after_failure = True
+                break
+            except subprocess.TimeoutExpired:
+                failed_status = {
+                    "status": "failed",
+                    "error": "timeout",
+                    "agent": agent,
+                    "batch": batch_index,
+                    "timeout_seconds": args.timeout,
+                    "sample_ids": batch_sample_ids,
+                }
+                stop_after_failure = True
+                break
+
+            stdout_path.write_text(completed.stdout or "", encoding="utf-8")
+            stderr_path.write_text(completed.stderr or "", encoding="utf-8")
+            response_text = (
+                response_path.read_text(encoding="utf-8")
+                if response_path.exists()
+                else completed.stdout or ""
+            )
+            parsed = parse_agent_visual_audit_response(response_text)
+            normalized_batch, validation_errors = validate_agent_visual_audit_response(
+                parsed,
+                batch_manifest,
+                expected_agent=agent,
+            )
+            attempt_status = {
+                "attempt": attempt,
+                "exit_code": completed.returncode,
+                "validation_errors": validation_errors,
+            }
+            batch_attempts.append(attempt_status)
+            if completed.returncode == 0 and normalized_batch is not None:
+                break
+            retryable_empty_response = (
+                attempt == 1
+                and completed.returncode == 0
+                and validation_errors == ["response_not_json_object"]
+            )
+            if retryable_empty_response:
+                continue
+            failed_status = {
+                "status": "failed",
+                "agent": agent,
+                "batch": batch_index,
+                "exit_code": completed.returncode,
+                "validation_errors": validation_errors,
+                "sample_ids": batch_sample_ids,
+            }
+            break
+        if failed_status is not None:
+            if batch_attempts:
+                failed_status["attempts"] = batch_attempts
+            batch_statuses.append(failed_status)
+            failed_batches.append(failed_status)
+            if stop_after_failure:
+                # A timed-out local agent cannot make this audit pass. Preserve
+                # completed batches, then stop instead of spending the full
+                # timeout budget again on later batches from the same invocation.
+                break
+            continue
+        if normalized_batch is None:
+            failed_status = {
+                "status": "failed",
+                "agent": agent,
+                "batch": batch_index,
+                "error": "normalization_missing",
+                "sample_ids": batch_sample_ids,
+                "attempts": batch_attempts,
+            }
+            batch_statuses.append(failed_status)
+            failed_batches.append(failed_status)
+            continue
+        if (
+            normalized_calibrations is not None
+            and normalized_batch["calibrations"] != normalized_calibrations
+        ):
+            failed_status = {
+                "status": "failed",
+                "agent": agent,
+                "batch": batch_index,
+                "error": "calibration_verdict_inconsistent_across_batches",
+                "sample_ids": batch_sample_ids,
+                "attempts": batch_attempts,
+            }
+            batch_statuses.append(failed_status)
+            failed_batches.append(failed_status)
+            continue
+        batch_statuses.append(
+            {
+                "batch": batch_index,
+                "sample_ids": batch_sample_ids,
+                "exit_code": batch_attempts[-1]["exit_code"],
+                "validation_errors": batch_attempts[-1]["validation_errors"],
+                "attempts": batch_attempts,
+                "status": "ok",
+            }
+        )
+        if normalized_calibrations is None:
+            normalized_calibrations = normalized_batch["calibrations"]
+        normalized_samples.extend(normalized_batch["samples"])
+
+    if failed_batches:
+        partial = {
+            "format": AGENT_VISUAL_AUDIT_FORMAT,
+            "agent": agent,
+            "overall_verdict": "needs_review",
+            "manifest_sha256": str(manifest.get("manifest_sha256") or ""),
+            "calibrations": normalized_calibrations or [],
+            "samples": normalized_samples,
+        }
+        status = {
+            "status": "partial",
+            "agent": agent,
+            "batches": batch_statuses,
+            "failed_batches": failed_batches,
+        }
+        write_json(normalized_path, {**status, "response": partial})
+        return partial, status
+
+    assembled = {
+        "format": AGENT_VISUAL_AUDIT_FORMAT,
+        "agent": agent,
+        "overall_verdict": (
+            "pass"
+            if all(sample.get("confirmed") is True for sample in normalized_samples)
+            else "needs_review"
+        ),
+        "calibrations": normalized_calibrations or [],
+        "samples": normalized_samples,
+    }
+    normalized, validation_errors = validate_agent_visual_audit_response(
+        assembled,
+        manifest,
+        expected_agent=agent,
+    )
+    if normalized is None:
+        status = {
+            "status": "failed",
+            "agent": agent,
+            "validation_errors": validation_errors,
+        }
+        write_json(normalized_path, {**status, "batches": batch_statuses})
+        return None, status
+    status = {
+        "status": "ok",
+        "agent": agent,
+        "batches": batch_statuses,
+        "reused_confirmed_samples": len(confirmed_sample_ids),
+    }
+    write_json(normalized_path, {**status, "response": normalized})
+    return normalized, status
+
+
+def _review_action_priority_segment_ids(
+    output_dir: Path,
+    segments: list[dict[str, Any]],
+) -> set[str]:
+    """Prioritize visual audit samples that back already drafted action owners."""
+
+    review_path = output_dir / "work" / "review" / "minutes.smart.json"
+    if not review_path.is_file():
+        return set()
+    payload = read_json(review_path)
+    minutes = payload.get("minutes") if isinstance(payload, dict) else None
+    actions = minutes.get("actions") if isinstance(minutes, dict) else None
+    if not isinstance(actions, list):
+        return set()
+    stable_to_raw = {
+        stable_segment_id(segment, index): str(segment.get("id") or "").strip()
+        for index, segment in enumerate(segments)
+    }
+    priority: set[str] = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        raw_ids = action.get("segment_ids")
+        if not isinstance(raw_ids, list):
+            continue
+        for segment_id in raw_ids:
+            raw_id = stable_to_raw.get(str(segment_id or "").strip())
+            if raw_id:
+                priority.add(raw_id)
+    return priority
+
+
+def _reuse_matching_agent_visual_audit(
+    *,
+    audit_dir: Path,
+    agent: str,
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Reuse only a fully validated result for this exact frame manifest."""
+
+    if validate_agent_visual_audit_manifest_content(manifest):
+        return None, None
+    normalized_path = audit_dir / "responses" / f"{agent}.normalized.json"
+    if not normalized_path.is_file():
+        return None, None
+    prior = read_json(normalized_path)
+    if not isinstance(prior, dict) or prior.get("status") != "ok":
+        return None, None
+    response = prior.get("response")
+    if not isinstance(response, dict):
+        return None, None
+    if response.get("manifest_sha256") != manifest.get("manifest_sha256"):
+        return None, None
+    normalized, errors = validate_agent_visual_audit_response(
+        response,
+        manifest,
+        expected_agent=agent,
+    )
+    if normalized is None or errors:
+        return None, None
+    prior_batches = prior.get("batches")
+    return normalized, {
+        "status": "ok",
+        "agent": agent,
+        "batches": prior_batches if isinstance(prior_batches, list) else [],
+        "reused_matching_manifest": True,
+    }
+
+
+def visual_agent_audit_existing(args: argparse.Namespace) -> int:
+    output_dir = args.output_dir.expanduser().resolve()
+    transcript_path = output_dir / "transcript.json"
+    if not transcript_path.is_file():
+        raise FileNotFoundError(f"Expected transcript at {transcript_path}")
+    metadata_path = output_dir / "metadata.json"
+    metadata = read_json(metadata_path) if metadata_path.exists() else {}
+    expected_recording: dict[str, Any] | None = None
+    effective_input = str(metadata.get("effective_input") or metadata.get("input") or "").strip()
+    if effective_input:
+        input_path = Path(effective_input).expanduser().resolve()
+        if input_path.is_file():
+            expected_recording = _visual_recording_provenance(
+                input_path,
+                float(metadata.get("duration", 0.0) or 0.0),
+            )
+    visual_path, visual_identity, skip_status = _select_visual_identity_artifact(
+        output_dir=output_dir,
+        visual_identity_path=args.visual_identity_path,
+        expected_recording=expected_recording,
+    )
+    if visual_identity is None:
+        payload = {
+            "format": AGENT_VISUAL_AUDIT_FORMAT,
+            "status": (skip_status or {}).get("status", "skipped_no_direct_visual_identity"),
+            "visual_identity": str(visual_path) if visual_path else None,
+            "detail": skip_status or {},
+        }
+        write_json(output_dir / "agent_visual_audit.json", payload)
+        print(str(output_dir / "agent_visual_audit.json"))
+        return 2
+
+    current_segments = read_json(transcript_path)
+    audit_source_segments = current_segments
+    audit_dir = output_dir / "work" / "agent_visual_audit"
+    existing_manifest_path = audit_dir / "request.json"
+    existing_schema_path = audit_dir / "response.schema.json"
+    bundle: dict[str, Path] | None = None
+    manifest: dict[str, Any] | None = None
+    if (
+        bool(getattr(args, "full_coverage", False))
+        and existing_manifest_path.is_file()
+        and existing_schema_path.is_file()
+    ):
+        candidate_manifest = read_json(existing_manifest_path)
+        if (
+            isinstance(candidate_manifest, dict)
+            and not validate_agent_visual_audit_manifest_content(candidate_manifest)
+            and candidate_manifest.get("coverage", {}).get("selection_mode")
+            == "full_coverage"
+        ):
+            restored_segments, restoration_errors = (
+                restore_direct_visual_candidates_from_manifest(
+                    current_segments,
+                    candidate_manifest,
+                )
+            )
+            if not restoration_errors:
+                audit_source_segments = restored_segments
+                manifest = candidate_manifest
+                bundle = {
+                    "directory": audit_dir,
+                    "manifest": existing_manifest_path,
+                    "schema": existing_schema_path,
+                }
+    if bundle is None or manifest is None:
+        priority_segment_ids = _review_action_priority_segment_ids(
+            output_dir,
+            current_segments,
+        )
+        bundle = write_agent_visual_audit_bundle(
+            output_dir,
+            current_segments,
+            visual_identity,
+            samples_per_identity=args.samples_per_identity,
+            max_samples=args.max_samples,
+            full_coverage=bool(getattr(args, "full_coverage", False)),
+            priority_segment_ids=priority_segment_ids,
+            calibration_frames=[
+                frame.expanduser().resolve()
+                for frame in getattr(args, "calibration_frame", [])
+            ],
+            calibration_layout=getattr(args, "calibration_layout", None),
+        )
+        manifest = read_json(bundle["manifest"])
+    requested_agents = list(dict.fromkeys(args.run_agent))
+    workspace = (args.workspace or Path.cwd()).expanduser().resolve()
+    if not workspace.is_dir():
+        raise FileNotFoundError(f"Agent workspace does not exist: {workspace}")
+    results: dict[str, dict[str, Any] | None] = {}
+    agent_statuses: dict[str, dict[str, Any]] = {}
+    for agent in requested_agents:
+        result, status = _reuse_matching_agent_visual_audit(
+            audit_dir=bundle["directory"],
+            agent=agent,
+            manifest=manifest,
+        )
+        retry_unconfirmed = bool(getattr(args, "retry_unconfirmed", False))
+        has_unconfirmed = bool(
+            result
+            and any(
+                sample.get("confirmed") is not True
+                for sample in result.get("samples", [])
+                if isinstance(sample, dict)
+            )
+        )
+        if result is not None and status is not None and retry_unconfirmed and has_unconfirmed:
+            result, status = _run_agent_visual_audit(
+                agent=agent,
+                args=args,
+                workspace=workspace,
+                output_dir=output_dir,
+                bundle=bundle,
+                manifest=manifest,
+                seed_response=result,
+                response_tag="retry-unconfirmed",
+            )
+        elif result is None or status is None:
+            result, status = _run_agent_visual_audit(
+                agent=agent,
+                args=args,
+                workspace=workspace,
+                output_dir=output_dir,
+                bundle=bundle,
+                manifest=manifest,
+            )
+        results[agent] = result
+        agent_statuses[agent] = status
+    summary = summarize_agent_visual_audits(manifest, results)
+    status_name = (
+        summary["status"]
+        if requested_agents
+        else "pack_ready"
+    )
+    veto = build_agent_visual_audit_veto(
+        manifest,
+        results,
+        audit_source_segments,
+    )
+    gated_segments, gate_status = apply_agent_visual_audit_veto(
+        current_segments,
+        veto,
+    )
+    veto_path = output_dir / "identity_audit_veto.json"
+    gated_transcript_path = output_dir / "transcript.identity_audited.json"
+    gated_transcript_markdown_path = output_dir / "transcript.identity_audited.md"
+    write_json(veto_path, veto)
+    write_json(gated_transcript_path, gated_segments)
+    write_transcript_markdown(gated_transcript_markdown_path, gated_segments)
+    payload = {
+        "format": AGENT_VISUAL_AUDIT_FORMAT,
+        "status": status_name,
+        "visual_identity_path": str(visual_path),
+        "manifest": str(bundle["manifest"]),
+        "schema": str(bundle["schema"]),
+        "agent_statuses": agent_statuses,
+        "summary": summary,
+        "veto": {
+            "path": str(veto_path),
+            "derived_transcript": str(gated_transcript_path),
+            **gate_status,
+        },
+        "guardrail": "Agent results can only clear an existing direct active-speaker highlight identity; they never create or propagate a real-name assignment.",
+    }
+    write_json(output_dir / "agent_visual_audit.json", payload)
+    write_agent_visual_audit_report(output_dir / "agent_visual_audit_report.md", manifest, summary)
+    run_status_path = output_dir / "run_status.json"
+    if run_status_path.exists():
+        run_status = read_json(run_status_path)
+        statuses = dict(run_status.get("statuses", {}))
+        statuses["agent_visual_audit"] = {
+            "status": status_name,
+            "requested_agents": requested_agents,
+            "sampled_frames": manifest.get("coverage", {}).get("selected_frames", 0),
+            "veto": gate_status,
+        }
+        write_json(run_status_path, {**run_status, "statuses": statuses})
+    print(str(output_dir / "agent_visual_audit_report.md"))
+    if any(status.get("status") != "ok" for status in agent_statuses.values()):
+        return 2
+    if args.require_consensus and summary["status"] != "passed":
+        return 3
+    return 0
+
+
 def dynamic_visual_identify_existing(args: argparse.Namespace) -> int:
     output_dir = args.output_dir.expanduser().resolve()
     metadata = read_json(output_dir / "metadata.json")
@@ -1619,7 +2554,7 @@ def direct_visual_cluster_identify_existing(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Expected transcript at {transcript_path}")
     if not turns_path.exists():
         raise FileNotFoundError(f"Expected speaker turns at {turns_path}")
-    segments = read_json(transcript_path)
+    segments, identity_audit_status = _load_identity_audited_segments(output_dir)
     turns = read_json(turns_path)
     metadata = read_json(output_dir / "metadata.json")
     run_status = read_json(output_dir / "run_status.json") if (output_dir / "run_status.json").exists() else {}
@@ -1628,6 +2563,23 @@ def direct_visual_cluster_identify_existing(args: argparse.Namespace) -> int:
         for segment in segments
         if str(segment.get("name_source") or "") == "direct_visual_voice_cluster_consensus"
     )
+    if identity_audit_status.get("publishable") is not True:
+        clear_direct_visual_cluster_identity(segments)
+        status = {
+            "status": "skipped_identity_audit_not_publishable",
+            "identity_audit_status": identity_audit_status,
+            "cleared_prior_cluster_assignments": prior_cluster_assignments,
+        }
+        _write_direct_visual_cluster_skip_artifact(output_dir, status)
+        _finalize_direct_visual_cluster_identify_existing(
+            output_dir=output_dir,
+            segments=segments,
+            metadata=metadata,
+            run_status=run_status,
+            status=status,
+        )
+        print(str(output_dir / "direct_visual_cluster_identity_report.md"))
+        return 0
     try:
         config_path = args.config.expanduser().resolve() if args.config else None
         visual_identity_path = args.visual_identity_path.expanduser().resolve() if args.visual_identity_path else None
@@ -1681,7 +2633,7 @@ def visual_voice_identify_existing(args: argparse.Namespace) -> int:
     transcript_path = output_dir / "transcript.json"
     if not transcript_path.exists():
         raise FileNotFoundError(f"Expected transcript at {transcript_path}")
-    segments = read_json(transcript_path)
+    segments, identity_audit_status = _load_identity_audited_segments(output_dir)
     cleared = clear_visual_voice_identity(segments)
     metadata_path = output_dir / "metadata.json"
     metadata = read_json(metadata_path) if metadata_path.exists() else {}
@@ -1718,6 +2670,14 @@ def visual_voice_identify_existing(args: argparse.Namespace) -> int:
         print(str(output_dir / "same_session_visual_voice_report.md"))
         return 0
 
+    if identity_audit_status.get("publishable") is not True:
+        return finalize_skip(
+            {
+                "status": "skipped_identity_audit_not_publishable",
+                "identity_audit_status": identity_audit_status,
+                "cleared_prior_visual_voice_assignments": cleared,
+            }
+        )
     if not audio_path.exists():
         return finalize_skip(
             {
@@ -1754,6 +2714,10 @@ def visual_voice_identify_existing(args: argparse.Namespace) -> int:
         if skip_status is not None:
             return finalize_skip({**skip_status, "cleared_prior_visual_voice_assignments": cleared})
         assert visual_path is not None and visual_payload is not None
+        visual_payload = restrict_visual_enrollment_to_agent_confirmed_segments(
+            visual_payload,
+            segments,
+        )
         if direct_visual_enrollment_frame_count(visual_payload) == 0:
             return finalize_skip(
                 {
@@ -2115,9 +3079,10 @@ def audit_actions_existing(args: argparse.Namespace) -> int:
     transcript_path = output_dir / "transcript.json"
     if not transcript_path.exists():
         raise FileNotFoundError(f"Expected transcript at {transcript_path}")
-    segments = read_json(transcript_path)
+    segments, identity_audit_status = _load_identity_audited_segments(output_dir)
     run_status = read_json(output_dir / "run_status.json") if (output_dir / "run_status.json").exists() else {}
     statuses = dict(run_status.get("statuses", {}))
+    statuses["identity_audit_gate"] = identity_audit_status
     action_ledger = _write_action_artifacts(output_dir, segments, statuses)
     keyframes = read_json(output_dir / "keyframes.json") if (output_dir / "keyframes.json").exists() else []
     ocr_records = read_json(output_dir / "ocr.json") if (output_dir / "ocr.json").exists() else []
@@ -2145,7 +3110,7 @@ def validate_actions_existing(args: argparse.Namespace) -> int:
     transcript_path = output_dir / "transcript.json"
     if not transcript_path.exists():
         raise FileNotFoundError(f"Expected transcript at {transcript_path}")
-    transcript = read_json(transcript_path)
+    transcript, _identity_audit_status = _load_identity_audited_segments(output_dir)
     regenerated_ledger = build_action_ledger(transcript)
     freshness_errors = _action_ledger_freshness_errors(transcript, ledger)
     payload = read_json(args.items)
@@ -2243,7 +3208,13 @@ def publish_minutes_file(args: argparse.Namespace) -> int:
     if not ledger_path.is_file():
         print("publication_action_ledger_missing", file=sys.stderr)
         return 1
-    segments = read_json(transcript_path)
+    segments, identity_audit_status = _load_identity_audited_segments(output_dir)
+    if identity_audit_status.get("publishable") is not True:
+        print(
+            f"publication_identity_audit_not_publishable:{identity_audit_status.get('status', 'unknown')}",
+            file=sys.stderr,
+        )
+        return 1
     action_ledger = read_json(ledger_path)
     ledger_errors = _action_ledger_freshness_errors(segments, action_ledger)
     if ledger_errors:
@@ -2542,6 +3513,8 @@ def main(argv: list[str] | None = None) -> int:
         return diarize_existing(args)
     if args.command == "visual-identify":
         return visual_identify_existing(args)
+    if args.command == "visual-agent-audit":
+        return visual_agent_audit_existing(args)
     if args.command == "dynamic-visual-identify":
         return dynamic_visual_identify_existing(args)
     if args.command == "visual-voice-identify":

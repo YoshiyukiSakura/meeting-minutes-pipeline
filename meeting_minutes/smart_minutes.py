@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -11,21 +12,25 @@ from typing import Any, Callable
 
 from .action_items import build_action_ledger, stable_segment_id, transcript_fingerprint
 from .deepseek import DeepSeekConfig, request_deepseek_json
+from .identity_authority import ACTIVE_SPEAKER_HIGHLIGHT_SOURCE
 from .minutes_contract import validate_bilingual_minutes
 
 
 SMART_MINUTES_FORMAT = "meeting-minutes/smart-minutes-v1"
 SMART_MINUTES_AUDIT_FORMAT = "meeting-minutes/smart-minutes-audit-v1"
 SMART_MINUTES_CHECKPOINT_FORMAT = "meeting-minutes/smart-minutes-checkpoint-v1"
-SMART_PROMPT_VERSION = 27
+SMART_PROMPT_VERSION = 32
 IDENTITY_CONFIDENCE = 0.6
 CLUSTER_NAME_MIN_SECONDS = 10.0
 CLUSTER_NAME_MIN_SHARE = 0.8
 ACTION_MAX_EVIDENCE_SPAN_SECONDS = 120.0
+PROJECT_UPDATE_MAX_EVIDENCE_SPAN_SECONDS = 120.0
 LONG_MEETING_SECONDS = 3600.0
 MIN_LONG_MEETING_THEME_SPAN_SECONDS = 180.0
 MAX_THEME_EVIDENCE_GAP_SECONDS = 1500.0
 MAX_THEMES = 10
+MAX_THEME_TITLE_CHARS = 56
+MAX_TRANSLATED_THEME_TITLE_CHARS = 88
 MAX_KEY_POINTS_PER_THEME = 3
 MAX_DECISIONS = 4
 MAX_ACTIONS = 24
@@ -55,6 +60,8 @@ ACTION_SCOUT_OWNER_EVIDENCE_DROP_MAX_ACTIONS = 2
 ENTITY_GROUNDING_CONTEXT_SECONDS = 8.0
 ENTITY_GROUNDING_FUZZY_MIN_CHARACTERS = 7
 ENTITY_GROUNDING_FUZZY_MIN_SIMILARITY = 0.84
+THEME_ENTITY_EVIDENCE_EXPANSION_SECONDS = 180.0
+MAX_THEME_ENTITY_EVIDENCE_ADDITIONS = 4
 HIERARCHICAL_TRANSCRIPT_CHARS = 90_000
 TRANSCRIPT_CHUNK_TARGET_CHARS = 55_000
 TRANSCRIPT_CHUNK_HARD_CHARS = 70_000
@@ -64,7 +71,16 @@ MAX_LOCAL_TOPIC_TRANSITION_GAP_SECONDS = 30.0
 MIN_NESTED_TOPIC_MERGE_SECONDS = 30.0
 MAX_LOCAL_TOPIC_ANCHORS = 8
 MAX_THEME_CHUNK_SUMMARY_CHARS = 800
-ACTION_SUPPORT_BASES = {"self_commitment", "accepted_assignment", "owned_follow_up"}
+THEME_MERGE_POLICY_VERSION = 2
+UNASSIGNED_ACTION_OWNER = "待确认"
+UNASSIGNED_ACTION_OWNER_EN = "To confirm"
+REQUESTED_FOLLOW_UP_BASIS = "requested_follow_up"
+ACTION_SUPPORT_BASES = {
+    "self_commitment",
+    "accepted_assignment",
+    "owned_follow_up",
+    REQUESTED_FOLLOW_UP_BASIS,
+}
 DECISION_SUPPORT_BASES = {"explicit_agreement", "selected_direction"}
 _DETERMINISTIC_IMPLICIT_GROUNDING_ERROR_SUFFIXES = frozenset(
     {
@@ -103,6 +119,12 @@ _OWNED_FOLLOW_UP_CUE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_EXPLICIT_REQUESTED_FOLLOW_UP_CUE = re.compile(
+    r"\bi\s+need\s+(?:your\s+)?help(?:\s+\w+){0,8}?\s+to\s+"
+    r"(?:retest|retry|regenerate|generate|test|collect|provide|send|prepare|review|fix|"
+    r"implement|investigate|coordinate|schedule|update|deploy)\b",
+    re.IGNORECASE,
+)
 _WORK_UNDERWAY_CUE = re.compile(
     r"\b(?:i(?:'m| am)|we(?:'re| are))\s+(?:already\s+)?"
     r"(?:working|preparing|migrating|moving)\s+on\b",
@@ -119,9 +141,15 @@ _POSITIVE_SELF_COMMITMENT_CUE = re.compile(
     r"i\s+will(?:\s+try\s+to)?|i['’]ll|"
     r"i['’]m\s+(?:going\s+to|gonna)|i\s+am\s+going\s+to|"
     r"i\s+(?:gotta|got\s+to|need\s+to|continue\s+to)|"
+    r"i\s+want\s+to|"
     r"all\s+i\s+need\s+to\s+do\s+is|"
     r"let\s+me\s+(?!ask\b|explain\b|look\b|say\b|see\b|show\b|think\b)"
     r")\b|(?:我会|我将|我要|我来|我负责)",
+    re.IGNORECASE,
+)
+_IDEA_FRAMED_PROPOSAL_CUE = re.compile(
+    r"\blet\s+me\s+(?:continue\s+)?(?:my\s+){0,2}idea\s+(?:was|is)\b|"
+    r"\bmy\s+(?:main\s+)?idea\s+(?:was|is)\b",
     re.IGNORECASE,
 )
 _CONCRETE_SELF_COMMITMENT_CUE = re.compile(
@@ -135,7 +163,20 @@ _CONCRETE_SELF_COMMITMENT_CUE = re.compile(
     r")"
     r"(?:follow\s+up|check|complete|create|define|deploy|finish|fix|get|"
     r"implement|migrate|move|onboard|prepare|provide|publish|review|send|"
-    r"test|update|work|continue|wait|talk|discuss|clean|log)\b",
+    r"test|update|work|continue|wait|talk|discuss|clean|log)\b|"
+    r"\bi(?:'m|\s+am)\s+(?:going\s+to|gonna)\s+make\s+sure"
+    r"(?:\s+that)?\s+(?:i|we)\s+(?:work(?:ing)?\s+on|prepare|create|"
+    r"present|send|review)\b|"
+    r"\bi['’]ll\s+start\s+(?:working\s+on|work(?:ing)?\s+on|preparing|"
+    r"creating|reviewing|sending)\b",
+    re.IGNORECASE,
+)
+_TIME_BOUND_SELF_INTENT_CUE = re.compile(
+    r"\bi\s+want\s+to\s+(?:follow\s+up|check|complete|create|define|"
+    r"deploy|finish|fix|get|implement|migrate|move|onboard|prepare|provide|"
+    r"publish|review|send|test|update|work|discuss)\b"
+    r"[^.!?]{0,120}\b(?:before|by|within|today|tomorrow|monday|tuesday|"
+    r"wednesday|thursday|friday)\b",
     re.IGNORECASE,
 )
 _NEGATED_COMMITMENT_CUE = re.compile(
@@ -214,6 +255,47 @@ _NEUTRAL_FUTURE_QUALIFIER = re.compile(
     r"proposed|direction|plan|expected|may|might|not\s+decided)",
     re.IGNORECASE,
 )
+_OUTCOME_UNRESOLVED_CUE = re.compile(
+    r"(?:尚未|未形成|待(?:评估|确认|决定)|可能|提议|建议|方案|discussion|"
+    r"proposed|proposal|may|might|not\s+(?:be\s+)?decided|pending)",
+    re.IGNORECASE,
+)
+_OUTCOME_CONSENSUS_CUE = re.compile(
+    r"(?:讨论(?:形成|达成)共识|(?:形成|达成)共识|"
+    r"\b(?:a\s+)?consensus\s*(?::|was\s+(?:formed|reached)|"
+    r"has\s+been\s+(?:formed|reached))|\bconsensus\s*:)",
+    re.IGNORECASE,
+)
+_UNCONFIRMED_OUTCOME_COMMITMENT = re.compile(
+    r"(?:"
+    r"(?:将|会)\s*(?:构建|实施|迁移|部署|建立|替换|开发|实现|安排|推进|采用)|"
+    r"(?:团队|大家|我们)(?:已)?(?:同意|一致同意|决定|确认)\s*(?:将|会)?\s*"
+    r"(?:构建|实施|迁移|部署|建立|替换|开发|实现|安排|推进|采用)|"
+    r"\b(?:we|the\s+team|team)\s+(?:agreed?\s+to|decid(?:e|ed)\s+to|will)\s+"
+    r"(?:build|implement|migrate|deploy|establish|replace|develop|arrange|"
+    r"advance|adopt)|"
+    r"\b(?:the\s+)?(?:system|platform|api\s+gateway|bps|document)\s+will\s+"
+    r"(?:build|implement|migrate|deploy|establish|replace|develop|arrange|"
+    r"advance|adopt)"
+    r")",
+    re.IGNORECASE,
+)
+_THEME_TITLE_COMPOSITE_SEPARATOR = re.compile(r"[／/]")
+_GENERIC_THEME_TITLE = re.compile(
+    r"^(?:intermediate\s+operational\s+discussion|general\s+discussion|"
+    r"other\s+discussion|miscellaneous|中间运营讨论|一般讨论|其他讨论)$",
+    re.IGNORECASE,
+)
+_THEME_TITLE_REPAIR_PREFIX = re.compile(
+    r"^(?:how\s+to|how\s+should\s+(?:we|the\s+team)|"
+    r"what(?:'s|\s+is)\s+the\s+(?:best\s+)?way\s+to)\s+",
+    re.IGNORECASE,
+)
+_THEME_TITLE_RATIONALE_PREFIX = re.compile(
+    r"^what(?:'s|\s+is)\s+the\s+(?:rationale|reason)\s+for\s+",
+    re.IGNORECASE,
+)
+_THEME_TITLE_TRAILING_PUNCTUATION = re.compile(r"[\s?.!:;,]+$")
 _TITLECASE_TOKEN = re.compile(
     r"(?<![A-Za-z0-9])[A-Z][a-z][A-Za-z0-9_.-]*(?![A-Za-z0-9])"
 )
@@ -221,7 +303,144 @@ _DISTINCTIVE_LATIN_TOKEN = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Za-z0-9_.-]*|"
     r"[A-Z][a-z0-9]+[A-Z][A-Za-z0-9_.-]*)(?![A-Za-z0-9])"
 )
-_NUMBER_TOKEN = re.compile(r"(?<![\w])\d+(?:[.,]\d+)?(?![\w])")
+# Chinese prose commonly places a quantity immediately next to a CJK word, for
+# example ``处理90%的流量``.  ``\w`` treats that preceding CJK character as a
+# word character, which used to let those claims evade source-evidence checks.
+_NUMBER_TOKEN = re.compile(r"(?<![0-9A-Za-z])\d+(?:[.,]\d+)?(?![0-9A-Za-z])")
+_TRANSLATION_NUMBER_TOKEN = re.compile(
+    r"(?<![0-9A-Za-z])\d+(?:[.,]\d+)?(?:st|nd|rd|th)?(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+_TRANSLATION_LATIN_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9_.-]*)(?![A-Za-z0-9])"
+)
+_TRANSLATION_PERCENT_MARKER = re.compile(r"%|\bpercent(?:age)?\b|百分之", re.IGNORECASE)
+_TRANSLATION_NUMBER_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+_CHINESE_NUMERAL_TOKEN = re.compile(r"[零〇一二两三四五六七八九十百千万]+")
+_CHINESE_NUMERAL_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CHINESE_NUMERAL_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+_TRANSLATION_COMMON_LATIN_TOKENS = frozenset(
+    {
+        "a",
+        "about",
+        "access",
+        "after",
+        "an",
+        "and",
+        "as",
+        "at",
+        "before",
+        "business",
+        "by",
+        "complex",
+        "current",
+        "decision",
+        "decisions",
+        "delivery",
+        "development",
+        "discussion",
+        "during",
+        "efficiency",
+        "existing",
+        "for",
+        "from",
+        "future",
+        "goal",
+        "goals",
+        "in",
+        "information",
+        "into",
+        "issue",
+        "issues",
+        "it",
+        "its",
+        "meeting",
+        "need",
+        "needs",
+        "new",
+        "of",
+        "on",
+        "operations",
+        "operational",
+        "or",
+        "outcome",
+        "plan",
+        "plans",
+        "process",
+        "processes",
+        "product",
+        "products",
+        "project",
+        "projects",
+        "proposal",
+        "related",
+        "request",
+        "requested",
+        "review",
+        "reviews",
+        "risk",
+        "risks",
+        "role",
+        "state",
+        "support",
+        "system",
+        "systems",
+        "team",
+        "technical",
+        "the",
+        "this",
+        "that",
+        "these",
+        "those",
+        "to",
+        "update",
+        "updates",
+        "with",
+        "without",
+    }
+)
 _WEEKDAY_TOKEN = re.compile(
     r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
     r"(?:周|星期)[一二三四五六日天]",
@@ -236,6 +455,78 @@ _WEEKDAY_EQUIVALENTS = {
     "saturday": {"saturday", "周六", "星期六"},
     "sunday": {"sunday", "周日", "周天", "星期日", "星期天"},
 }
+_STATUS_OPERATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "retest",
+        re.compile(
+            r"(?:\bre[- ]?(?:test|try)(?:ed|ing|s)?\b|"
+            r"\b(?:re[- ]?generat(?:e|ed|ing|ion)|"
+            r"generate(?:d|s|ing)?\s+(?:once|again))\b|"
+            r"重新(?:测试|测|生成)|再次生成|复测)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "deploy",
+        re.compile(r"(?:\bdeploy(?:ed|ing|s)?\b|部署)", re.IGNORECASE),
+    ),
+    (
+        "migrate",
+        re.compile(r"(?:\bmigrat(?:e|ed|ing|es)\b|迁移)", re.IGNORECASE),
+    ),
+    (
+        "implement",
+        re.compile(r"(?:\bimplement(?:ed|ing|s)?\b|实现|构建|开发)", re.IGNORECASE),
+    ),
+    (
+        "create",
+        re.compile(
+            r"(?:\b(?:create|created|creating|write|wrote|draft|drafted|"
+            r"prepare|prepared)\b|创建|编写|起草|制作|准备)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "send",
+        re.compile(r"(?:\bsend(?:s|ing|t)?\b|发送|寄出|提交)", re.IGNORECASE),
+    ),
+    (
+        "fix",
+        re.compile(r"(?:\b(?:fix|fixed|fixing|resolve|resolved|resolving)\b|修复|解决)", re.IGNORECASE),
+    ),
+    (
+        "access",
+        re.compile(
+            r"(?:\b(?:grant|granted|provide|provided|add|added)\b|授予|提供|添加|开通)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "review",
+        re.compile(r"(?:\breview(?:ed|ing|s)?\b|审查|复核|检查)", re.IGNORECASE),
+    ),
+)
+_STATUS_COMPLETION_CUE = re.compile(
+    r"(?:\b(?:already|completed?|finished|done|retested|deployed|migrated|"
+    r"implemented|created|sent|fixed|resolved|granted|provided|attempted|tried)\b|"
+    r"(?:已(?:经)?|完成(?:了)?|成功(?:地)?|已被|已经))",
+    re.IGNORECASE,
+)
+_STATUS_NEGATED_COMPLETION_CUE = re.compile(
+    r"(?:\b(?:not|never|no)\s+(?:already\s+)?(?:complete(?:d)?|finish(?:ed)?|"
+    r"done|retested|deployed|migrated|implemented|created|sent|fixed|resolved|"
+    r"attempted|tried)\b|"
+    r"(?:尚未|未|没有)\s*(?:完成|成功|部署|迁移|实现|创建|发送|修复|解决|重新测试))",
+    re.IGNORECASE,
+)
+_STATUS_PENDING_CUE = re.compile(
+    r"(?:\b(?:need(?:s)?|need\s+your\s+help|please|request(?:ed|s|ing)?|"
+    r"ask(?:ed|s|ing)?|try(?:ing)?\s+to|should|must|will|would|could|can|"
+    r"plan(?:s|ned|ning)?\s+to|want(?:s|ed)?\s+to|going\s+to)\b|"
+    r"(?:需要|请求|请|计划|将|会|待|希望))",
+    re.IGNORECASE,
+)
+STATUS_CLAIM_CONTEXT_CHARACTERS = 48
 _SMALL_NUMBER_EQUIVALENTS = {
     "0": {"0", "zero", "零"},
     "1": {"1", "one", "一"},
@@ -276,6 +567,25 @@ class SmartMinutesSanitizationResult:
 def _plain(value: object) -> str:
     text = str(value or "").replace("\r", " ").replace("\n", " ")
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _theme_title_errors(
+    title: str,
+    *,
+    max_characters: int,
+) -> list[str]:
+    """Return structural title errors without trying to infer a replacement."""
+
+    if not title:
+        return []
+    errors: list[str] = []
+    if len(title) > max_characters:
+        errors.append("too_long")
+    if _THEME_TITLE_COMPOSITE_SEPARATOR.search(title):
+        errors.append("combined_topic")
+    if _GENERIC_THEME_TITLE.match(title):
+        errors.append("generic")
+    return errors
 
 
 def _review_finding_digest(value: object) -> str:
@@ -486,6 +796,32 @@ def _messages_fingerprint(messages: list[dict[str, str]]) -> str:
 
 def _validation_repair_guidance(errors: list[str]) -> list[str]:
     guidance: list[str] = []
+    theme_count_error = next(
+        (
+            error
+            for error in errors
+            if error.startswith("theme_outline_count_out_of_range:")
+        ),
+        None,
+    )
+    if theme_count_error:
+        match = re.search(r"!=(\d+)-(\d+)$", theme_count_error)
+        if match:
+            minimum = int(match.group(1))
+            maximum = int(match.group(2))
+            count_requirement = (
+                f"exactly {minimum}"
+                if minimum == maximum
+                else f"between {minimum} and {maximum}"
+            )
+            guidance.append(
+                f"Return {count_requirement} chronological themes. Partition every "
+                "source candidate index into non-empty adjacent groups, consuming "
+                "each index exactly once. When more candidates than themes exist, "
+                "merge the closest neighboring candidates under one truthful parent "
+                "business question; do not preserve one theme per candidate, omit "
+                "an index, or invent an index."
+            )
     if any("evidence_gap_too_wide" in error for error in errors):
         guidance.append(
             "For each flagged theme, split its distant evidence clusters into "
@@ -505,6 +841,18 @@ def _validation_repair_guidance(errors: list[str]) -> list[str]:
             "point inside its own outline range; do not copy an adjacent theme's "
             "evidence merely because the topics are related."
         )
+    if any(
+        "title_zh_too_long" in error
+        or "title_en_too_long" in error
+        or "title_combined_topic" in error
+        or "title_generic" in error
+        for error in errors
+    ):
+        guidance.append(
+            "Rewrite every flagged title as one specific business question under "
+            "56 characters. Do not join topics with a slash, concatenate source "
+            "titles, or use a generic discussion label."
+        )
     if any("anonymous_speaker_reference" in error for error in errors):
         guidance.append(
             "Never expose labels such as Speaker 1, Speaker 5, or Speaker Unknown "
@@ -517,11 +865,54 @@ def _validation_repair_guidance(errors: list[str]) -> list[str]:
             "participant. Rewrite unsupported entities out of the update instead "
             "of deleting the participant row."
         )
+    if any(
+        error.startswith("action:") and ":evidence_span_too_wide:" in error
+        for error in errors
+    ) or any("must_keep_candidates_collapsed" in error for error in errors):
+        guidance.append(
+            "For each flagged action, retain only one commitment within a local "
+            "evidence window of at most 120 seconds. Split distinct must-keep "
+            "commitments into separate action rows; candidates may share one row "
+            "only when they describe the same outcome in the same local window."
+        )
+    if any(
+        error.startswith("project_update:")
+        and ":evidence_span_too_wide:" in error
+        for error in errors
+    ):
+        guidance.append(
+            "For each flagged project update, retain one coherent same-speaker "
+            "statement from a local evidence window of at most 120 seconds. Do "
+            "not combine distant statements into one row."
+        )
     if any("named_entity_ungrounded" in error for error in errors):
         guidance.append(
             "Remove or replace every unsupported named entity with wording directly "
             "entailed by the cited evidence. Never substitute a canonical participant "
             "for a phonetically similar name without identity evidence."
+        )
+    if any("status_unsupported_completion" in error for error in errors):
+        guidance.append(
+            "Preserve factual state. When cited evidence requests, plans, or needs an "
+            "operation, describe it as pending or requested. Never rewrite it as work "
+            "already completed unless the cited evidence explicitly confirms completion."
+        )
+    if any("quality_degraded_placeholder" in error for error in errors):
+        guidance.append(
+            "Replace masking artifacts such as 相关接口, client side, relevant features, "
+            "or related personnel with concise wording entailed by the cited evidence. "
+            "Do not use a vague placeholder to preserve an unsupported product or person."
+        )
+    if any("quality_incomplete_action" in error for error in errors):
+        guidance.append(
+            "Rewrite each flagged action as one complete concrete outcome stated by its "
+            "own cited commitment. A phrase such as 'with Billy complete' is not an action."
+        )
+    if any("number_ungrounded" in error for error in errors):
+        guidance.append(
+            "Remove every numeric claim that is not stated in the cited evidence. "
+            "Do not derive a total from separate values or borrow a number from an "
+            "anonymous adjacent turn; retain only the supported qualitative status."
         )
     if any("atomicity_review_required" in error for error in errors):
         guidance.append(
@@ -548,7 +939,8 @@ def _validation_repair_guidance(errors: list[str]) -> list[str]:
         guidance.append(
             "A flagged action candidate has already passed a narrow owned-follow-up "
             "adjudication and deterministic evidence checks. Keep it as a concise "
-            "action, or map it to an existing action for the same owner and outcome. "
+            "action, or map it to an existing action for the same owner and outcome "
+            "inside one 120-second evidence window. "
             "Do not reject it merely because the work is already underway."
         )
     if any("future_owner_without_action" in error for error in errors):
@@ -556,12 +948,55 @@ def _validation_repair_guidance(errors: list[str]) -> list[str]:
             "Remove the unsupported named future follow-up or add a separately "
             "verified action for that owner from nearby commitment evidence."
         )
+    if any(
+        "future_fact_unqualified" in error
+        or "outcome_unconfirmed_commitment" in error
+        or "outcome_ungrounded_consensus" in error
+        for error in errors
+    ):
+        guidance.append(
+            "Rewrite each flagged outcome as a discussion, proposal, or "
+            "unresolved option unless its own cited evidence establishes an "
+            "explicit decision or agreement. Do not state generic future "
+            "implementation or consensus as settled."
+        )
     if any("speaker_anonymous" in error for error in errors):
         guidance.append(
             "Do not publish an anonymous Speaker label as a key-point author. Keep "
             "the idea in neutral theme prose unless identity is proven."
         )
+    if any("speaker_evidence_mismatch" in error for error in errors):
+        guidance.append(
+            "Drop each key point whose cited segments do not include the claimed "
+            "named speaker. Retain only a key point with same-segment named evidence; "
+            "never relabel anonymous evidence to a nearby participant."
+        )
     return guidance
+
+
+def _requires_full_final_review_rewrite(errors: list[str]) -> bool:
+    """Return whether a final-review error invalidates the minutes structure.
+
+    Text-only repair is intentionally unable to fix a mismatch between the
+    reviewed theme list and the independent outline.  Treating it as progress
+    would otherwise suppress the full constrained rewrite and leave the
+    meeting without a publishable recovery path.
+    """
+
+    return any(
+        error == "theme_outline_minutes_count_mismatch"
+        or error.startswith("themes_too_many:")
+        or error == "themes_invalid"
+        or bool(
+            re.match(
+                r"^theme:\d+:(?:outline_anchor_missing$|"
+                r"outside_outline_range:|span_too_short:|"
+                r"evidence_gap_too_wide:)",
+                error,
+            )
+        )
+        for error in errors
+    )
 
 
 def _json_repair_messages(
@@ -605,6 +1040,97 @@ def _json_repair_messages(
             ),
         },
     ]
+
+
+def _theme_merge_topology_repair_messages(
+    messages: list[dict[str, str]],
+    *,
+    payload: object,
+    errors: list[str],
+    candidates: list[dict[str, Any]],
+    min_theme_count: int,
+    max_theme_count: int,
+) -> list[dict[str, str]]:
+    allowed_indexes = [
+        candidate["candidate_index"]
+        for candidate in candidates
+    ]
+    return [
+        *messages,
+        {
+            "role": "assistant",
+            "content": json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "instruction": (
+                        "This is the final bounded topology repair. Return only the "
+                        "complete corrected JSON. Keep each theme's factual topic "
+                        "grounded in its source candidates. Change grouping, ranges, "
+                        "anchors, and titles only as needed to satisfy every hard "
+                        "constraint below."
+                    ),
+                    "local_validation_errors": errors,
+                    "required_theme_count": (
+                        min_theme_count
+                        if min_theme_count == max_theme_count
+                        else {
+                            "minimum": min_theme_count,
+                            "maximum": max_theme_count,
+                        }
+                    ),
+                    "allowed_source_candidate_indexes": allowed_indexes,
+                    "required_source_candidate_partition": allowed_indexes,
+                    "hard_constraints": [
+                        (
+                            "Use only allowed_source_candidate_indexes; never invent "
+                            "an index."
+                        ),
+                        (
+                            "Consume every required partition index exactly once, "
+                            "in ascending order."
+                        ),
+                        (
+                            "Each theme must consume one non-empty contiguous slice "
+                            "of the required partition."
+                        ),
+                        (
+                            "Return the required theme count by merging the closest "
+                            "neighboring candidates under a truthful parent business "
+                            "question."
+                        ),
+                        (
+                            "Final theme ranges must contain every source candidate "
+                            "range assigned to that theme."
+                        ),
+                    ],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _only_theme_merge_topology_errors(errors: list[str]) -> bool:
+    topology_prefixes = (
+        "theme_outline_count_out_of_range:",
+        "theme_merge_candidate_uncovered:",
+        "theme_merge_candidate_duplicated:",
+        "theme_merge_candidate_unknown:",
+        "theme_merge_candidate_order_invalid",
+        "theme_merge:",
+    )
+    return bool(errors) and all(
+        error.startswith(topology_prefixes)
+        for error in errors
+    )
 
 
 def _segment_ids_in_payload(value: object) -> set[str]:
@@ -667,8 +1193,9 @@ def _targeted_final_review_repair_messages(
                         "unchanged. The supplied transcript_evidence is the only evidence "
                         "available for changed claims. Remove unsupported actions or named "
                         "entities rather than guessing. A must_keep candidate must remain "
-                        "represented by one or more atomic actions, and duplicate candidates "
-                        "may map to one retained action. Return only the complete corrected "
+                        "represented by one or more atomic actions. Candidates may map to "
+                        "one retained action only for the same outcome inside one local "
+                        "120-second evidence window. Return only the complete corrected "
                         "final-review JSON."
                     ),
                     "local_validation_errors": errors,
@@ -686,6 +1213,571 @@ def _targeted_final_review_repair_messages(
             ),
         },
     ]
+
+
+_DEGRADED_NEUTRALIZATION_PATTERNS = (
+    re.compile(
+        r"(?:客户|内部|通过|使用|对比|或|和|与|Web)\s*相关(?:接口|Box|与|功能|开发|人员|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"相关(?:接口|与功能|人员)"),
+    re.compile(
+        r"\b(?:relevant personnel|relevant interface|relevant features|"
+        r"relevant tools|client side|internal side)\b",
+        re.IGNORECASE,
+    ),
+)
+_INCOMPLETE_ACTION_ITEM = re.compile(
+    r"^(?:与[^。！？.!?]{1,48}一起完成|complete with [^.]{1,72})[。.!?]?$",
+    re.IGNORECASE,
+)
+
+
+def _degraded_publication_text(text: object) -> bool:
+    source = _plain(text)
+    return bool(
+        source
+        and (
+            any(pattern.search(source) for pattern in _DEGRADED_NEUTRALIZATION_PATTERNS)
+            or _INCOMPLETE_ACTION_ITEM.match(source) is not None
+        )
+    )
+
+
+def _publication_language_quality_errors(minutes: dict[str, Any]) -> list[str]:
+    """Reject wording produced by evidence masking rather than grounded writing."""
+
+    errors: list[str] = []
+    themes = minutes.get("themes")
+    if isinstance(themes, list):
+        for theme_index, theme in enumerate(themes, start=1):
+            if not isinstance(theme, dict):
+                continue
+            for field in ("title", "current_state", "outcome"):
+                if _degraded_publication_text(theme.get(field)):
+                    errors.append(
+                        f"theme:{theme_index}:{field}:quality_degraded_placeholder"
+                    )
+            points = theme.get("key_points")
+            if isinstance(points, list):
+                for point_index, point in enumerate(points, start=1):
+                    if isinstance(point, dict) and _degraded_publication_text(
+                        point.get("text")
+                    ):
+                        errors.append(
+                            "theme:"
+                            f"{theme_index}:point:{point_index}:text:"
+                            "quality_degraded_placeholder"
+                        )
+    decisions = minutes.get("decisions")
+    if isinstance(decisions, list):
+        for decision_index, decision in enumerate(decisions, start=1):
+            if isinstance(decision, dict) and _degraded_publication_text(
+                decision.get("text")
+            ):
+                errors.append(
+                    f"decision:{decision_index}:text:quality_degraded_placeholder"
+                )
+    actions = minutes.get("actions")
+    if isinstance(actions, list):
+        for action_index, action in enumerate(actions, start=1):
+            if not isinstance(action, dict):
+                continue
+            item = _plain(action.get("item"))
+            if _INCOMPLETE_ACTION_ITEM.match(item) is not None:
+                errors.append(f"action:{action_index}:item:quality_incomplete_action")
+            elif _degraded_publication_text(item):
+                errors.append(
+                    f"action:{action_index}:item:quality_degraded_placeholder"
+                )
+    updates = minutes.get("project_updates")
+    if isinstance(updates, list):
+        for update_index, update in enumerate(updates, start=1):
+            if not isinstance(update, dict):
+                continue
+            for field in ("project", "update"):
+                if _degraded_publication_text(update.get(field)):
+                    errors.append(
+                        f"project_update:{update_index}:{field}:"
+                        "quality_degraded_placeholder"
+                    )
+    return errors
+
+
+def _field_repair_targets(
+    review: object,
+    errors: list[str],
+    *,
+    transcript_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Extract immutable text-field repair targets from local validation errors."""
+
+    if not isinstance(review, dict) or not isinstance(review.get("minutes"), dict):
+        return []
+    minutes = review["minutes"]
+    record_map = {
+        _plain(record.get("segment_id")): record
+        for record in transcript_records
+        if isinstance(record, dict) and _plain(record.get("segment_id"))
+    }
+    targets: dict[str, dict[str, Any]] = {}
+
+    def register(path: str, text: object, segment_ids: object, error: str) -> None:
+        ids = [
+            _plain(segment_id)
+            for segment_id in (segment_ids if isinstance(segment_ids, list) else [])
+            if _plain(segment_id) in record_map
+        ]
+        if not ids:
+            return
+        target = targets.setdefault(
+            path,
+            {
+                "field": path,
+                "text": _plain(text),
+                "segment_ids": list(dict.fromkeys(ids)),
+                "errors": [],
+            },
+        )
+        target["errors"].append(error)
+
+    themes = minutes.get("themes")
+    actions = minutes.get("actions")
+    updates = minutes.get("project_updates")
+    decisions = minutes.get("decisions")
+    repair_suffix = (
+        r"(?:named_entity_ungrounded|number_ungrounded|weekday_ungrounded|"
+        r"status_unsupported_completion|quality_)"
+    )
+    for error in errors:
+        theme_match = re.match(
+            rf"^theme:(\d+):(title|current_state|outcome):{repair_suffix}",
+            error,
+        )
+        point_match = re.match(
+            rf"^theme:(\d+):point:(\d+):text:{repair_suffix}",
+            error,
+        )
+        action_match = re.match(
+            rf"^action:(\d+)(?::item)?:{repair_suffix}",
+            error,
+        )
+        update_match = re.match(
+            rf"^project_update:(\d+)(?::(project|update))?:{repair_suffix}",
+            error,
+        )
+        decision_match = re.match(
+            rf"^decision:(\d+):text:{repair_suffix}",
+            error,
+        )
+        if theme_match is not None and isinstance(themes, list):
+            theme_index = int(theme_match.group(1))
+            if 1 <= theme_index <= len(themes) and isinstance(
+                themes[theme_index - 1], dict
+            ):
+                theme = themes[theme_index - 1]
+                field = theme_match.group(2)
+                ids = list(theme.get("evidence_segment_ids", []))
+                for point in theme.get("key_points", []):
+                    if isinstance(point, dict) and isinstance(point.get("segment_ids"), list):
+                        ids.extend(point["segment_ids"])
+                register(f"theme:{theme_index}:{field}", theme.get(field), ids, error)
+        elif point_match is not None and isinstance(themes, list):
+            theme_index, point_index = map(int, point_match.groups())
+            if 1 <= theme_index <= len(themes) and isinstance(
+                themes[theme_index - 1], dict
+            ):
+                points = themes[theme_index - 1].get("key_points")
+                if (
+                    isinstance(points, list)
+                    and 1 <= point_index <= len(points)
+                    and isinstance(points[point_index - 1], dict)
+                ):
+                    point = points[point_index - 1]
+                    register(
+                        f"theme:{theme_index}:point:{point_index}:text",
+                        point.get("text"),
+                        point.get("segment_ids"),
+                        error,
+                    )
+        elif action_match is not None and isinstance(actions, list):
+            action_index = int(action_match.group(1))
+            if 1 <= action_index <= len(actions) and isinstance(actions[action_index - 1], dict):
+                action = actions[action_index - 1]
+                register(
+                    f"action:{action_index}:item",
+                    action.get("item"),
+                    action.get("segment_ids"),
+                    error,
+                )
+        elif update_match is not None and isinstance(updates, list):
+            update_index = int(update_match.group(1))
+            field = update_match.group(2) or "update"
+            if 1 <= update_index <= len(updates) and isinstance(updates[update_index - 1], dict):
+                update = updates[update_index - 1]
+                register(
+                    f"project_update:{update_index}:{field}",
+                    update.get(field),
+                    update.get("segment_ids"),
+                    error,
+                )
+        elif decision_match is not None and isinstance(decisions, list):
+            decision_index = int(decision_match.group(1))
+            if 1 <= decision_index <= len(decisions) and isinstance(decisions[decision_index - 1], dict):
+                decision = decisions[decision_index - 1]
+                register(
+                    f"decision:{decision_index}:text",
+                    decision.get("text"),
+                    decision.get("segment_ids"),
+                    error,
+                )
+    return [
+        {
+            **target,
+            "evidence": [
+                {
+                    "segment_id": segment_id,
+                    "start": record_map[segment_id].get("start"),
+                    "end": record_map[segment_id].get("end"),
+                    "speaker": record_map[segment_id].get("speaker"),
+                    "text": record_map[segment_id].get("text"),
+                }
+                for segment_id in target["segment_ids"]
+            ],
+        }
+        for _path, target in sorted(targets.items())
+    ]
+
+
+def _targeted_field_repair_messages(
+    targets: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You repair only listed meeting-minutes text fields. Return valid JSON "
+                "and nothing else."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "instruction": (
+                        "Return {\"repairs\":[{\"field\":\"...\",\"text\":\"...\"}]}. "
+                        "Repair only listed fields. Each replacement must be concise, "
+                        "professional Chinese, and fully entailed by that field's cited "
+                        "transcript evidence. Keep supported product and person names; "
+                        "Treat completed, in-progress, requested, planned, and proposed "
+                        "states as different facts. Never rewrite a request, need, or plan "
+                        "as completed work. A past-tense attempt such as 已尝试 or was "
+                        "attempted is also a completed status claim unless the evidence "
+                        "states that the attempt occurred. "
+                        "omit unsupported terms instead of masking them with 相关, related, "
+                        "relevant, client side, or internal side. Do not change owners, "
+                        "speakers, segment IDs, decisions, candidate dispositions, or any "
+                        "identity. For an action, state one complete concrete outcome, not "
+                        "only a collaboration phrase."
+                    ),
+                    "fields": targets,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _set_repair_field_text(
+    review: dict[str, Any],
+    field: str,
+    text: str,
+) -> bool:
+    minutes = review.get("minutes")
+    if not isinstance(minutes, dict):
+        return False
+    theme_match = re.match(r"^theme:(\d+):(title|current_state|outcome)$", field)
+    point_match = re.match(r"^theme:(\d+):point:(\d+):text$", field)
+    action_match = re.match(r"^action:(\d+):item$", field)
+    update_match = re.match(r"^project_update:(\d+):(project|update)$", field)
+    decision_match = re.match(r"^decision:(\d+):text$", field)
+    if theme_match is not None:
+        themes = minutes.get("themes")
+        index = int(theme_match.group(1))
+        if not isinstance(themes, list) or not 1 <= index <= len(themes) or not isinstance(themes[index - 1], dict):
+            return False
+        themes[index - 1][theme_match.group(2)] = text
+        return True
+    if point_match is not None:
+        themes = minutes.get("themes")
+        theme_index, point_index = map(int, point_match.groups())
+        if not isinstance(themes, list) or not 1 <= theme_index <= len(themes) or not isinstance(themes[theme_index - 1], dict):
+            return False
+        points = themes[theme_index - 1].get("key_points")
+        if not isinstance(points, list) or not 1 <= point_index <= len(points) or not isinstance(points[point_index - 1], dict):
+            return False
+        points[point_index - 1]["text"] = text
+        return True
+    if action_match is not None:
+        actions = minutes.get("actions")
+        index = int(action_match.group(1))
+        if not isinstance(actions, list) or not 1 <= index <= len(actions) or not isinstance(actions[index - 1], dict):
+            return False
+        actions[index - 1]["item"] = text
+        return True
+    if update_match is not None:
+        updates = minutes.get("project_updates")
+        index = int(update_match.group(1))
+        if not isinstance(updates, list) or not 1 <= index <= len(updates) or not isinstance(updates[index - 1], dict):
+            return False
+        updates[index - 1][update_match.group(2)] = text
+        return True
+    if decision_match is not None:
+        decisions = minutes.get("decisions")
+        index = int(decision_match.group(1))
+        if not isinstance(decisions, list) or not 1 <= index <= len(decisions) or not isinstance(decisions[index - 1], dict):
+            return False
+        decisions[index - 1]["text"] = text
+        return True
+    return False
+
+
+def _apply_targeted_field_repairs(
+    review: object,
+    payload: object,
+    *,
+    targets: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if (
+        not isinstance(review, dict)
+        or not isinstance(payload, dict)
+        or set(payload) != {"repairs"}
+        or not isinstance(payload.get("repairs"), list)
+    ):
+        return None, []
+    allowed_fields = {_plain(target.get("field")) for target in targets}
+    repaired = deepcopy(review)
+    applied: list[str] = []
+    for repair in payload["repairs"]:
+        if not isinstance(repair, dict) or set(repair) != {"field", "text"}:
+            return None, []
+        field = _plain(repair.get("field"))
+        text = _plain(repair.get("text"))
+        if not field or not text or field not in allowed_fields or field in applied:
+            return None, []
+        if not _set_repair_field_text(repaired, field, text):
+            return None, []
+        applied.append(field)
+    return (repaired, applied) if applied else (None, [])
+
+
+def repair_source_minutes_text_fields(
+    source_minutes: object,
+    *,
+    transcript_records: list[dict[str, Any]],
+    required_project_participants: list[str],
+    config: DeepSeekConfig,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Repair only locally invalid prose fields of a previously reviewed draft.
+
+    This is the recovery path for a validator upgrade. It deliberately reuses
+    the reviewed structure and evidence IDs, asks the model for text-only
+    changes, and refuses any repair that introduces a new local validation
+    error. It never asks for a new full-meeting synthesis.
+    """
+
+    current, errors = validate_source_minutes(
+        source_minutes,
+        transcript_records=transcript_records,
+        required_project_participants=required_project_participants,
+        return_partial_on_error=True,
+    )
+    if current is not None and not errors:
+        return current, {"status": "not_needed", "initial_validation_errors": []}
+    if current is None:
+        return None, {
+            "status": "source_minutes_invalid",
+            "initial_validation_errors": errors,
+        }
+
+    initial_errors = list(errors)
+    history: list[dict[str, Any]] = []
+    for attempt in range(1, 3):
+        review = {"minutes": current}
+        targets = _field_repair_targets(
+            review,
+            errors,
+            transcript_records=transcript_records,
+        )
+        targeted_errors = {
+            _plain(error)
+            for target in targets
+            for error in target.get("errors", [])
+            if _plain(error)
+        }
+        if not targets or set(errors).difference(targeted_errors):
+            return None, {
+                "status": "untargetable_validation_errors",
+                "initial_validation_errors": initial_errors,
+                "remaining_validation_errors": errors,
+                "targeted_error_count": len(targeted_errors),
+            }
+        repair_payload, request_status = request_deepseek_json(
+            messages=_targeted_field_repair_messages(targets),
+            config=config,
+            max_tokens=4_000,
+        )
+        repaired_review, applied_fields = _apply_targeted_field_repairs(
+            review,
+            repair_payload,
+            targets=targets,
+        )
+        if repaired_review is None:
+            return None, {
+                "status": "field_repair_response_invalid",
+                "initial_validation_errors": initial_errors,
+                "remaining_validation_errors": errors,
+                "field_repair": request_status,
+            }
+        candidate, candidate_errors = validate_source_minutes(
+            repaired_review.get("minutes"),
+            transcript_records=transcript_records,
+            required_project_participants=required_project_participants,
+            return_partial_on_error=True,
+        )
+        if (
+            candidate is None
+            or set(candidate_errors).difference(errors)
+            or len(candidate_errors) >= len(errors)
+        ):
+            return None, {
+                "status": "field_repair_no_progress",
+                "initial_validation_errors": initial_errors,
+                "remaining_validation_errors": errors,
+                "candidate_validation_errors": candidate_errors,
+                "field_repair": request_status,
+            }
+        history.append(
+            {
+                "attempt": attempt,
+                "applied_fields": applied_fields,
+                "request_status": request_status,
+            }
+        )
+        current = candidate
+        errors = candidate_errors
+        if not errors:
+            return current, {
+                "status": "repaired",
+                "initial_validation_errors": initial_errors,
+                "field_repair": history,
+            }
+    return None, {
+        "status": "field_repair_retry_exhausted",
+        "initial_validation_errors": initial_errors,
+        "remaining_validation_errors": errors,
+        "field_repair": history,
+    }
+
+
+def repair_reviewed_minutes_text_fields(
+    payload: object,
+    *,
+    segments: list[dict[str, Any]],
+    config: DeepSeekConfig,
+    allow_cluster_name_consensus: bool = True,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Revalidate a reviewed bilingual artifact through bounded text repair.
+
+    The original evidence IDs, owners, speakers, decisions, and list structure
+    are retained. Only fields selected by current local validation may change,
+    followed by a fresh English translation of the repaired Chinese source.
+    """
+
+    if not isinstance(payload, dict) or set(payload) != {"format", "minutes"}:
+        return None, {"status": "reviewed_payload_top_level_invalid"}
+    if payload.get("format") != SMART_MINUTES_FORMAT:
+        return None, {"status": "reviewed_payload_format_invalid"}
+    bilingual = payload.get("minutes")
+    if not isinstance(bilingual, dict):
+        return None, {"status": "reviewed_payload_minutes_invalid"}
+    records = canonical_transcript_records(
+        segments,
+        allow_cluster_name_consensus=allow_cluster_name_consensus,
+    )
+    if not records:
+        return None, {"status": "empty_transcript"}
+    required_participants = _required_project_participants(records)
+    chinese_source = _bilingual_to_source(bilingual, language="zh")
+    repaired_source, source_status = repair_source_minutes_text_fields(
+        chinese_source,
+        transcript_records=records,
+        required_project_participants=required_participants,
+        config=config,
+    )
+    if repaired_source is None:
+        return None, {
+            "status": "source_field_repair_failed",
+            "source_field_repair": source_status,
+        }
+    if source_status.get("status") == "not_needed":
+        return deepcopy(payload), {
+            "status": "not_needed",
+            "source_field_repair": source_status,
+        }
+
+    translation_messages = build_translation_messages(repaired_source)
+    raw_translation, translation_status = request_deepseek_json(
+        messages=translation_messages,
+        config=config,
+    )
+    if raw_translation is None:
+        return None, {
+            "status": "translation_failed",
+            "source_field_repair": source_status,
+            "translation": translation_status,
+        }
+    repaired_bilingual, translation_errors = combine_publishable_minutes_languages(
+        repaired_source,
+        raw_translation,
+    )
+    if repaired_bilingual is None:
+        translation_repair_messages = build_translation_repair_messages(
+            repaired_source,
+            raw_translation,
+            translation_errors,
+        )
+        translated_repair, translation_repair_status = request_deepseek_json(
+            messages=translation_repair_messages,
+            config=config,
+        )
+        if translated_repair is not None:
+            raw_translation = translated_repair
+            translation_status = {
+                **translation_repair_status,
+                "status": "repair",
+                "initial_validation_errors": translation_errors,
+            }
+            repaired_bilingual, translation_errors = combine_publishable_minutes_languages(
+                repaired_source,
+                raw_translation,
+            )
+    if repaired_bilingual is None:
+        return None, {
+            "status": "translation_alignment_invalid",
+            "source_field_repair": source_status,
+            "translation": translation_status,
+            "errors": translation_errors,
+        }
+    return {
+        "format": SMART_MINUTES_FORMAT,
+        "minutes": repaired_bilingual,
+    }, {
+        "status": "repaired",
+        "source_field_repair": source_status,
+        "translation": translation_status,
+    }
 
 
 def _error_indexes(errors: list[str], pattern: str) -> set[int]:
@@ -798,21 +1890,264 @@ def _neutralize_ungrounded_entities(
     return neutralized.strip(" ，,；;")
 
 
+def _drop_ungrounded_entity_clauses(
+    text: object,
+    entities: set[str],
+) -> str:
+    """Remove complete unsupported clauses instead of masking names in place."""
+
+    source = _plain(text)
+    values = {_plain(entity) for entity in entities if _plain(entity)}
+    if not source or not values:
+        return source
+    patterns = [
+        re.compile(re.escape(value), re.IGNORECASE)
+        for value in sorted(values, key=len, reverse=True)
+    ]
+    clauses = re.split(r"(?<=[，,；;。！？!?])", source)
+    retained = [
+        clause
+        for clause in clauses
+        if clause and not any(pattern.search(clause) for pattern in patterns)
+    ]
+    cleaned = "".join(retained).strip()
+    cleaned = re.sub(
+        r"^[，,；;\s]*(?:但|而|并且|且|以及|同时|but|and|while)\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"(?:[，,；;]\s*){2,}", "，", cleaned)
+    return cleaned.strip(" ，,；;")
+
+
+def _record_time_distance_seconds(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> float:
+    left_start = float(left.get("start", 0.0) or 0.0)
+    left_end = float(left.get("end", left_start) or left_start)
+    right_start = float(right.get("start", 0.0) or 0.0)
+    right_end = float(right.get("end", right_start) or right_start)
+    if left_end < right_start:
+        return right_start - left_end
+    if right_end < left_start:
+        return left_start - right_end
+    return 0.0
+
+
+def _theme_entity_evidence_additions(
+    *,
+    theme_index: int,
+    target_ids: list[str],
+    entities: set[str],
+    transcript_record_map: dict[str, dict[str, Any]],
+    theme_outline: list[dict[str, Any]] | None,
+    required_speaker: str | None = None,
+) -> list[str]:
+    """Find nearby, outline-bounded transcript turns that state missing entities.
+
+    This is intentionally evidence-only: it never alters a point speaker or turns
+    an anonymous diarization label into a participant identity.
+    """
+
+    if not entities or not transcript_record_map:
+        return []
+    if (
+        not isinstance(theme_outline, list)
+        or not 1 <= theme_index <= len(theme_outline)
+        or not isinstance(theme_outline[theme_index - 1], dict)
+    ):
+        return []
+    outline = theme_outline[theme_index - 1]
+    try:
+        allowed_start = float(outline["start"]) - ACTION_MAX_EVIDENCE_SPAN_SECONDS
+        allowed_end = float(outline["end"]) + ACTION_MAX_EVIDENCE_SPAN_SECONDS
+    except (KeyError, TypeError, ValueError):
+        return []
+    source_records = [
+        transcript_record_map[segment_id]
+        for segment_id in target_ids
+        if segment_id in transcript_record_map
+    ]
+    if not source_records:
+        return []
+    normalized_speaker = _plain(required_speaker)
+    candidates: list[tuple[float, float, str]] = []
+    for segment_id, record in transcript_record_map.items():
+        if segment_id in target_ids:
+            continue
+        start = float(record.get("start", 0.0) or 0.0)
+        end = float(record.get("end", start) or start)
+        if start < allowed_start or end > allowed_end:
+            continue
+        if normalized_speaker and _plain(record.get("speaker")) != normalized_speaker:
+            continue
+        text = _plain(record.get("text"))
+        if not text or not any(
+            _entity_token_grounded(entity, text)
+            for entity in entities
+        ):
+            continue
+        distance = min(
+            _record_time_distance_seconds(record, source)
+            for source in source_records
+        )
+        if distance > THEME_ENTITY_EVIDENCE_EXPANSION_SECONDS:
+            continue
+        candidates.append((distance, start, segment_id))
+    candidates.sort()
+    return [
+        segment_id
+        for _distance, _start, segment_id in candidates[
+            :MAX_THEME_ENTITY_EVIDENCE_ADDITIONS
+        ]
+    ]
+
+
+def _neutralize_ungrounded_numbers(
+    text: object,
+    numbers: set[str],
+) -> str:
+    """Drop only clauses that depend on numeric claims absent from evidence."""
+
+    source = _plain(text)
+    values = {_plain(number) for number in numbers if _plain(number)}
+    if not source or not values:
+        return source
+
+    number_patterns = [
+        re.compile(
+            rf"(?<![0-9A-Za-z]){re.escape(value)}(?![0-9A-Za-z])",
+            re.IGNORECASE,
+        )
+        for value in sorted(values, key=len, reverse=True)
+    ]
+    clauses = re.split(r"(?<=[，,；;。！？!?])", source)
+    retained = [
+        clause
+        for clause in clauses
+        if clause and not any(pattern.search(clause) for pattern in number_patterns)
+    ]
+    neutralized = "".join(retained).strip()
+    neutralized = re.sub(
+        r"^[，,；;\s]*(?:但|而|并且|且|以及|同时|but|and|while)\s*",
+        "",
+        neutralized,
+        flags=re.IGNORECASE,
+    )
+    neutralized = re.sub(r"(?:[，,；;]\s*){2,}", "，", neutralized)
+    neutralized = neutralized.strip(" ，,；;")
+    if neutralized:
+        return neutralized
+    if re.search(r"[\u4e00-\u9fff]", source):
+        return "该项细节尚待确认。"
+    return "This detail remains to be confirmed."
+
+
+def _concise_candidate_disposition_reason(disposition: dict[str, Any]) -> str:
+    """Return a bounded, evidence-oriented reason for a final-review disposition."""
+
+    if _plain(disposition.get("disposition")) == "kept":
+        return "Cited evidence supports this action."
+    reason_code = _plain(disposition.get("reason_code"))
+    reasons = {
+        "unsupported_owner": "Cited evidence does not establish this owner.",
+        "unsupported_commitment": "Cited evidence does not establish a concrete commitment.",
+        "unsupported_item": "Cited evidence does not establish this follow-up item.",
+    }
+    return reasons.get(
+        reason_code,
+        "Cited evidence does not support this disposition.",
+    )
+
+
+def _concise_prior_finding_reason(disposition: dict[str, Any]) -> str:
+    """Return a bounded reason without changing a prior-finding disposition."""
+
+    if _plain(disposition.get("disposition")) == "addressed":
+        return "The revised minutes address this finding."
+    return "No evidence-backed correction is available."
+
+
+def _ungrounded_values_by_index(
+    errors: list[str],
+    *,
+    field: str,
+    kind: str,
+) -> dict[int, set[str]]:
+    values: dict[int, set[str]] = {}
+    pattern = re.compile(
+        rf"^{re.escape(field)}:(\d+):{re.escape(kind)}_ungrounded:(.+)$"
+    )
+    for error in errors:
+        match = pattern.match(error)
+        if match is None:
+            continue
+        value = _plain(match.group(2))
+        if value:
+            values.setdefault(int(match.group(1)), set()).add(value)
+    return values
+
+
 def _ungrounded_entities_by_index(
     errors: list[str],
     *,
     field: str,
 ) -> dict[int, set[str]]:
-    entities: dict[int, set[str]] = {}
-    pattern = re.compile(rf"^{re.escape(field)}:(\d+):named_entity_ungrounded:(.+)$")
+    return _ungrounded_values_by_index(
+        errors,
+        field=field,
+        kind="named_entity",
+    )
+
+
+def _ungrounded_numbers_by_index(
+    errors: list[str],
+    *,
+    field: str,
+) -> dict[int, set[str]]:
+    return _ungrounded_values_by_index(errors, field=field, kind="number")
+
+
+def _ungrounded_weekdays_by_index(
+    errors: list[str],
+    *,
+    field: str,
+) -> dict[int, set[str]]:
+    return _ungrounded_values_by_index(errors, field=field, kind="weekday")
+
+
+def _ungrounded_theme_claim_values(
+    errors: list[str],
+    *,
+    kind: str,
+) -> dict[tuple[int, str, int | None], set[str]]:
+    """Return repair tokens for theme fields and speaker key points."""
+
+    values: dict[tuple[int, str, int | None], set[str]] = {}
+    field_pattern = re.compile(
+        rf"^theme:(\d+):(title|current_state|outcome):"
+        rf"{re.escape(kind)}_ungrounded:(.+)$"
+    )
+    point_pattern = re.compile(
+        rf"^theme:(\d+):point:(\d+):(?:text:)?"
+        rf"{re.escape(kind)}_ungrounded:(.+)$"
+    )
     for error in errors:
-        match = pattern.match(error)
-        if match is None:
-            continue
-        entity = _plain(match.group(2))
-        if entity:
-            entities.setdefault(int(match.group(1)), set()).add(entity)
-    return entities
+        field_match = field_pattern.match(error)
+        if field_match is not None:
+            key = (int(field_match.group(1)), field_match.group(2), None)
+            value = _plain(field_match.group(3))
+        else:
+            point_match = point_pattern.match(error)
+            if point_match is None:
+                continue
+            key = (int(point_match.group(1)), "point", int(point_match.group(2)))
+            value = _plain(point_match.group(3))
+        if value:
+            values.setdefault(key, set()).add(value)
+    return values
 
 
 def _project_update_fallback_action(
@@ -913,6 +2248,9 @@ def _deterministic_final_review_repair(
     *,
     errors: list[str],
     action_scout: list[dict[str, Any]],
+    transcript_records: list[dict[str, Any]] | None = None,
+    theme_outline: list[dict[str, Any]] | None = None,
+    entity_fallback: bool = True,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     if not isinstance(review, dict) or not isinstance(review.get("minutes"), dict):
         return None, []
@@ -922,14 +2260,11 @@ def _deterministic_final_review_repair(
     themes = minutes.get("themes")
     dispositions = review.get("candidate_dispositions")
     supports = review.get("action_support")
-    if not all(
-        isinstance(value, list)
-        for value in (actions, updates, themes, dispositions, supports)
-    ):
+    if not all(isinstance(value, list) for value in (actions, updates, themes, dispositions, supports)):
         return None, []
 
     must_keep_actions: set[int] = set()
-    must_keep_candidates: dict[int, dict[str, Any]] = {}
+    must_keep_candidates: dict[int, list[tuple[int, dict[str, Any]]]] = {}
     for disposition in dispositions:
         if not isinstance(disposition, dict):
             continue
@@ -944,9 +2279,8 @@ def _deterministic_final_review_repair(
             and action_scout[candidate_index - 1].get("must_keep") is True
         ):
             must_keep_actions.add(action_index)
-            must_keep_candidates.setdefault(
-                action_index,
-                action_scout[candidate_index - 1],
+            must_keep_candidates.setdefault(action_index, []).append(
+                (candidate_index, action_scout[candidate_index - 1])
             )
 
     invalid_support_positions = _error_indexes(
@@ -972,14 +2306,67 @@ def _deterministic_final_review_repair(
         errors,
         r"^action:(\d+):atomicity_review_required$",
     )
+    wide_actions = _error_indexes(
+        errors,
+        r"^action:(\d+):evidence_span_too_wide:",
+    )
+    collapsed_actions = {
+        int(match.group(1))
+        for error in errors
+        if (
+            match := re.match(
+                r"^publication_gate_candidate_disposition:\d+:"
+                r"must_keep_candidates_collapsed:(\d+)$",
+                error,
+            )
+        )
+    }
     action_entities = _ungrounded_entities_by_index(errors, field="action")
+    action_numbers = _ungrounded_numbers_by_index(errors, field="action")
+    action_weekdays = _ungrounded_weekdays_by_index(errors, field="action")
+    transcript_record_map = {
+        _plain(record.get("segment_id")): record
+        for record in transcript_records or []
+        if isinstance(record, dict) and _plain(record.get("segment_id"))
+    }
+    canonical_names = {
+        _plain(record.get("speaker"))
+        for record in transcript_record_map.values()
+        if _is_real_name(record.get("speaker"))
+    }
+    split_action_indexes = wide_actions | collapsed_actions
+    split_replacements: dict[int, list[tuple[int, dict[str, Any], str]]] = {}
+    for index, candidates in must_keep_candidates.items():
+        if index not in split_action_indexes or index in external_status_actions:
+            continue
+        replacements_for_action: list[tuple[int, dict[str, Any], str]] = []
+        for candidate_index, candidate in candidates:
+            core = _atomic_action_core(candidate.get("item"))
+            if not core:
+                return None, []
+            replacements_for_action.append(
+                (
+                    candidate_index,
+                    {
+                        "owner": candidate["owner"],
+                        "item": core,
+                        "segment_ids": list(candidate["segment_ids"]),
+                    },
+                    candidate["basis"],
+                )
+            )
+        if replacements_for_action:
+            split_replacements[index] = replacements_for_action
     replacements: dict[int, dict[str, Any]] = {}
     replacement_bases: dict[int, str] = {}
-    for index, candidate in must_keep_candidates.items():
+    for index, candidates in must_keep_candidates.items():
         if index in external_status_actions:
+            continue
+        if index in split_replacements:
             continue
         if index not in invalid_support_actions and index not in atomic_actions:
             continue
+        _candidate_index, candidate = candidates[0]
         core = _atomic_action_core(candidate.get("item"))
         if not core:
             return None, []
@@ -995,8 +2382,69 @@ def _deterministic_final_review_repair(
         | external_status_actions
     )
     old_to_new: dict[int, int] = {}
+    split_candidate_actions: dict[int, int] = {}
+    split_supports_by_old_index: dict[int, list[tuple[int, str]]] = {}
     repaired_actions: list[dict[str, Any]] = []
     changes: list[str] = []
+
+    def neutralize_action_claims(
+        action: dict[str, Any],
+        *,
+        source_index: int,
+    ) -> bool:
+        field = f"action:{source_index}"
+        entities = action_entities.get(source_index, set())
+        literals = (
+            action_numbers.get(source_index, set())
+            | action_weekdays.get(source_index, set())
+        )
+        ids = action.get("segment_ids")
+        if transcript_record_map and isinstance(ids, list):
+            current_errors = _claim_fidelity_errors(
+                _plain(action.get("item")),
+                [segment_id for segment_id in ids if segment_id in transcript_record_map],
+                records=transcript_record_map,
+                canonical_names=canonical_names,
+                field=field,
+            )
+            entities = _ungrounded_entities_by_index(
+                current_errors,
+                field="action",
+            ).get(source_index, set())
+            literals = (
+                _ungrounded_numbers_by_index(current_errors, field="action").get(
+                    source_index,
+                    set(),
+                )
+                | _ungrounded_weekdays_by_index(
+                    current_errors,
+                    field="action",
+                ).get(source_index, set())
+            )
+        if entities and entity_fallback:
+            repaired_item = _drop_ungrounded_entity_clauses(
+                action.get("item"),
+                entities,
+            )
+            if repaired_item and repaired_item != _plain(action.get("item")):
+                action["item"] = repaired_item
+                changes.append(
+                    f"dropped_ungrounded_action_entity_clause:{source_index}"
+                )
+        if literals:
+            neutralized_item = _neutralize_ungrounded_numbers(
+                action.get("item"),
+                literals,
+            )
+            if not neutralized_item:
+                return False
+            if neutralized_item != _plain(action.get("item")):
+                action["item"] = neutralized_item
+                changes.append(
+                    f"neutralized_ungrounded_action_literals:{source_index}"
+                )
+        return True
+
     for old_index, action in enumerate(actions, start=1):
         if old_index in dropped_actions:
             change = (
@@ -1008,42 +2456,115 @@ def _deterministic_final_review_repair(
             continue
         if not isinstance(action, dict):
             return None, []
+        split_actions = split_replacements.get(old_index)
+        if split_actions is not None:
+            for candidate_index, replacement, basis in split_actions:
+                repaired_action = deepcopy(replacement)
+                if not neutralize_action_claims(
+                    repaired_action,
+                    source_index=old_index,
+                ):
+                    return None, []
+                new_index = len(repaired_actions) + 1
+                repaired_actions.append(repaired_action)
+                old_to_new.setdefault(old_index, new_index)
+                split_candidate_actions[candidate_index] = new_index
+                split_supports_by_old_index.setdefault(old_index, []).append(
+                    (new_index, basis)
+                )
+            changes.append(
+                f"split_must_keep_action:{old_index}:{len(split_actions)}"
+            )
+            continue
         replacement = replacements.get(old_index)
         if replacement is not None:
             action = replacement
             changes.append(f"restored_must_keep_action:{old_index}")
         else:
             action = deepcopy(action)
-        entities = action_entities.get(old_index, set())
-        if entities:
-            neutralized_item = _neutralize_ungrounded_entities(
-                action.get("item"),
-                entities,
+        if old_index in wide_actions and transcript_record_map:
+            raw_ids = action.get("segment_ids")
+            ids = [
+                segment_id
+                for segment_id in (raw_ids if isinstance(raw_ids, list) else [])
+                if segment_id in transcript_record_map
+            ]
+            narrowed_ids = _first_bounded_evidence_cluster(
+                ids,
+                transcript_record_map,
+                max_span_seconds=ACTION_MAX_EVIDENCE_SPAN_SECONDS,
             )
-            if not neutralized_item:
-                return None, []
-            if neutralized_item != _plain(action.get("item")):
-                action["item"] = neutralized_item
-                changes.append(f"neutralized_ungrounded_action_entities:{old_index}")
+            if narrowed_ids and narrowed_ids != ids:
+                action["segment_ids"] = narrowed_ids
+                changes.append(f"narrowed_action_evidence:{old_index}")
+        if not neutralize_action_claims(action, source_index=old_index):
+            return None, []
         old_to_new[old_index] = len(repaired_actions) + 1
         repaired_actions.append(action)
-    forced_candidates = _error_indexes(
+    forced_candidate_positions = _error_indexes(
         errors,
-        r"^publication_gate_candidate_disposition:(\d+):unsupported_commitment_conflicts_with_evidence$",
+        r"^publication_gate_candidate_disposition:(\d+):"
+        r"(?:unsupported_commitment_conflicts_with_evidence|"
+        r"must_keep_candidate_rejected)$",
     )
+    rejected_must_keep_positions = _error_indexes(
+        errors,
+        r"^publication_gate_candidate_disposition:(\d+):"
+        r"must_keep_candidate_rejected$",
+    )
+    forced_candidates: set[int] = set()
+    for position in forced_candidate_positions:
+        if not 1 <= position <= len(dispositions):
+            return None, []
+        disposition = dispositions[position - 1]
+        if not isinstance(disposition, dict):
+            return None, []
+        candidate_index = disposition.get("candidate_index")
+        if not isinstance(candidate_index, int) or not 1 <= candidate_index <= len(action_scout):
+            return None, []
+        if (
+            position in rejected_must_keep_positions
+            and action_scout[candidate_index - 1].get("must_keep") is not True
+        ):
+            return None, []
+        forced_candidates.add(candidate_index)
     forced_candidate_actions: dict[int, int] = {}
     for candidate_index in sorted(forced_candidates):
         if not 1 <= candidate_index <= len(action_scout):
             return None, []
         candidate = action_scout[candidate_index - 1]
+        candidate_ids = {
+            segment_id
+            for segment_id in candidate["segment_ids"]
+            if segment_id in transcript_record_map
+        }
         matching_index = next(
             (
                 index
                 for index, action in enumerate(repaired_actions, start=1)
                 if action.get("owner") == candidate["owner"]
                 and (
-                    bool(set(action.get("segment_ids", [])).intersection(candidate["segment_ids"]))
-                    or _action_item_similarity(action.get("item"), candidate["item"]) >= 0.5
+                    bool(set(action.get("segment_ids", [])).intersection(candidate_ids))
+                    or (
+                        _action_item_similarity(action.get("item"), candidate["item"])
+                        >= 0.5
+                        and _evidence_span_seconds(
+                            list(
+                                dict.fromkeys(
+                                    [
+                                        *(
+                                            action.get("segment_ids", [])
+                                            if isinstance(action.get("segment_ids"), list)
+                                            else []
+                                        ),
+                                        *candidate_ids,
+                                    ]
+                                )
+                            ),
+                            transcript_record_map,
+                        )
+                        <= ACTION_MAX_EVIDENCE_SPAN_SECONDS
+                    )
                 )
             ),
             None,
@@ -1077,6 +2598,18 @@ def _deterministic_final_review_repair(
         support = support_by_old_index.get(old_index)
         if not isinstance(support, dict):
             return None, []
+        split_supports = split_supports_by_old_index.get(old_index)
+        if split_supports is not None:
+            for split_index, basis in split_supports:
+                action = repaired_actions[split_index - 1]
+                rebuilt_supports.append(
+                    {
+                        "action_index": split_index,
+                        "segment_ids": list(action.get("segment_ids", [])),
+                        "basis": basis,
+                    }
+                )
+            continue
         action = repaired_actions[new_index - 1]
         rebuilt_supports.append(
             {
@@ -1103,6 +2636,98 @@ def _deterministic_final_review_repair(
         supported_action_indexes.add(action_index)
     repaired["action_support"] = rebuilt_supports
 
+    decision_entities = _ungrounded_entities_by_index(errors, field="decision")
+    invalid_decision_supports: dict[int, str] = {}
+    for error in errors:
+        match = re.match(
+            r"^publication_gate_decision_support:(\d+):"
+            r"(explicit_agreement_not_grounded|selected_direction_not_grounded)$",
+            error,
+        )
+        if match is not None:
+            invalid_decision_supports[int(match.group(1))] = match.group(2)
+    if decision_entities or invalid_decision_supports:
+        decisions = minutes.get("decisions")
+        decision_supports = review.get("decision_support")
+        if not isinstance(decisions, list) or not isinstance(decision_supports, list):
+            return None, []
+        record_map = {
+            _plain(record.get("segment_id")): record
+            for record in transcript_records or []
+            if isinstance(record, dict) and _plain(record.get("segment_id"))
+        }
+        replacement_bases: dict[int, str] = {}
+        dropped_decisions: set[int] = set()
+        for position, error_kind in invalid_decision_supports.items():
+            if not 1 <= position <= len(decision_supports):
+                return None, []
+            support = decision_supports[position - 1]
+            if not isinstance(support, dict):
+                return None, []
+            decision_index = support.get("decision_index")
+            if not isinstance(decision_index, int) or not 1 <= decision_index <= len(decisions):
+                return None, []
+            evidence_text = " ".join(
+                _plain(record_map[segment_id].get("text"))
+                for segment_id in support.get("segment_ids", [])
+                if isinstance(segment_id, str) and segment_id in record_map
+            )
+            alternative_basis = (
+                "selected_direction"
+                if error_kind == "explicit_agreement_not_grounded"
+                and _SELECTED_DIRECTION_CUE.search(evidence_text)
+                else (
+                    "explicit_agreement"
+                    if error_kind == "selected_direction_not_grounded"
+                    and _EXPLICIT_AGREEMENT_CUE.search(evidence_text)
+                    else None
+                )
+            )
+            if alternative_basis is None:
+                dropped_decisions.add(decision_index)
+            else:
+                replacement_bases[position] = alternative_basis
+
+        old_to_new_decision: dict[int, int] = {}
+        repaired_decisions: list[dict[str, Any]] = []
+        for old_index, decision in enumerate(decisions, start=1):
+            if old_index in dropped_decisions:
+                changes.append(f"dropped_ungrounded_decision:{old_index}")
+                continue
+            if not isinstance(decision, dict):
+                return None, []
+            repaired_decision = deepcopy(decision)
+            entities = decision_entities.get(old_index, set())
+            if entities and entity_fallback:
+                repaired_text = _drop_ungrounded_entity_clauses(
+                    repaired_decision.get("text"),
+                    entities,
+                )
+                if repaired_text and repaired_text != _plain(repaired_decision.get("text")):
+                    repaired_decision["text"] = repaired_text
+                    changes.append(
+                        f"dropped_ungrounded_decision_entity_clause:{old_index}"
+                    )
+            old_to_new_decision[old_index] = len(repaired_decisions) + 1
+            repaired_decisions.append(repaired_decision)
+
+        rebuilt_decision_supports: list[dict[str, Any]] = []
+        for position, support in enumerate(decision_supports, start=1):
+            if not isinstance(support, dict):
+                return None, []
+            old_index = support.get("decision_index")
+            if not isinstance(old_index, int) or old_index not in old_to_new_decision:
+                continue
+            repaired_support = deepcopy(support)
+            repaired_support["decision_index"] = old_to_new_decision[old_index]
+            replacement_basis = replacement_bases.get(position)
+            if replacement_basis is not None:
+                repaired_support["basis"] = replacement_basis
+                changes.append(f"repaired_decision_support_basis:{position}")
+            rebuilt_decision_supports.append(repaired_support)
+        repaired_minutes["decisions"] = repaired_decisions
+        repaired["decision_support"] = rebuilt_decision_supports
+
     wrong_owner_candidates = _error_indexes(
         errors,
         r"^publication_gate_candidate_disposition:(\d+):unsupported_owner_conflicts_with_evidence$",
@@ -1126,6 +2751,11 @@ def _deterministic_final_review_repair(
                     "reason": reason,
                 }
             )
+        elif (
+            isinstance(candidate_index, int)
+            and candidate_index in split_candidate_actions
+        ):
+            disposition["action_index"] = split_candidate_actions[candidate_index]
         elif isinstance(old_action_index, int) and old_action_index in old_to_new:
             disposition["action_index"] = old_to_new[old_action_index]
         if isinstance(candidate_index, int) and candidate_index in forced_candidate_actions:
@@ -1145,7 +2775,45 @@ def _deterministic_final_review_repair(
                 }
             )
 
+    for position in _error_indexes(
+        errors,
+        r"^publication_gate_candidate_disposition:(\d+):reason_too_long$",
+    ):
+        if not 1 <= position <= len(repaired["candidate_dispositions"]):
+            return None, []
+        disposition = repaired["candidate_dispositions"][position - 1]
+        if not isinstance(disposition, dict):
+            return None, []
+        concise_reason = _concise_candidate_disposition_reason(disposition)
+        if _plain(disposition.get("reason")) != concise_reason:
+            disposition["reason"] = concise_reason
+            changes.append(f"shortened_candidate_disposition_reason:{position}")
+
+    prior_dispositions = repaired.get("prior_finding_dispositions")
+    if isinstance(prior_dispositions, list):
+        for position in _error_indexes(
+            errors,
+            r"^publication_gate_prior_finding_disposition:(\d+):reason_too_long$",
+        ):
+            if not 1 <= position <= len(prior_dispositions):
+                return None, []
+            disposition = prior_dispositions[position - 1]
+            if not isinstance(disposition, dict):
+                return None, []
+            concise_reason = _concise_prior_finding_reason(disposition)
+            if _plain(disposition.get("reason")) != concise_reason:
+                disposition["reason"] = concise_reason
+                changes.append(f"shortened_prior_finding_reason:{position}")
+
     update_entities = _ungrounded_entities_by_index(
+        errors,
+        field="project_update",
+    )
+    update_numbers = _ungrounded_numbers_by_index(
+        errors,
+        field="project_update",
+    )
+    update_weekdays = _ungrounded_weekdays_by_index(
         errors,
         field="project_update",
     )
@@ -1153,8 +2821,76 @@ def _deterministic_final_review_repair(
         errors,
         r"^project_update:(\d+):participant_evidence_mismatch$",
     )
-    invalid_updates = set(update_entities) | update_evidence_mismatches
-    for update_index in invalid_updates:
+    wide_updates = _error_indexes(
+        errors,
+        r"^project_update:(\d+):evidence_span_too_wide:",
+    )
+
+    def neutralize_update_claims(
+        update: dict[str, Any],
+        *,
+        source_index: int,
+    ) -> bool:
+        entities = update_entities.get(source_index, set())
+        literals = (
+            update_numbers.get(source_index, set())
+            | update_weekdays.get(source_index, set())
+        )
+        ids = update.get("segment_ids")
+        if transcript_record_map and isinstance(ids, list):
+            current_errors = _claim_fidelity_errors(
+                _plain(update.get("update")),
+                [segment_id for segment_id in ids if segment_id in transcript_record_map],
+                records=transcript_record_map,
+                canonical_names=canonical_names,
+                field=f"project_update:{source_index}",
+            )
+            entities = _ungrounded_entities_by_index(
+                current_errors,
+                field="project_update",
+            ).get(source_index, set())
+            literals = (
+                _ungrounded_numbers_by_index(
+                    current_errors,
+                    field="project_update",
+                ).get(source_index, set())
+                | _ungrounded_weekdays_by_index(
+                    current_errors,
+                    field="project_update",
+                ).get(source_index, set())
+            )
+        if entities and entity_fallback:
+            detail = _drop_ungrounded_entity_clauses(
+                update.get("update"),
+                entities,
+            )
+            if detail and detail != _plain(update.get("update")):
+                update["update"] = detail
+                changes.append(
+                    f"dropped_ungrounded_project_update_entity_clause:{source_index}"
+                )
+        if literals:
+            detail = _neutralize_ungrounded_numbers(
+                update.get("update"),
+                literals,
+            )
+            if not detail:
+                return False
+            if detail != _plain(update.get("update")):
+                update["update"] = detail
+                changes.append(
+                    f"neutralized_ungrounded_project_update_literals:{source_index}"
+                )
+        return True
+
+    invalid_updates = (
+        set(update_entities)
+        | set(update_numbers)
+        | set(update_weekdays)
+        | update_evidence_mismatches
+        | wide_updates
+    )
+    for update_index in sorted(invalid_updates):
         if not 1 <= update_index <= len(repaired_minutes["project_updates"]):
             continue
         update = repaired_minutes["project_updates"][update_index - 1]
@@ -1162,31 +2898,43 @@ def _deterministic_final_review_repair(
             return None, []
         participant = _plain(update.get("participant"))
         fallback = _project_update_fallback_action(repaired_actions, participant)
-        if not isinstance(fallback, dict):
+        should_rebuild = isinstance(fallback, dict) and (
+            update_index in update_evidence_mismatches
+            or update_index in update_entities
+            or (
+                update_index in wide_updates
+                and _plain(update.get("project")) == "后续跟进"
+            )
+        )
+        if should_rebuild:
+            update.update(
+                {
+                    "project": "后续跟进",
+                    "update": _plain(fallback.get("item")),
+                    "segment_ids": list(fallback.get("segment_ids", [])),
+                }
+            )
+            changes.append(f"rebuilt_project_update:{update_index}")
+        else:
             if update_index in update_evidence_mismatches:
                 return None, []
-            entities = update_entities.get(update_index, set())
-            project = _neutralize_ungrounded_entities(
-                update.get("project"),
-                entities,
-            )
-            detail = _neutralize_ungrounded_entities(
-                update.get("update"),
-                entities,
-            )
-            if not project or not detail:
-                return None, []
-            update.update({"project": project, "update": detail})
-            changes.append(f"neutralized_ungrounded_project_update_entities:{update_index}")
-            continue
-        update.update(
-            {
-                "project": "后续跟进",
-                "update": _plain(fallback.get("item")),
-                "segment_ids": list(fallback.get("segment_ids", [])),
-            }
-        )
-        changes.append(f"rebuilt_project_update:{update_index}")
+            if update_index in wide_updates and transcript_record_map:
+                raw_ids = update.get("segment_ids")
+                ids = [
+                    segment_id
+                    for segment_id in (raw_ids if isinstance(raw_ids, list) else [])
+                    if segment_id in transcript_record_map
+                ]
+                narrowed_ids = _first_bounded_evidence_cluster(
+                    ids,
+                    transcript_record_map,
+                    max_span_seconds=PROJECT_UPDATE_MAX_EVIDENCE_SPAN_SECONDS,
+                )
+                if narrowed_ids and narrowed_ids != ids:
+                    update["segment_ids"] = narrowed_ids
+                    changes.append(f"narrowed_project_update_evidence:{update_index}")
+        if not neutralize_update_claims(update, source_index=update_index):
+            return None, []
 
     if any(error.startswith("project_update:") and error.endswith(":participant_duplicate") for error in errors):
         seen_participants: set[str] = set()
@@ -1221,6 +2969,83 @@ def _deterministic_final_review_repair(
             }
         )
         changes.append(f"upgraded_project_update:{update_index}")
+
+    unattributed_points: dict[int, set[int]] = {}
+    retained_point_positions: dict[tuple[int, int], int] = {}
+    for error in errors:
+        match = re.match(
+            r"^theme:(\d+):point:(\d+):(?:speaker_evidence_mismatch|"
+            r"speaker_anonymous)$",
+            error,
+        )
+        if match is not None:
+            unattributed_points.setdefault(int(match.group(1)), set()).add(
+                int(match.group(2))
+            )
+    if unattributed_points:
+        record_map = {
+            _plain(record.get("segment_id")): record
+            for record in transcript_records or []
+            if isinstance(record, dict) and _plain(record.get("segment_id"))
+        }
+        for theme_index, point_indexes in sorted(unattributed_points.items()):
+            if not 1 <= theme_index <= len(repaired_minutes["themes"]):
+                return None, []
+            theme = repaired_minutes["themes"][theme_index - 1]
+            if not isinstance(theme, dict):
+                return None, []
+            points = theme.get("key_points")
+            if not isinstance(points, list):
+                return None, []
+            retained_points: list[dict[str, Any]] = []
+            for point_index, point in enumerate(points, start=1):
+                if not isinstance(point, dict):
+                    return None, []
+                if point_index not in point_indexes:
+                    retained_points.append(point)
+                    retained_point_positions[(theme_index, point_index)] = len(
+                        retained_points
+                    )
+                    continue
+                segment_ids = point.get("segment_ids")
+                if not isinstance(segment_ids, list):
+                    return None, []
+                evidence_speakers = {
+                    _plain(record_map[segment_id].get("speaker"))
+                    for segment_id in segment_ids
+                    if isinstance(segment_id, str)
+                    and segment_id in record_map
+                    and _is_real_name(record_map[segment_id].get("speaker"))
+                }
+                if len(evidence_speakers) == 1:
+                    corrected_speaker = next(iter(evidence_speakers))
+                    if _plain(point.get("speaker")) != corrected_speaker:
+                        point = deepcopy(point)
+                        point["speaker"] = corrected_speaker
+                        changes.append(
+                            f"corrected_theme_point_speaker:{theme_index}:{point_index}"
+                        )
+                    retained_points.append(point)
+                    retained_point_positions[(theme_index, point_index)] = len(
+                        retained_points
+                    )
+                    continue
+                changes.append(
+                    f"dropped_unattributed_theme_point:{theme_index}:{point_index}"
+                )
+            if not retained_points:
+                theme_evidence_ids = theme.get("evidence_segment_ids")
+                if not isinstance(theme_evidence_ids, list):
+                    return None, []
+                has_named_theme_evidence = any(
+                    isinstance(segment_id, str)
+                    and segment_id in record_map
+                    and _is_real_name(record_map[segment_id].get("speaker"))
+                    for segment_id in theme_evidence_ids
+                )
+                if has_named_theme_evidence:
+                    return None, []
+            theme["key_points"] = retained_points
 
     outside_outline_ids: dict[int, set[str]] = {}
     for error in errors:
@@ -1270,6 +3095,49 @@ def _deterministic_final_review_repair(
         theme["key_points"] = retained_points
         changes.append(f"dropped_out_of_outline_theme_evidence:{theme_index}")
 
+    if isinstance(theme_outline, list):
+        anchor_missing_indexes = _error_indexes(
+            errors,
+            r"^theme:(\d+):outline_anchor_missing$",
+        )
+        short_span_indexes = _error_indexes(
+            errors,
+            r"^theme:(\d+):span_too_short:",
+        )
+        for theme_index in sorted(anchor_missing_indexes | short_span_indexes):
+            if (
+                not 1 <= theme_index <= len(repaired_minutes["themes"])
+                or not 1 <= theme_index <= len(theme_outline)
+            ):
+                return None, []
+            theme = repaired_minutes["themes"][theme_index - 1]
+            outline = theme_outline[theme_index - 1]
+            if not isinstance(theme, dict) or not isinstance(outline, dict):
+                return None, []
+            evidence_ids = theme.get("evidence_segment_ids")
+            if not isinstance(evidence_ids, list):
+                return None, []
+            additions: list[str] = []
+            if theme_index in anchor_missing_indexes:
+                additions.extend(
+                    segment_id
+                    for segment_id in outline.get("anchor_segment_ids", [])
+                    if isinstance(segment_id, str)
+                )
+            if theme_index in short_span_indexes:
+                additions.extend(
+                    segment_id
+                    for segment_id in (
+                        outline.get("start_segment_id"),
+                        outline.get("end_segment_id"),
+                    )
+                    if isinstance(segment_id, str)
+                )
+            expanded_ids = list(dict.fromkeys([*evidence_ids, *additions]))
+            if expanded_ids != evidence_ids:
+                theme["evidence_segment_ids"] = expanded_ids
+                changes.append(f"restored_theme_outline_evidence:{theme_index}")
+
     anonymous_theme_indexes = {
         int(match.group(1))
         for error in errors
@@ -1307,6 +3175,192 @@ def _deterministic_final_review_repair(
                 changed = True
         if changed:
             changes.append(f"neutralized_anonymous_theme_reference:{theme_index}")
+
+    theme_entities = _ungrounded_theme_claim_values(
+        errors,
+        kind="named_entity",
+    )
+    theme_numbers = _ungrounded_theme_claim_values(errors, kind="number")
+    theme_weekdays = _ungrounded_theme_claim_values(errors, kind="weekday")
+    theme_claim_keys = set(theme_entities) | set(theme_numbers) | set(theme_weekdays)
+    for theme_index, field, point_index in sorted(theme_claim_keys):
+        if not 1 <= theme_index <= len(repaired_minutes["themes"]):
+            return None, []
+        theme = repaired_minutes["themes"][theme_index - 1]
+        if not isinstance(theme, dict):
+            return None, []
+        if field == "point":
+            points = theme.get("key_points")
+            current_point_index = retained_point_positions.get(
+                (theme_index, point_index)
+            )
+            if (
+                point_index is not None
+                and theme_index in unattributed_points
+                and point_index in unattributed_points[theme_index]
+                and current_point_index is None
+            ):
+                continue
+            if current_point_index is None:
+                current_point_index = point_index
+            if (
+                not isinstance(points, list)
+                or current_point_index is None
+                or not 1 <= current_point_index <= len(points)
+                or not isinstance(points[current_point_index - 1], dict)
+            ):
+                return None, []
+            target = points[current_point_index - 1]
+            text_key = "text"
+            ids = target.get("segment_ids")
+            fidelity_field = (
+                f"theme:{theme_index}:point:{current_point_index}"
+            )
+        else:
+            target = theme
+            text_key = field
+            theme_ids = theme.get("evidence_segment_ids")
+            points = theme.get("key_points")
+            if not isinstance(theme_ids, list) or not isinstance(points, list):
+                return None, []
+            ids = list(theme_ids)
+            for point in points:
+                if not isinstance(point, dict) or not isinstance(
+                    point.get("segment_ids"),
+                    list,
+                ):
+                    return None, []
+                for segment_id in point["segment_ids"]:
+                    if segment_id not in ids:
+                        ids.append(segment_id)
+            fidelity_field = f"theme:{theme_index}:{field}"
+        if not isinstance(ids, list):
+            return None, []
+        entities = theme_entities.get((theme_index, field, point_index), set())
+        literals = (
+            theme_numbers.get((theme_index, field, point_index), set())
+            | theme_weekdays.get((theme_index, field, point_index), set())
+        )
+        if transcript_record_map:
+            current_errors = _claim_fidelity_errors(
+                _plain(target.get(text_key)),
+                [segment_id for segment_id in ids if segment_id in transcript_record_map],
+                records=transcript_record_map,
+                canonical_names=canonical_names,
+                field=fidelity_field,
+            )
+            entities = _ungrounded_theme_claim_values(
+                current_errors,
+                kind="named_entity",
+            ).get((theme_index, field, point_index), set())
+            literals = (
+                _ungrounded_theme_claim_values(current_errors, kind="number").get(
+                    (theme_index, field, point_index),
+                    set(),
+                )
+                | _ungrounded_theme_claim_values(current_errors, kind="weekday").get(
+                    (theme_index, field, point_index),
+                    set(),
+                )
+            )
+        if entities and transcript_record_map:
+            point_speaker = _plain(target.get("speaker")) if field == "point" else ""
+            additions = (
+                _theme_entity_evidence_additions(
+                    theme_index=theme_index,
+                    target_ids=[
+                        segment_id
+                        for segment_id in ids
+                        if segment_id in transcript_record_map
+                    ],
+                    entities=entities,
+                    transcript_record_map=transcript_record_map,
+                    theme_outline=theme_outline,
+                    required_speaker=point_speaker,
+                )
+                if field != "point" or _is_real_name(point_speaker)
+                else []
+            )
+            if additions:
+                if field == "point":
+                    target["segment_ids"] = list(
+                        dict.fromkeys([*ids, *additions])
+                    )
+                    ids = list(target["segment_ids"])
+                else:
+                    theme["evidence_segment_ids"] = list(
+                        dict.fromkeys(
+                            [*theme.get("evidence_segment_ids", []), *additions]
+                        )
+                    )
+                    ids = list(theme["evidence_segment_ids"])
+                    for point in points:
+                        if not isinstance(point, dict) or not isinstance(
+                            point.get("segment_ids"),
+                            list,
+                        ):
+                            return None, []
+                        for segment_id in point["segment_ids"]:
+                            if segment_id not in ids:
+                                ids.append(segment_id)
+                current_errors = _claim_fidelity_errors(
+                    _plain(target.get(text_key)),
+                    [
+                        segment_id
+                        for segment_id in ids
+                        if segment_id in transcript_record_map
+                    ],
+                    records=transcript_record_map,
+                    canonical_names=canonical_names,
+                    field=fidelity_field,
+                )
+                entities = _ungrounded_theme_claim_values(
+                    current_errors,
+                    kind="named_entity",
+                ).get((theme_index, field, point_index), set())
+                literals = (
+                    _ungrounded_theme_claim_values(
+                        current_errors,
+                        kind="number",
+                    ).get((theme_index, field, point_index), set())
+                    | _ungrounded_theme_claim_values(
+                        current_errors,
+                        kind="weekday",
+                    ).get((theme_index, field, point_index), set())
+                )
+                changes.append(
+                    f"expanded_theme_entity_evidence:{theme_index}:{field}:"
+                    f"{len(additions)}"
+                )
+        changed = False
+        if entities and entity_fallback:
+            neutralized = _drop_ungrounded_entity_clauses(
+                target.get(text_key),
+                entities,
+            )
+            if neutralized != _plain(target.get(text_key)):
+                target[text_key] = neutralized
+                changed = True
+                changes.append(
+                    f"dropped_ungrounded_theme_entity_clause:{theme_index}:{field}"
+                )
+        if literals:
+            neutralized = _neutralize_ungrounded_numbers(
+                target.get(text_key),
+                literals,
+            )
+            if neutralized != _plain(target.get(text_key)):
+                target[text_key] = neutralized
+                changed = True
+                changes.append(
+                    f"neutralized_ungrounded_theme_literals:{theme_index}:{field}"
+                )
+        if field == "point" and not _plain(target.get(text_key)):
+            target[text_key] = "提出了待确认事项。"
+            if not changed:
+                changes.append(
+                    f"neutralized_ungrounded_theme_point:{theme_index}:{point_index}"
+                )
 
     anonymous_update_indexes = {
         int(match.group(1))
@@ -1379,7 +3433,24 @@ def _deterministic_final_review_repair(
             action["item"] = neutralized
             changes.append(f"neutralized_anonymous_action:{action_index}")
 
-    for error in errors:
+    future_owner_errors = {
+        error
+        for error in errors
+        if re.match(r"^theme:(\d+):future_owner_without_action:(.+)$", error)
+    }
+    if transcript_records is not None:
+        _partial_minutes, post_repair_errors = validate_source_minutes(
+            repaired_minutes,
+            transcript_records=transcript_records,
+            required_project_participants=[],
+            return_partial_on_error=True,
+        )
+        future_owner_errors.update(
+            error
+            for error in post_repair_errors
+            if re.match(r"^theme:(\d+):future_owner_without_action:(.+)$", error)
+        )
+    for error in sorted(future_owner_errors):
         match = re.match(r"^theme:(\d+):future_owner_without_action:(.+)$", error)
         if match is None:
             continue
@@ -1390,11 +3461,55 @@ def _deterministic_final_review_repair(
         theme = repaired_minutes["themes"][theme_index - 1]
         if not isinstance(theme, dict):
             return None, []
-        theme["outcome"] = _neutralize_future_owner_claim(
+        neutralized_outcome = _neutralize_future_owner_claim(
             theme.get("outcome"),
             owner,
         )
-        changes.append(f"neutralized_future_owner_theme:{theme_index}")
+        if neutralized_outcome != _plain(theme.get("outcome")):
+            theme["outcome"] = neutralized_outcome
+            changes.append(f"neutralized_future_owner_theme:{theme_index}")
+
+    unconfirmed_outcome_indexes = {
+        int(match.group(1))
+        for error in errors
+        if (
+            match := re.match(
+                r"^theme:(\d+):(?:future_fact_unqualified|"
+                r"outcome_unconfirmed_commitment|outcome_ungrounded_consensus)$",
+                error,
+            )
+        )
+    }
+    if transcript_records is not None:
+        _partial_minutes, post_repair_errors = validate_source_minutes(
+            repaired_minutes,
+            transcript_records=transcript_records,
+            required_project_participants=[],
+            return_partial_on_error=True,
+        )
+        unconfirmed_outcome_indexes.update(
+            int(match.group(1))
+            for error in post_repair_errors
+            if (
+                match := re.match(
+                r"^theme:(\d+):(?:future_fact_unqualified|"
+                r"outcome_unconfirmed_commitment|outcome_ungrounded_consensus)$",
+                    error,
+                )
+            )
+        )
+    for theme_index in sorted(unconfirmed_outcome_indexes):
+        if not 1 <= theme_index <= len(repaired_minutes["themes"]):
+            return None, []
+        theme = repaired_minutes["themes"][theme_index - 1]
+        if not isinstance(theme, dict):
+            return None, []
+        neutral_outcome = (
+            "讨论了相关方案与后续安排，尚未形成有明确证据支持的最终决定。"
+        )
+        if _plain(theme.get("outcome")) != neutral_outcome:
+            theme["outcome"] = neutral_outcome
+            changes.append(f"neutralized_unconfirmed_theme_outcome:{theme_index}")
 
     normalized_external_review, external_changes = _normalize_external_delivery_actions(
         repaired,
@@ -1410,9 +3525,121 @@ def _deterministic_final_review_repair(
     return repaired, changes
 
 
+def _deterministic_coverage_review_repair(
+    review: object,
+    *,
+    errors: list[str],
+    action_scout: list[dict[str, Any]],
+    transcript_records: list[dict[str, Any]],
+    theme_outline: list[dict[str, Any]],
+    entity_fallback: bool = True,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Adapt the publication repair to a one-pass coverage review payload."""
+
+    if (
+        not isinstance(review, dict)
+        or set(review) != {"findings", "minutes"}
+        or not isinstance(review.get("findings"), list)
+        or not isinstance(review.get("minutes"), dict)
+        or not isinstance(review["minutes"].get("actions"), list)
+    ):
+        return None, []
+
+    adapted = deepcopy(review)
+    changes: list[str] = []
+    unknown_owner_indexes = _error_indexes(
+        errors,
+        r"^action:(\d+):owner_unknown$",
+    )
+    for action_index in sorted(unknown_owner_indexes):
+        actions = adapted["minutes"]["actions"]
+        if not 1 <= action_index <= len(actions):
+            return None, []
+        action = actions[action_index - 1]
+        if not isinstance(action, dict):
+            return None, []
+        if _plain(action.get("owner")) != UNASSIGNED_ACTION_OWNER:
+            action["owner"] = UNASSIGNED_ACTION_OWNER
+            changes.append(f"neutralized_unknown_action_owner:{action_index}")
+
+    actions = adapted["minutes"]["actions"]
+    for candidate_index, candidate in enumerate(action_scout, start=1):
+        if not isinstance(candidate, dict) or candidate.get("must_keep") is not True:
+            continue
+        candidate_owner = _plain(candidate.get("owner"))
+        candidate_ids = {
+            segment_id
+            for segment_id in candidate.get("segment_ids", [])
+            if isinstance(segment_id, str)
+        }
+        covered = any(
+            isinstance(action, dict)
+            and _plain(action.get("owner")) == candidate_owner
+            and bool(
+                candidate_ids.intersection(
+                    segment_id
+                    for segment_id in action.get("segment_ids", [])
+                    if isinstance(segment_id, str)
+                )
+            )
+            for action in actions
+        )
+        if covered:
+            continue
+        item = _atomic_action_core(candidate.get("item")) or _plain(
+            candidate.get("item")
+        )
+        if not candidate_owner or not item or not candidate_ids:
+            return None, []
+        actions.append(
+            {
+                "owner": candidate_owner,
+                "item": item,
+                "segment_ids": list(candidate.get("segment_ids", [])),
+            }
+        )
+        changes.append(f"restored_must_keep_action_candidate:{candidate_index}")
+
+    synthetic = deepcopy(adapted)
+    synthetic["candidate_dispositions"] = []
+    synthetic["action_support"] = [
+        {
+            "action_index": action_index,
+            "segment_ids": list(action.get("segment_ids", [])),
+            "basis": "accepted_assignment",
+        }
+        for action_index, action in enumerate(
+            synthetic["minutes"]["actions"],
+            start=1,
+        )
+        if isinstance(action, dict)
+    ]
+    repaired, publication_changes = _deterministic_final_review_repair(
+        synthetic,
+        errors=errors,
+        action_scout=action_scout,
+        transcript_records=transcript_records,
+        theme_outline=theme_outline,
+        entity_fallback=entity_fallback,
+    )
+    if repaired is not None:
+        adapted = {
+            "findings": repaired["findings"],
+            "minutes": repaired["minutes"],
+        }
+        changes.extend(publication_changes)
+    if not changes:
+        return None, []
+    return adapted, changes
+
+
 def _is_real_name(value: object) -> bool:
     name = _plain(value)
     return bool(name and not _ANONYMOUS_SPEAKER.match(name))
+
+
+def _is_unassigned_action_owner(value: object) -> bool:
+    return _plain(value) == UNASSIGNED_ACTION_OWNER
 
 
 def _compact_claim_text(value: object) -> str:
@@ -1528,6 +3755,61 @@ def _entity_token_grounded(token: str, evidence_text: str) -> bool:
     return False
 
 
+def _operation_contexts(
+    text: str,
+    pattern: re.Pattern[str],
+) -> list[str]:
+    contexts: list[str] = []
+    for match in pattern.finditer(text):
+        start = max(0, match.start() - STATUS_CLAIM_CONTEXT_CHARACTERS)
+        end = min(len(text), match.end() + STATUS_CLAIM_CONTEXT_CHARACTERS)
+        contexts.append(text[start:end])
+    return contexts
+
+
+def _operation_has_status_cue(
+    text: str,
+    pattern: re.Pattern[str],
+    cue: re.Pattern[str],
+) -> bool:
+    return any(cue.search(context) for context in _operation_contexts(text, pattern))
+
+
+def _operation_is_completed(text: str, pattern: re.Pattern[str]) -> bool:
+    for context in _operation_contexts(text, pattern):
+        if _STATUS_NEGATED_COMPLETION_CUE.search(context):
+            continue
+        if _STATUS_COMPLETION_CUE.search(context):
+            return True
+    return False
+
+
+def _claim_status_fidelity_errors(
+    text: str,
+    evidence_text: str,
+    *,
+    field: str,
+) -> list[str]:
+    """Reject a source request being rewritten as a completed operation.
+
+    Entity and literal checks cannot catch an aspect reversal such as "need to
+    retest" becoming "retested". This conservative guard only fires when the
+    same operation has an explicit pending cue in the cited evidence and no
+    completion cue there, while the minutes claim completion.
+    """
+
+    errors: list[str] = []
+    for operation, pattern in _STATUS_OPERATION_PATTERNS:
+        if not _operation_is_completed(text, pattern):
+            continue
+        if not _operation_has_status_cue(evidence_text, pattern, _STATUS_PENDING_CUE):
+            continue
+        if _operation_is_completed(evidence_text, pattern):
+            continue
+        errors.append(f"{field}:status_unsupported_completion:{operation}")
+    return errors
+
+
 def _claim_fidelity_errors(
     text: str,
     ids: list[str],
@@ -1543,6 +3825,7 @@ def _claim_fidelity_errors(
     ]
     evidence_text = " ".join(record["text"] for record in evidence_records)
     entity_evidence_text = _nearby_entity_evidence_text(evidence_records, records)
+    status_evidence_text = entity_evidence_text or evidence_text
     evidence_speakers = {
         record["speaker"]
         for record in evidence_records
@@ -1579,16 +3862,19 @@ def _claim_fidelity_errors(
             errors.append(f"{field}:named_entity_ungrounded:{token}")
 
     normalized_evidence = _plain(evidence_text).casefold().replace(",", "")
-    for raw_number in _NUMBER_TOKEN.findall(text):
+    evidence_numeric_values = _translation_numeric_values(evidence_text)
+    numeric_claim_text = _ANONYMOUS_SPEAKER_REFERENCE.sub("", text)
+    for raw_number in _NUMBER_TOKEN.findall(numeric_claim_text):
         normalized_number = raw_number.replace(",", "")
         equivalents = _SMALL_NUMBER_EQUIVALENTS.get(normalized_number, {normalized_number})
-        if not any(
+        directly_grounded = any(
             re.search(
-                rf"(?<![\w]){re.escape(value.casefold())}(?![\w])",
+                rf"(?<![0-9A-Za-z]){re.escape(value.casefold())}(?![0-9A-Za-z])",
                 normalized_evidence,
             )
             for value in equivalents
-        ):
+        )
+        if not directly_grounded and normalized_number not in evidence_numeric_values:
             errors.append(f"{field}:number_ungrounded:{raw_number}")
 
     evidence_weekdays = {
@@ -1600,6 +3886,13 @@ def _claim_fidelity_errors(
         key = _weekday_key(weekday)
         if key is not None and key not in evidence_weekdays:
             errors.append(f"{field}:weekday_ungrounded:{weekday}")
+    errors.extend(
+        _claim_status_fidelity_errors(
+            text,
+            status_evidence_text,
+            field=field,
+        )
+    )
     return errors
 
 
@@ -1639,14 +3932,18 @@ def _cluster_name_consensus(
     return consensus
 
 
-def canonical_transcript_records(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def canonical_transcript_records(
+    segments: list[dict[str, Any]],
+    *,
+    allow_cluster_name_consensus: bool = True,
+) -> list[dict[str, Any]]:
     """Return the transcript representation sent to the summarizer.
 
-    Direct visual identities take precedence. A diarization cluster is named
-    only when trusted local identity evidence overwhelmingly agrees.
+    Direct visual identities take precedence. Cluster-name expansion is opt-in
+    because a shareable minutes workflow may require per-segment visual proof.
     """
 
-    cluster_names = _cluster_name_consensus(segments)
+    cluster_names = _cluster_name_consensus(segments) if allow_cluster_name_consensus else {}
     records: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     ordered_segments = sorted(
@@ -1671,8 +3968,17 @@ def canonical_transcript_records(segments: list[dict[str, Any]]) -> list[dict[st
 
         direct_name = _plain(segment.get("name"))
         direct_confidence = float(segment.get("name_confidence", 0.0) or 0.0)
+        direct_source = _plain(segment.get("name_source"))
         cluster = _plain(segment.get("speaker")) or "Speaker Unknown"
-        if _is_real_name(direct_name) and direct_confidence >= IDENTITY_CONFIDENCE:
+        direct_identity_allowed = (
+            allow_cluster_name_consensus
+            or direct_source == ACTIVE_SPEAKER_HIGHLIGHT_SOURCE
+        )
+        if (
+            direct_identity_allowed
+            and _is_real_name(direct_name)
+            and direct_confidence >= IDENTITY_CONFIDENCE
+        ):
             speaker = direct_name
             identity_kind = "direct"
             identity_confidence = direct_confidence
@@ -2047,6 +4353,7 @@ Rules:
 - importance must be substantive or transitional. A long technical, operational, commercial, or planning discussion is substantive.
 - Use exact supplied segment IDs. Every model-created topic needs one to four anchors inside its range.
 - Summaries are neutral evidence aids, not decisions. Preserve proposals, disagreements, estimates, dependencies, and unresolved boundaries.
+- Give each topic one specific business-question title. Never join unrelated subjects with a slash.
 - Never infer a real name from an anonymous Speaker label.
 """
     chunk_records = chunk["records"]
@@ -2161,14 +4468,17 @@ Rules:
 - Return between min_theme_count and max_theme_count chronological semantic themes.
 - Consume every source candidate exactly once. source_candidate_indexes must be sorted, adjacent, and may only be merged with neighboring candidates.
 - Merge adjacent candidates when they address the same parent business question. Split when architecture, implementation, operations, documentation, commercial, or ownership questions materially change.
+- Never merge candidates merely because they are adjacent or to reach the requested count. A shared time boundary is not evidence of a shared topic.
 - Final ranges must contain all source candidate ranges and remain chronological and non-overlapping.
 - Use exact candidate or boundary-evidence segment IDs for one to five anchors.
 - Cover the complete supplied candidate range through its last candidate. Never drop a later candidate to meet the count range.
-- Keep titles concise and neutral. Do not promote proposals, estimates, or future designs into decisions.
+- Give every final theme one concise parent-question title of at most 56 characters. Never concatenate candidate titles or unrelated subjects with a slash; split instead when there is no single parent question.
+- Do not promote proposals, estimates, or future designs into decisions.
 """
     user = json.dumps(
         {
             "schema": _theme_merge_schema_example(),
+            "planner_policy_version": THEME_MERGE_POLICY_VERSION,
             "min_theme_count": min_theme_count,
             "max_theme_count": max_theme_count,
             "read_marker": {
@@ -2220,7 +4530,8 @@ Rules:
 - Use exact transcript segment IDs for start_segment_id, end_segment_id, and one to five anchor_segment_ids.
 - Every anchor must fall between its theme start and end. Include anchors for the defining arguments, constraints, or outcome, not greetings or filler.
 - Keep boundaries chronological and non-overlapping. A short transition gap is acceptable; omitting a substantial discussion is not.
-- Keep titles concise and neutral. Do not turn proposals, estimates, or future architecture explanations into decisions.
+- Give every theme one concise, neutral business-question title of at most 56 characters. Never concatenate unrelated subjects with a slash or use a generic placeholder such as "general discussion".
+- Do not turn proposals, estimates, or future architecture explanations into decisions.
 """
     user = json.dumps(
         {
@@ -2735,20 +5046,22 @@ Quality rules:
 - Follow theme_outline in order: produce exactly one minutes theme per outline entry, include at least one supplied anchor in that theme, and keep cited evidence inside the outline range. Do not merge, split, or reorder outline entries.
 - For a long meeting, do not create a residual theme under three minutes and do not merge two cited evidence clusters separated by more than twenty-five minutes. Split at real topic shifts and merge a tiny administrative tail into its related operational theme.
 - Keep the result compact: use at most three key points per theme, one project update per required participant, at most four decisions, and at most twenty-four actions. These are ceilings, not quotas; decisions and actions may be empty.
-- Keep titles under 80 characters, Chinese prose fields under 180 characters, and English prose fields under 360 characters.
+- Give each theme one specific business-question title under 56 characters. Never concatenate unrelated subjects with a slash or use a generic placeholder title.
+- Keep Chinese prose fields under 180 characters and English prose fields under 360 characters.
 - Preserve the actual argument: current state, alternatives, disagreements, estimates, dependencies, and what remained undecided.
-- Attribute every key point to the exact canonical speaker supplied in the transcript. Never infer a real name from an anonymous Speaker label.
-- Include each substantial named participant in project_updates when the user payload lists them as required.
+- Treat completed, in-progress, requested, planned, proposed, and rejected states as different facts. Never turn a request, need, suggestion, or plan into completed work. For example, source wording such as "need to retest" must remain a request to retest, not "retested".
+- Attribute a key point only when one of its exact cited segment IDs has the same canonical named speaker. Never infer a real name from an anonymous Speaker label or nearby turn.
+- Include each substantial named participant in project_updates when the user payload lists them as required. Each update must be one coherent same-speaker statement from a local 120-second evidence window; never merge status claims from distant parts of the meeting into one row.
 - required_action_candidate_groups and action_scout are high-recall candidate pools. Use them to avoid omissions, but independently reject false positives. They are not publication facts.
 - Do not silently lose a material candidate during drafting. The final publication adjudicator will issue an explicit kept or rejected disposition for every action_scout item.
-- An action requires an explicit self-commitment, an explicit assignment accepted by the owner in context, or a clearly owned follow-up already in progress. A suggestion, concern, estimate, dependency, question, brainstorm, or use of "we can", "we should", "we need", "let's say", or "let's try" is not an action by itself.
+- An action requires an explicit self-commitment, an explicit assignment accepted by the owner in context, or a clearly owned follow-up already in progress. The only ownerless exception is an action_scout candidate marked unassigned_explicit_request=true: retain its concrete request with owner exactly "待确认"; never replace that marker with a guessed person. A suggestion, concern, estimate, dependency, question, brainstorm, or use of "we can", "we should", "we need", "let's say", or "let's try" is not an action by itself.
 - Concrete phrases such as "I will", "I will try to", "I'll", "I'm gonna", "let me review", and "we are working on" count as commitments when they name a real follow-up. Brief communication follow-ups such as sending notes also count.
 - Each action contains exactly one commitment. Never merge commitments from distant parts of the meeting. Cite nearby commitment or assignment-and-acceptance evidence within a 120-second window, including at least one owner-spoken segment.
 - If an action_scout candidate has external_delivery_update=true, the owner is responsible only for follow-up or communicating status. Do not say that the owner ensures, guarantees, or personally completes the third party's deliverable.
 - A decision requires explicit collective agreement or an explicitly selected direction. Future-tense architecture explanation, proposal, estimate, or action is not automatically a decision.
-- In theme outcomes, use neutral language such as "讨论形成方向" or "尚未决定" unless the decision test is satisfied. Never use "决定" or "确认" merely because an idea was discussed.
+- In theme outcomes, use neutral language such as "讨论形成方向" or "尚未决定" unless the decision test is satisfied. When there is no explicit decision evidence, never state that a system, team, or plan will be built, implemented, migrated, deployed, or adopted; describe it as a discussion, proposal, or unresolved option instead.
 - Any named participant's future follow-up stated in a theme outcome must also appear as a verified action. Otherwise describe it as a proposal or remove the ownership claim.
-- Do not attribute a key point to an anonymous Speaker label in publishable minutes. If identity is unresolved, keep the idea in neutral theme prose without guessing a name.
+- Do not attribute a key point to an anonymous Speaker label in publishable minutes. If identity is unresolved, keep the idea in neutral theme prose without guessing a name, and omit the key point when no directly named segment supports it.
 - Never write labels such as Speaker 1, Speaker 5, or Speaker Unknown in any publishable title, theme, point, update, decision, or action. Use neutral wording for an unresolved participant.
 - Keep every action atomic. When evidence contains a setup step, a migration, and a reporting goal, retain one core externally verifiable outcome and move supporting context into the theme.
 - Preserve entities, numbers, dates, and weekdays exactly from cited evidence. Do not silently replace an ASR-rendered person or counterparty with a canonical participant name.
@@ -2793,6 +5106,7 @@ Audit the entire transcript against the draft.
 Review requirements:
 - Find material themes or explicit actions omitted from the draft. For long meetings, use the complete ordered theme_candidates plus the chunk-derived evidence packet; do not assume evidence wording that is absent.
 - Preserve the supplied theme_outline one-to-one and in order. Every corrected theme must cite at least one outline anchor and remain inside its outline range.
+- Keep every title to one specific business question under 56 characters. Reject slash-joined, generic, or multi-topic headings and rewrite them from the local theme evidence.
 - required_action_candidate_groups and action_scout are high-recall candidates, not publication facts. Re-evaluate them against the transcript and retain only supported actions.
 - The final review must issue one explicit kept or rejected disposition for every action_scout item, so no candidate can disappear silently.
 - Detect wrong speaker attribution, especially when adjacent speakers alternate.
@@ -2802,12 +5116,16 @@ Review requirements:
 - Keep exactly one commitment per action. Never combine two follow-ups from different parts of the meeting. Cite nearby commitment or assignment-and-acceptance evidence within a 120-second window, including at least one owner-spoken segment.
 - Remove decisions that were only proposals, future-tense architecture explanations, estimates, implementation ideas, or individual preferences.
 - A decision survives only with explicit agreement or an explicitly selected direction. Otherwise retain it as a neutrally worded topic outcome, not a confirmed decision.
+- Without explicit decision evidence, reject outcome wording that says a system, plan, or team will build, implement, migrate, deploy, or adopt something. Preserve the discussion as a proposal or unresolved option instead.
 - Any named participant's future follow-up stated in a theme outcome must also appear as a verified action. Otherwise rewrite it as a proposal or remove the ownership claim.
 - Reject anonymous Speaker labels as publishable key-point attribution. Preserve the idea in neutral prose if identity cannot be proven.
 - Never expose labels such as Speaker 1, Speaker 5, or Speaker Unknown in any publishable title, theme, point, update, decision, or action. Preserve the content without attributing it to an unresolved participant.
 - Keep actions atomic. If an item combines an enabling step with a separate migration, communication, or reporting outcome, retain one core follow-up and move context into the theme.
 - For an action_scout candidate marked external_delivery_update=true, describe the owner's follow-up or status responsibility only. Do not turn the external party's delivery into the owner's guarantee.
 - Verify every entity, number, date, and weekday in actions, decisions, and project updates against cited evidence. Never silently substitute a canonical participant for a phonetically similar name in the transcript.
+- Verify status and aspect as factual claims: completed, in progress, requested, planned, proposed, and rejected are not interchangeable. Never turn "need to", "please", "try to", a request, or a proposal into a completed result.
+- Preserve a named participant when the exact cited transcript text names that person, even if the participant is not the owner. Never replace a directly cited name with vague wording such as "related".
+- A project update must use one coherent local, same-speaker evidence window of at most 120 seconds. Never combine a participant's statements from separate points in the meeting.
 - Preserve caveats on aggressive estimates and unresolved alternatives.
 - Verify every evidence segment exists and supports the associated claim.
 - Check the complete meeting's major topic shifts. Do not bury implementation priorities, timeline pressure, or unresolved dependencies inside an adjacent architecture theme.
@@ -2824,13 +5142,14 @@ Review requirements:
     if pass_index >= 2:
         system = """You are the final publication adjudicator for meeting minutes. Precision is more important than recall.
 
-Re-audit every proposed decision and action against the exact transcript wording. Silently apply a three-part test to each action: identifiable owner, one allowed ownership basis, and one concrete follow-up. The allowed ownership bases are a performative self-commitment, an accepted assignment, or a clearly owned follow-up already underway. An owned follow-up does not require a new "I will" promise. Delete the item if any part fails. There is no desired action count and fewer accurate actions are better than plausible extras.
+Re-audit every proposed decision and action against the exact transcript wording. Silently apply a three-part test to each action: identifiable owner, one allowed ownership basis, and one concrete follow-up. The allowed ownership bases are a performative self-commitment, an accepted assignment, or a clearly owned follow-up already underway. The sole exception is a candidate marked unassigned_explicit_request=true: preserve its explicit requested follow-up with owner exactly "待确认" rather than inventing a recipient. An owned follow-up does not require a new "I will" promise. Delete the item if any part fails. There is no desired action count and fewer accurate actions are better than plausible extras.
 The draft has already passed an independent coverage review. Do not add a new confirmed decision that was absent from the draft unless the cited transcript contains exact explicit agreement or selection language. Discussion outcomes can stay in themes without being promoted to decisions.
 
 Support-basis rules:
 - self_commitment requires a positive owner-spoken commitment such as "I will", "I'll", "I'm gonna", or a concrete "let me" action. Negated, conditional, quoted, or questioned wording does not qualify.
 - accepted_assignment requires evidence for both the assignment and the named owner's nearby acceptance. Cite both when they are separate lines.
 - owned_follow_up requires owner-spoken evidence of work underway plus its intended outcome, or evidence that the owner supplied required external input plus a concrete future delivery point.
+- requested_follow_up is valid only for the special owner "待确认" and an exact direct request such as "I need your help ... to retest". It does not identify the recipient.
 - For an action_scout candidate marked external_delivery_update=true, retain only a follow-up or status action. Never state that the owner ensures, guarantees, or personally completes the external party's deliverable.
 - explicit_agreement requires explicit agreement language. selected_direction requires wording that a direction was actually chosen. A proposal or architecture explanation cannot use either basis.
 
@@ -2839,8 +5158,8 @@ Return exactly seven top-level keys:
 - minutes: the fully corrected minutes object.
 - prior_finding_dispositions: exactly one entry for every one-based prior_findings finding_index. Each entry has finding_index, disposition, and reason. disposition is addressed or wontfix. Use wontfix only when the earlier finding is demonstrably invalid, and explain why.
 - candidate_dispositions: exactly one entry for every one-based action_scout candidate_index. Each entry has candidate_index, disposition, action_index, reason_code, and reason. disposition is kept or rejected. For kept, action_index is the matching one-based minutes.actions index, reason_code is supported, and reason explains the evidence. For rejected, action_index is null, reason_code is unsupported_owner, unsupported_commitment, or unsupported_item, and reason explains why the candidate fails the publication test. Do not use unsupported_commitment merely because an owned follow-up is already underway rather than newly promised. Use unsupported_item only when no concrete supported portion can be retained; otherwise keep a narrowed action.
-- An action_scout candidate with must_keep=true has passed both narrow semantic adjudication and deterministic owned-follow-up checks. It must be kept as one or more atomic actions; do not copy a compound candidate item verbatim into one action row. Multiple candidates may map to the same action_index when they are genuine duplicates.
-- action_support: one entry for every action in minutes, with its one-based action_index, exact segment_ids, and basis. Basis must be self_commitment, accepted_assignment, or owned_follow_up.
+- An action_scout candidate with must_keep=true has passed both narrow semantic adjudication and deterministic owned-follow-up checks. It must be kept as one or more atomic actions; do not copy a compound candidate item verbatim into one action row. Multiple candidates may map to the same action_index only when they describe the same outcome and their combined evidence stays within one 120-second window.
+- action_support: one entry for every action in minutes, with its one-based action_index, exact segment_ids, and basis. Basis must be self_commitment, accepted_assignment, owned_follow_up, or requested_follow_up for the special owner "待确认".
 - decision_support: one entry for every decision in minutes, with its one-based decision_index, exact segment_ids, and basis. Basis must be explicit_agreement or selected_direction.
 - publishable: true only when every reported issue was fixed and every retained action and decision passes its support test.
 - Every prior_finding_dispositions reason and candidate_dispositions reason must be at or below {FINAL_REVIEW_REASON_MAX_CHARS} characters. Only adjudicate the supplied prior_findings. prior_finding_budget records omitted advisory findings; do not infer or invent dispositions for omitted entries.
@@ -3449,12 +5768,78 @@ def flatten_theme_candidates(
     return candidates
 
 
+def _max_span_feasible_theme_count(
+    macro_candidates: list[dict[str, Any]],
+) -> int:
+    """Return the largest contiguous partition satisfying the long-theme span."""
+
+    if not macro_candidates:
+        return 0
+    boundaries: list[tuple[float, float]] = []
+    for candidate in macro_candidates:
+        try:
+            start = float(candidate["start"])
+            end = float(candidate["end"])
+        except (KeyError, TypeError, ValueError):
+            return 0
+        if end < start:
+            return 0
+        boundaries.append((start, end))
+
+    best = [-len(boundaries) - 1] * (len(boundaries) + 1)
+    best[0] = 0
+    for end_index, (_start, end) in enumerate(boundaries, start=1):
+        for start_index, (start, _end) in enumerate(
+            boundaries[:end_index],
+        ):
+            if best[start_index] < 0:
+                continue
+            if end - start < MIN_LONG_MEETING_THEME_SPAN_SECONDS:
+                continue
+            best[end_index] = max(best[end_index], best[start_index] + 1)
+    return max(0, best[-1])
+
+
 def theme_count_bounds(
     records: list[dict[str, Any]],
+    *,
+    macro_candidate_count: int | None = None,
+    macro_candidates: list[dict[str, Any]] | None = None,
 ) -> tuple[int, int]:
     duration = max((record["end"] for record in records), default=0.0)
     ideal = max(1, min(MAX_THEMES, math.ceil(duration / 1500.0)))
-    return max(1, ideal - 1), min(MAX_THEMES, ideal + 2)
+    minimum = max(1, ideal - 1)
+    maximum = min(MAX_THEMES, ideal + 2)
+
+    # A dense technical meeting can contain far more material topic changes
+    # than its wall-clock duration suggests.  The hierarchical planner has
+    # already validated these macro candidates, so retain enough room for the
+    # final merge to represent them instead of forcing unrelated topics into a
+    # few broad sections.
+    candidate_count = (
+        len(macro_candidates)
+        if isinstance(macro_candidates, list)
+        else macro_candidate_count
+    )
+    if isinstance(candidate_count, int) and candidate_count > maximum:
+        density_target = min(
+            MAX_THEMES,
+            max(ideal, math.ceil(candidate_count * 0.8)),
+        )
+        span_feasible = False
+        if isinstance(macro_candidates, list):
+            feasible_count = _max_span_feasible_theme_count(macro_candidates)
+            if feasible_count:
+                maximum = min(maximum, feasible_count)
+                minimum = min(minimum, maximum)
+                density_target = min(density_target, feasible_count)
+                span_feasible = feasible_count >= density_target
+        if density_target > maximum:
+            maximum = density_target
+            minimum = min(maximum, max(minimum, density_target - 1))
+            if span_feasible:
+                minimum = density_target
+    return minimum, maximum
 
 
 def _expected_theme_count(records: list[dict[str, Any]]) -> int:
@@ -3530,8 +5915,16 @@ def validate_theme_outline(
         raw_anchor_ids = raw.get("anchor_segment_ids")
         if not title:
             errors.append(f"{prefix}:title_missing")
-        elif title.casefold() in seen_titles:
-            errors.append(f"{prefix}:title_duplicate")
+        else:
+            errors.extend(
+                f"{prefix}:title_{error}"
+                for error in _theme_title_errors(
+                    title,
+                    max_characters=MAX_THEME_TITLE_CHARS,
+                )
+            )
+            if title.casefold() in seen_titles:
+                errors.append(f"{prefix}:title_duplicate")
         seen_titles.add(title.casefold())
         if not boundary_reason:
             errors.append(f"{prefix}:boundary_reason_missing")
@@ -3872,6 +6265,40 @@ def validate_required_action_coverage(
     return errors
 
 
+def validate_must_keep_action_coverage(
+    minutes: dict[str, Any],
+    action_scout: list[dict[str, Any]],
+) -> list[str]:
+    actions = minutes.get("actions")
+    if not isinstance(actions, list):
+        return ["must_keep_action_coverage_actions_invalid"]
+    errors: list[str] = []
+    for candidate_index, candidate in enumerate(action_scout, start=1):
+        if not isinstance(candidate, dict) or candidate.get("must_keep") is not True:
+            continue
+        owner = _plain(candidate.get("owner"))
+        candidate_ids = {
+            segment_id
+            for segment_id in candidate.get("segment_ids", [])
+            if isinstance(segment_id, str)
+        }
+        covered = any(
+            isinstance(action, dict)
+            and _plain(action.get("owner")) == owner
+            and bool(
+                candidate_ids.intersection(
+                    segment_id
+                    for segment_id in action.get("segment_ids", [])
+                    if isinstance(segment_id, str)
+                )
+            )
+            for action in actions
+        )
+        if not covered:
+            errors.append(f"must_keep_action_missing:{candidate_index}")
+    return errors
+
+
 def _positive_self_commitment(records: list[dict[str, Any]]) -> bool:
     texts = [
         _plain(record.get("text"))
@@ -3883,13 +6310,59 @@ def _positive_self_commitment(records: list[dict[str, Any]]) -> bool:
             _POSITIVE_SELF_COMMITMENT_CUE.search(text)
             and not _NEGATED_COMMITMENT_CUE.search(text)
             and not _REPORTED_OR_QUESTIONED_SELF_COMMITMENT.search(text)
+            and not _IDEA_FRAMED_PROPOSAL_CUE.search(text)
             and (
                 _CONCRETE_SELF_COMMITMENT_CUE.search(text)
+                or _TIME_BOUND_SELF_INTENT_CUE.search(text)
                 or re.search(r"(?:我会|我将|我要|我来|我负责).{0,30}(?:发送|审查|迁移|整理|跟进|测试|更新|完成|提供|创建|部署)", text)
             )
         ):
             return True
     return False
+
+
+def _protect_direct_self_commitment_candidates(
+    actions: list[dict[str, Any]],
+    *,
+    transcript_records: list[dict[str, Any]],
+) -> None:
+    """Mark only direct, concrete self-commitments as non-droppable candidates.
+
+    The final reviewer may narrow a protected item, but cannot discard it merely
+    because its wording is not one of the model's preferred commitment forms.
+    Identity is still taken from the canonical same-segment speaker, which is
+    direct visual evidence under the strict policy.
+    """
+
+    record_map = {
+        _plain(record.get("segment_id")): record
+        for record in transcript_records
+        if isinstance(record, dict) and _plain(record.get("segment_id"))
+    }
+    for action in actions:
+        if (
+            not isinstance(action, dict)
+            or action.get("basis") != "self_commitment"
+            or action.get("must_keep") is True
+        ):
+            continue
+        owner = _plain(action.get("owner"))
+        segment_ids = action.get("segment_ids")
+        if not owner or not isinstance(segment_ids, list):
+            continue
+        owner_records = [
+            record_map[segment_id]
+            for segment_id in segment_ids
+            if isinstance(segment_id, str)
+            and segment_id in record_map
+            and _plain(record_map[segment_id].get("speaker")) == owner
+        ]
+        if (
+            owner_records
+            and _positive_self_commitment(owner_records)
+            and not _external_delivery_status_only(owner_records)
+        ):
+            action["must_keep"] = True
 
 
 def _owned_follow_up(records: list[dict[str, Any]]) -> bool:
@@ -3901,6 +6374,56 @@ def _owned_follow_up(records: list[dict[str, Any]]) -> bool:
     ):
         return True
     return False
+
+
+def _explicit_requested_follow_up(records: list[dict[str, Any]]) -> bool:
+    """Return whether the evidence contains a concrete request, not a proposal."""
+
+    text = " ".join(_plain(record.get("text")) for record in records)
+    return bool(_EXPLICIT_REQUESTED_FOLLOW_UP_CUE.search(text))
+
+
+def explicit_requested_follow_up_candidates(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Preserve direct requests even where recipient identity is not reliable.
+
+    The special owner marker is deliberately not a person's name. It prevents a
+    noisy ASR addressee such as "William might be Sebastian" from becoming a
+    fabricated owner while still retaining the concrete requested follow-up.
+    """
+
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[tuple[str, ...]] = set()
+    for index, record in enumerate(records):
+        evidence = [record]
+        if index + 1 < len(records):
+            following = records[index + 1]
+            if following["start"] - record["end"] <= 30.0:
+                evidence.append(following)
+        if not _explicit_requested_follow_up(evidence):
+            continue
+        segment_ids = tuple(_plain(item.get("segment_id")) for item in evidence)
+        if not all(segment_ids) or segment_ids in seen_ids:
+            continue
+        seen_ids.add(segment_ids)
+        source_text = " ".join(_plain(item.get("text")) for item in evidence)
+        item = (
+            "重新测试相关功能"
+            if re.search(r"\b(?:retest|retry|regenerate|generate|test)\b", source_text, re.IGNORECASE)
+            else "处理会议中明确提出的后续事项"
+        )
+        candidates.append(
+            {
+                "owner": UNASSIGNED_ACTION_OWNER,
+                "item": item,
+                "segment_ids": list(segment_ids),
+                "basis": REQUESTED_FOLLOW_UP_BASIS,
+                "must_keep": True,
+                "unassigned_explicit_request": True,
+            }
+        )
+    return candidates
 
 
 def _external_delivery_follow_up(records: list[dict[str, Any]]) -> bool:
@@ -3934,6 +6457,7 @@ def _validate_candidate_dispositions(
     }
     expected_indices = set(range(1, len(action_scout) + 1))
     seen_indices: set[int] = set()
+    kept_must_keep_by_action: dict[int, list[tuple[int, dict[str, Any]]]] = {}
     for position, disposition in enumerate(dispositions, start=1):
         prefix = f"publication_gate_candidate_disposition:{position}"
         if not isinstance(disposition, dict) or set(disposition) != {
@@ -4005,6 +6529,10 @@ def _validate_candidate_dispositions(
                         _ASSIGNMENT_CUE.search(all_text)
                         and _ACCEPTANCE_CUE.search(owner_text)
                     )
+                ) or (
+                    basis == REQUESTED_FOLLOW_UP_BASIS
+                    and _is_unassigned_action_owner(candidate.get("owner"))
+                    and _explicit_requested_follow_up(candidate_records)
                 )
                 if commitment_supported:
                     errors.append(
@@ -4053,6 +6581,40 @@ def _validate_candidate_dispositions(
             and _external_delivery_completion_guarantee(action.get("item"))
         ):
             errors.append(f"{prefix}:external_delivery_completion_guarantee")
+        if candidate.get("must_keep") is True:
+            kept_must_keep_by_action.setdefault(action_index, []).append(
+                (position, candidate)
+            )
+
+    for action_index, entries in sorted(kept_must_keep_by_action.items()):
+        if len(entries) < 2:
+            continue
+        candidates = [candidate for _position, candidate in entries]
+        candidate_ids = list(
+            dict.fromkeys(
+                segment_id
+                for candidate in candidates
+                for segment_id in candidate.get("segment_ids", [])
+                if segment_id in record_map
+            )
+        )
+        same_outcome = all(
+            _action_item_similarity(left.get("item"), right.get("item")) >= 0.5
+            for index, left in enumerate(candidates)
+            for right in candidates[index + 1 :]
+        )
+        local_evidence = (
+            bool(candidate_ids)
+            and _evidence_span_seconds(candidate_ids, record_map)
+            <= ACTION_MAX_EVIDENCE_SPAN_SECONDS
+        )
+        if same_outcome and local_evidence:
+            continue
+        for position, _candidate in entries[1:]:
+            errors.append(
+                f"publication_gate_candidate_disposition:{position}:"
+                f"must_keep_candidates_collapsed:{action_index}"
+            )
     if seen_indices != expected_indices or len(dispositions) != len(expected_indices):
         errors.append("publication_gate_candidate_disposition_coverage_mismatch")
     return errors
@@ -4195,7 +6757,16 @@ def validate_publication_gate(
             for record in support_records
             if record["speaker"] == action["owner"]
         ]
-        if not owner_records:
+        is_unassigned_request = (
+            _is_unassigned_action_owner(action.get("owner"))
+            and basis == REQUESTED_FOLLOW_UP_BASIS
+        )
+        if is_unassigned_request:
+            if not _explicit_requested_follow_up(support_records):
+                errors.append(
+                    f"publication_gate_action_support:{index}:requested_follow_up_not_grounded"
+                )
+        elif not owner_records:
             errors.append(f"publication_gate_action_support:{index}:owner_evidence_missing")
         elif basis == "self_commitment" and not _positive_self_commitment(owner_records):
             errors.append(f"publication_gate_action_support:{index}:self_commitment_not_grounded")
@@ -4297,12 +6868,43 @@ Return one minified JSON object matching the supplied schema and no explanatory 
 - Translate every Chinese prose field into concise natural professional English.
 - Preserve array order, canonical speaker names, owners, evidence segment IDs, and all non-prose values exactly.
 - Do not add, remove, merge, reinterpret, or correct any theme, project update, decision, or action.
+- Preserve factual status exactly: requested, planned, in-progress, completed, and rejected work are different states. Never translate a pending request as completed work.
 - Keep the entire response under 12,000 characters.
 """
     user = json.dumps(
         {
             "schema": _source_schema_example(),
             "source_minutes_zh": source,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_translation_repair_messages(
+    source: dict[str, Any],
+    invalid_translation: object,
+    errors: list[str],
+) -> list[dict[str, str]]:
+    """Ask for one bounded repair when the target language breaks the contract."""
+
+    system = """You are a professional meeting-minutes translator repairing an invalid translation.
+
+Return one minified JSON object matching the supplied schema and no Markdown.
+- Correct every supplied validation error against the Chinese source.
+- Preserve array order, canonical speaker names, owners, evidence segment IDs, and all non-prose values exactly.
+- Preserve every source number, percentage marker, weekday, and technical identifier; do not add or reinterpret facts.
+- Preserve factual status exactly: requested, planned, in-progress, completed, and rejected work are different states. Never translate a pending request as completed work.
+- Do not introduce vague masking phrases such as relevant interface, relevant features, client side, or internal side.
+- Keep unaffected target fields unchanged whenever possible.
+"""
+    user = json.dumps(
+        {
+            "schema": _source_schema_example(),
+            "source_minutes_zh": source,
+            "invalid_translation_en": invalid_translation,
+            "validation_errors": errors,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -4409,9 +7011,13 @@ def validate_action_scout(
         )
         if not item:
             errors.append(f"{prefix}:item_missing")
-        if owner not in named_speakers:
+        is_unassigned_request = (
+            _is_unassigned_action_owner(owner)
+            and basis == REQUESTED_FOLLOW_UP_BASIS
+        )
+        if owner not in named_speakers and not is_unassigned_request:
             errors.append(f"{prefix}:owner_unknown")
-        elif ids:
+        elif ids and not is_unassigned_request:
             owner_ids = [
                 segment_id
                 for segment_id in ids
@@ -4427,6 +7033,10 @@ def validate_action_scout(
                         record_map,
                         max_span_seconds=ACTION_MAX_EVIDENCE_SPAN_SECONDS,
                     )
+        elif ids and not _explicit_requested_follow_up(
+            [record_map[segment_id] for segment_id in ids]
+        ):
+            errors.append(f"{prefix}:requested_follow_up_not_grounded")
         if basis not in ACTION_SUPPORT_BASES:
             errors.append(f"{prefix}:basis_invalid")
         key = (owner.casefold(), item.casefold())
@@ -5110,6 +7720,17 @@ def validate_smart_minutes(
         outcome_zh, outcome_en = _bilingual_text(
             raw, "outcome_zh", "outcome_en", prefix=prefix, errors=errors
         )
+        for title_field, title, max_characters in (
+            ("title_zh", title_zh, MAX_THEME_TITLE_CHARS),
+            ("title_en", title_en, MAX_TRANSLATED_THEME_TITLE_CHARS),
+        ):
+            errors.extend(
+                f"{prefix}:{title_field}_{error}"
+                for error in _theme_title_errors(
+                    title,
+                    max_characters=max_characters,
+                )
+            )
         for field, text_zh, text_en in (
             ("title", title_zh, title_en),
             ("current_state", current_zh, current_en),
@@ -5124,11 +7745,16 @@ def validate_smart_minutes(
             raw.get("evidence_segment_ids"), records=record_map, field=prefix, errors=errors
         )
         raw_points = raw.get("key_points")
-        if not isinstance(raw_points, list) or not raw_points:
+        if not isinstance(raw_points, list):
             errors.append(f"{prefix}:key_points_missing")
             raw_points = []
         elif len(raw_points) > MAX_KEY_POINTS_PER_THEME:
             errors.append(f"{prefix}:key_points_too_many")
+        elif not raw_points and any(
+            _is_real_name(record_map[segment_id]["speaker"])
+            for segment_id in evidence_ids
+        ):
+            errors.append(f"{prefix}:key_points_missing")
         points: list[dict[str, Any]] = []
         for point_index, point in enumerate(raw_points, start=1):
             point_prefix = f"{prefix}:point:{point_index}"
@@ -5154,6 +7780,16 @@ def validate_smart_minutes(
             point_ids = _validated_ids(
                 point.get("segment_ids"), records=record_map, field=point_prefix, errors=errors
             )
+            if point_ids:
+                errors.extend(
+                    _claim_fidelity_errors(
+                        text_zh,
+                        point_ids,
+                        records=record_map,
+                        canonical_names=named_speakers,
+                        field=point_prefix,
+                    )
+                )
             if speaker not in allowed_speakers:
                 errors.append(f"{point_prefix}:speaker_unknown")
             elif not _is_real_name(speaker):
@@ -5168,6 +7804,25 @@ def validate_smart_minutes(
                     "segment_ids": point_ids,
                 }
             )
+        theme_claim_ids = list(evidence_ids)
+        for point in points:
+            for segment_id in point["segment_ids"]:
+                if segment_id not in theme_claim_ids:
+                    theme_claim_ids.append(segment_id)
+        if theme_claim_ids:
+            for field, text in (
+                ("current_state", current_zh),
+                ("outcome", outcome_zh),
+            ):
+                errors.extend(
+                    _claim_fidelity_errors(
+                        text,
+                        theme_claim_ids,
+                        records=record_map,
+                        canonical_names=named_speakers,
+                        field=f"{prefix}:{field}",
+                    )
+                )
         themes.append(
             {
                 "title_zh": title_zh,
@@ -5270,6 +7925,13 @@ def validate_smart_minutes(
                 errors.append(f"{prefix}:participant_evidence_mismatch")
             else:
                 ids = participant_ids
+                evidence_span = _evidence_span_seconds(ids, record_map)
+                if evidence_span > PROJECT_UPDATE_MAX_EVIDENCE_SPAN_SECONDS:
+                    errors.append(
+                        f"{prefix}:evidence_span_too_wide:"
+                        f"{evidence_span:.1f}>"
+                        f"{PROJECT_UPDATE_MAX_EVIDENCE_SPAN_SECONDS:.1f}"
+                    )
         if participant in seen_participants:
             errors.append(f"{prefix}:participant_duplicate")
         seen_participants.add(participant)
@@ -5360,9 +8022,10 @@ def validate_smart_minutes(
         if _ACTION_ATOMICITY_CUE.search(item_zh):
             errors.append(f"{prefix}:atomicity_review_required")
         ids = _validated_ids(raw.get("segment_ids"), records=record_map, field=prefix, errors=errors)
-        if owner not in named_speakers:
+        is_unassigned_request = _is_unassigned_action_owner(owner)
+        if owner not in named_speakers and not is_unassigned_request:
             errors.append(f"{prefix}:owner_unknown")
-        elif ids:
+        elif ids and not is_unassigned_request:
             owner_ids = [
                 segment_id
                 for segment_id in ids
@@ -5377,6 +8040,10 @@ def validate_smart_minutes(
                         f"{prefix}:evidence_span_too_wide:"
                         f"{evidence_span:.1f}>{ACTION_MAX_EVIDENCE_SPAN_SECONDS:.1f}"
                     )
+        elif ids and not _explicit_requested_follow_up(
+            [record_map[segment_id] for segment_id in ids]
+        ):
+            errors.append(f"{prefix}:requested_follow_up_not_grounded")
         if ids:
             errors.extend(
                 _claim_fidelity_errors(
@@ -5415,6 +8082,11 @@ def validate_smart_minutes(
                     f"{previous_index + 1}"
                 )
 
+    decision_evidence_ids = {
+        segment_id
+        for decision in decisions
+        for segment_id in decision["segment_ids"]
+    }
     for index, theme in enumerate(themes, start=1):
         outcome = theme["outcome_zh"]
         theme_ids = list(theme["evidence_segment_ids"])
@@ -5454,6 +8126,18 @@ def validate_smart_minutes(
             and not _NEUTRAL_FUTURE_QUALIFIER.search(outcome)
         ):
             errors.append(f"theme:{index}:future_fact_unqualified")
+        if (
+            _UNCONFIRMED_OUTCOME_COMMITMENT.search(outcome)
+            and not _OUTCOME_UNRESOLVED_CUE.search(outcome)
+            and not set(theme_ids).intersection(decision_evidence_ids)
+        ):
+            errors.append(f"theme:{index}:outcome_unconfirmed_commitment")
+        theme_evidence_text = " ".join(record["text"] for record in theme_records)
+        if (
+            _OUTCOME_CONSENSUS_CUE.search(outcome)
+            and not _EXPLICIT_AGREEMENT_CUE.search(theme_evidence_text)
+        ):
+            errors.append(f"theme:{index}:outcome_ungrounded_consensus")
 
     cleaned = {
         "themes": themes,
@@ -5527,11 +8211,385 @@ def validate_source_minutes(
     return _bilingual_to_source(cleaned, language="zh"), errors
 
 
+def _translation_payload_shape_errors(payload: object, *, role: str) -> list[str]:
+    """Validate the raw translator object before aligning it to the Chinese source."""
+
+    prefix = f"translation_{role}"
+    if not isinstance(payload, dict):
+        return [f"{prefix}:payload_not_object"]
+    expected_keys = {"themes", "project_updates", "decisions", "actions"}
+    if set(payload) != expected_keys:
+        return [f"{prefix}:top_level_keys_invalid"]
+
+    errors: list[str] = []
+    sections = {
+        "themes": {
+            "title",
+            "current_state",
+            "outcome",
+            "evidence_segment_ids",
+            "key_points",
+        },
+        "project_updates": {"participant", "project", "update", "segment_ids"},
+        "decisions": {"text", "segment_ids"},
+        "actions": {"owner", "item", "segment_ids"},
+    }
+    for section, expected_item_keys in sections.items():
+        values = payload.get(section)
+        if not isinstance(values, list):
+            errors.append(f"{prefix}:{section}_invalid")
+            continue
+        for index, value in enumerate(values, start=1):
+            item_prefix = f"{prefix}:{section}:{index}"
+            if not isinstance(value, dict) or set(value) != expected_item_keys:
+                errors.append(f"{item_prefix}:keys_invalid")
+                continue
+            for field in ("evidence_segment_ids", "segment_ids"):
+                if field in expected_item_keys and not isinstance(value.get(field), list):
+                    errors.append(f"{item_prefix}:{field}_invalid")
+            if section == "themes":
+                points = value.get("key_points")
+                if not isinstance(points, list):
+                    errors.append(f"{item_prefix}:key_points_invalid")
+                    continue
+                for point_index, point in enumerate(points, start=1):
+                    point_prefix = f"{item_prefix}:point:{point_index}"
+                    if not isinstance(point, dict) or set(point) != {
+                        "speaker",
+                        "text",
+                        "segment_ids",
+                    }:
+                        errors.append(f"{point_prefix}:keys_invalid")
+                        continue
+                    if not isinstance(point.get("segment_ids"), list):
+                        errors.append(f"{point_prefix}:segment_ids_invalid")
+    return sorted(set(errors))
+
+
+def _translation_numeric_values(text: str) -> Counter[str]:
+    """Return numeric values while accepting English number-word translations."""
+
+    values = Counter(
+        re.sub(r"(?:st|nd|rd|th)$", "", raw.replace(",", ""), flags=re.IGNORECASE)
+        for raw in _TRANSLATION_NUMBER_TOKEN.findall(text)
+    )
+    words = re.findall(r"[a-z]+", text.casefold().replace("-", " "))
+    index = 0
+    while index < len(words):
+        if words[index] not in _TRANSLATION_NUMBER_WORDS:
+            index += 1
+            continue
+        total = 0
+        current = 0
+        consumed = 0
+        has_magnitude_word = False
+        while index + consumed < len(words):
+            word = words[index + consumed]
+            if word == "and" and consumed:
+                consumed += 1
+                continue
+            if word == "hundred":
+                current = max(1, current) * 100
+                has_magnitude_word = True
+            elif word == "thousand":
+                total += max(1, current) * 1000
+                current = 0
+                has_magnitude_word = True
+            elif word in _TRANSLATION_NUMBER_WORDS:
+                current += _TRANSLATION_NUMBER_WORDS[word]
+                has_magnitude_word = has_magnitude_word or _TRANSLATION_NUMBER_WORDS[word] >= 20
+            else:
+                break
+            consumed += 1
+        if consumed:
+            next_word = words[index + consumed] if index + consumed < len(words) else ""
+            previous_word = words[index - 1] if index else ""
+            quantitative_context = next_word in {
+                "cent",
+                "days",
+                "hours",
+                "instances",
+                "members",
+                "minutes",
+                "months",
+                "nodes",
+                "people",
+                "person",
+                "percent",
+                "percentage",
+                "times",
+                "weeks",
+                "years",
+            } or next_word in {"to", "or"} or previous_word in {"to", "or"}
+            if has_magnitude_word or quantitative_context:
+                values[str(total + current)] += 1
+            index += consumed
+        else:
+            index += 1
+
+    for match in _CHINESE_NUMERAL_TOKEN.finditer(text):
+        token = match.group()
+        value = _contextual_chinese_numeral_value(
+            text,
+            token=token,
+            start=match.start(),
+            end=match.end(),
+        )
+        if value is not None:
+            values[str(value)] += 1
+    only_pronoun_count = len(
+        re.findall(
+            r"\b(?:only|solely)\s+(?:by\s+)?(?:he|him|she|her|one\s+person|"
+            r"a\s+single\s+person)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if only_pronoun_count:
+        values["1"] += only_pronoun_count
+    return values
+
+
+def _contextual_chinese_numeral_value(
+    text: str,
+    *,
+    token: str,
+    start: int,
+    end: int,
+) -> int | None:
+    """Return a Chinese numeral only when its form is translation-stable.
+
+    Calendar words such as ``六月`` can correctly become ``June`` and should
+    not be rejected as numeric drift. Percentages, percentage points, and
+    quantified multi-character numerals retain a numeric fact in English.
+    """
+
+    before = text[max(0, start - 3) : start]
+    after = text[end : end + 4]
+    if before.endswith(("周", "星期")):
+        return None
+    explicit_percentage = before.endswith("百分之") or after.startswith("个百分点")
+    has_unit = any(character in _CHINESE_NUMERAL_UNITS for character in token)
+    quantified = after.startswith(
+        ("倍", "小时", "分钟", "秒", "天", "人", "条", "年", "周", "个月")
+    )
+    if not (explicit_percentage or quantified):
+        return None
+
+    if not has_unit:
+        digits = "".join(str(_CHINESE_NUMERAL_DIGITS[character]) for character in token)
+        return int(digits) if digits else None
+
+    total = 0
+    section = 0
+    current = 0
+    for character in token:
+        if character in _CHINESE_NUMERAL_DIGITS:
+            current = _CHINESE_NUMERAL_DIGITS[character]
+            continue
+        unit = _CHINESE_NUMERAL_UNITS[character]
+        if unit == 10000:
+            section = (section + max(1, current)) * unit
+            total += section
+            section = 0
+            current = 0
+            continue
+        section += max(1, current) * unit
+        current = 0
+    return total + section + current
+
+
+def _translation_stable_latin_tokens(text: str, *, source: bool = False) -> set[str]:
+    """Extract identifiers that should survive translation, not ordinary prose."""
+
+    tokens: set[str] = set()
+    for match in _TRANSLATION_LATIN_TOKEN.finditer(text):
+        token = match.group(1)
+        compact = _compact_claim_text(token)
+        if len(compact) < 2 or compact in _TRANSLATION_COMMON_LATIN_TOKENS:
+            continue
+        if source and not (
+            any(character.isupper() for character in token)
+            or any(character.isdigit() for character in token)
+            or any(character in "_.-" for character in token)
+        ):
+            continue
+        tokens.add(compact)
+    return tokens
+
+
+def _translation_token_covered(token: str, candidates: set[str]) -> bool:
+    return any(
+        token == candidate or token in candidate or candidate in token
+        for candidate in candidates
+    )
+
+
+def _translation_prose_errors(
+    source: str,
+    translated: str,
+    *,
+    field: str,
+) -> list[str]:
+    """Validate target-language prose against the already reviewed Chinese field."""
+
+    errors: list[str] = []
+    if not translated:
+        return [f"{field}:text_missing"]
+    if _ANONYMOUS_SPEAKER_REFERENCE.search(translated):
+        errors.append(f"{field}:anonymous_speaker_reference")
+
+    source_numbers = _translation_numeric_values(source)
+    translated_numbers = _translation_numeric_values(translated)
+    if source_numbers != translated_numbers:
+        errors.append(f"{field}:number_mismatch")
+    if bool(_TRANSLATION_PERCENT_MARKER.search(source)) != bool(
+        _TRANSLATION_PERCENT_MARKER.search(translated)
+    ):
+        errors.append(f"{field}:percentage_mismatch")
+
+    source_weekdays = Counter(
+        key
+        for weekday in _WEEKDAY_TOKEN.findall(source)
+        if (key := _weekday_key(weekday)) is not None
+    )
+    translated_weekdays = Counter(
+        key
+        for weekday in _WEEKDAY_TOKEN.findall(translated)
+        if (key := _weekday_key(weekday)) is not None
+    )
+    if source_weekdays != translated_weekdays:
+        errors.append(f"{field}:weekday_mismatch")
+
+    source_tokens = _translation_stable_latin_tokens(source, source=True)
+    translated_tokens = _translation_stable_latin_tokens(translated)
+    for token in sorted(source_tokens):
+        if not _translation_token_covered(token, translated_tokens):
+            errors.append(f"{field}:source_token_missing:{token}")
+    return errors
+
+
+def _translation_status_errors(
+    source: str,
+    translated: str,
+    *,
+    field: str,
+) -> list[str]:
+    """Reject English completion language when Chinese keeps an operation pending."""
+
+    errors: list[str] = []
+    for operation, pattern in _STATUS_OPERATION_PATTERNS:
+        if _operation_is_completed(source, pattern):
+            continue
+        if not _operation_has_status_cue(source, pattern, _STATUS_PENDING_CUE):
+            continue
+        if _operation_is_completed(translated, pattern):
+            errors.append(f"{field}:status_completion_mismatch:{operation}")
+    return errors
+
+
+def validate_translation_against_source(
+    chinese: object,
+    english: object,
+) -> list[str]:
+    """Verify English prose is aligned with the reviewed Chinese source, not ASR text.
+
+    The Chinese source has already passed transcript-level evidence checks.  A
+    translation must preserve its structure and facts, but equivalent English
+    wording must not be reinterpreted as a fresh transcript claim.
+    """
+
+    errors = _translation_payload_shape_errors(chinese, role="source")
+    errors.extend(_translation_payload_shape_errors(english, role="target"))
+    if errors:
+        return sorted(set(errors))
+    assert isinstance(chinese, dict)
+    assert isinstance(english, dict)
+
+    for section in ("themes", "project_updates", "decisions", "actions"):
+        if len(chinese[section]) != len(english[section]):
+            errors.append(f"translation_{section}_count_mismatch")
+    if errors:
+        return sorted(set(errors))
+
+    prose_pairs: list[tuple[str, str, str]] = []
+    for index, (zh_theme, en_theme) in enumerate(
+        zip(chinese["themes"], english["themes"], strict=True), start=1
+    ):
+        prefix = f"translation_theme:{index}"
+        if zh_theme["evidence_segment_ids"] != en_theme["evidence_segment_ids"]:
+            errors.append(f"{prefix}:evidence_mismatch")
+        for field in ("title", "current_state", "outcome"):
+            prose_pairs.append((f"{prefix}:{field}", zh_theme[field], en_theme[field]))
+        if len(zh_theme["key_points"]) != len(en_theme["key_points"]):
+            errors.append(f"{prefix}:point_count_mismatch")
+            continue
+        for point_index, (zh_point, en_point) in enumerate(
+            zip(zh_theme["key_points"], en_theme["key_points"], strict=True), start=1
+        ):
+            point_prefix = f"{prefix}:point:{point_index}"
+            if zh_point["speaker"] != en_point["speaker"]:
+                errors.append(f"{point_prefix}:speaker_mismatch")
+            if zh_point["segment_ids"] != en_point["segment_ids"]:
+                errors.append(f"{point_prefix}:evidence_mismatch")
+            prose_pairs.append((point_prefix, zh_point["text"], en_point["text"]))
+
+    for index, (zh_update, en_update) in enumerate(
+        zip(chinese["project_updates"], english["project_updates"], strict=True), start=1
+    ):
+        prefix = f"translation_project_update:{index}"
+        if zh_update["participant"] != en_update["participant"]:
+            errors.append(f"{prefix}:participant_mismatch")
+        if zh_update["segment_ids"] != en_update["segment_ids"]:
+            errors.append(f"{prefix}:evidence_mismatch")
+        prose_pairs.append((f"{prefix}:project", zh_update["project"], en_update["project"]))
+        prose_pairs.append((f"{prefix}:update", zh_update["update"], en_update["update"]))
+
+    for index, (zh_decision, en_decision) in enumerate(
+        zip(chinese["decisions"], english["decisions"], strict=True), start=1
+    ):
+        prefix = f"translation_decision:{index}"
+        if zh_decision["segment_ids"] != en_decision["segment_ids"]:
+            errors.append(f"{prefix}:evidence_mismatch")
+        prose_pairs.append((prefix, zh_decision["text"], en_decision["text"]))
+
+    for index, (zh_action, en_action) in enumerate(
+        zip(chinese["actions"], english["actions"], strict=True), start=1
+    ):
+        prefix = f"translation_action:{index}"
+        if zh_action["owner"] != en_action["owner"]:
+            errors.append(f"{prefix}:owner_mismatch")
+        if zh_action["segment_ids"] != en_action["segment_ids"]:
+            errors.append(f"{prefix}:evidence_mismatch")
+        prose_pairs.append((prefix, zh_action["item"], en_action["item"]))
+
+    if errors:
+        return sorted(set(errors))
+    for field, source, translated in prose_pairs:
+        errors.extend(
+            _translation_prose_errors(
+                _plain(source),
+                _plain(translated),
+                field=field,
+            )
+        )
+        errors.extend(
+            _translation_status_errors(
+                _plain(source),
+                _plain(translated),
+                field=field,
+            )
+        )
+    return sorted(set(errors))
+
+
 def combine_minutes_languages(
     chinese: dict[str, Any],
     english: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    errors: list[str] = []
+    errors = validate_translation_against_source(chinese, english)
+    if errors:
+        return None, errors
     for section in ("themes", "project_updates", "decisions", "actions"):
         if len(chinese[section]) != len(english[section]):
             errors.append(f"translation_{section}_count_mismatch")
@@ -5637,6 +8695,26 @@ def combine_minutes_languages(
     }, []
 
 
+def combine_publishable_minutes_languages(
+    chinese: dict[str, Any],
+    english: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Combine languages and reject translation-only masking artifacts."""
+
+    bilingual, errors = combine_minutes_languages(chinese, english)
+    if bilingual is None:
+        return None, errors
+    english_quality_errors = _publication_language_quality_errors(
+        _bilingual_to_source(bilingual, language="en")
+    )
+    if english_quality_errors:
+        return None, [
+            f"translation_quality:{error}"
+            for error in english_quality_errors
+        ]
+    return bilingual, []
+
+
 def _time_range(ids: list[str], records: dict[str, dict[str, Any]]) -> tuple[float, float]:
     selected = [records[segment_id] for segment_id in ids]
     start = min(record["start"] for record in selected)
@@ -5706,12 +8784,15 @@ def render_smart_minutes(
             key=lambda point: _time_range(point["segment_ids"], records)[0],
         )
         for point in ordered_points:
-            point_start, _point_end = _time_range(point["segment_ids"], records)
+            point_start, point_end = _time_range(point["segment_ids"], records)
+            point_time = _timestamp(point_start)
+            if len(point["segment_ids"]) > 1:
+                point_time = f"{point_time}-{_timestamp(point_end)}"
             zh.append(
-                f"- 关键观点（{_timestamp(point_start)}，{_cell(point['speaker'])}）：{_plain(point['text_zh'])}"
+                f"- 关键观点（{point_time}，{_cell(point['speaker'])}）：{_plain(point['text_zh'])}"
             )
             en.append(
-                f"- Key point ({_timestamp(point_start)}, {_cell(point['speaker'])}): {_plain(point['text_en'])}"
+                f"- Key point ({point_time}, {_cell(point['speaker'])}): {_plain(point['text_en'])}"
             )
         zh.append("")
         en.append("")
@@ -5723,10 +8804,10 @@ def render_smart_minutes(
         en.extend(["| Time | Participant | Project | Update |", "| --- | --- | --- | --- |"])
         ordered_updates = sorted(
             payload["project_updates"],
-            key=lambda update: _first_evidence_range(update["segment_ids"], records)[0],
+            key=lambda update: _time_range(update["segment_ids"], records)[0],
         )
         for update in ordered_updates:
-            start, end = _first_evidence_range(update["segment_ids"], records)
+            start, end = _time_range(update["segment_ids"], records)
             time_range = f"{_timestamp(start)}-{_timestamp(end)}"
             zh.append(
                 f"| {time_range} | {_cell(update['participant'])} | {_cell(update['project_zh'])} | {_cell(update['update_zh'])} |"
@@ -5754,13 +8835,18 @@ def render_smart_minutes(
         en.extend(["| Time | Item | Owner |", "| --- | --- | --- |"])
         ordered_actions = sorted(
             payload["actions"],
-            key=lambda action: _first_evidence_range(action["segment_ids"], records)[0],
+            key=lambda action: _time_range(action["segment_ids"], records)[0],
         )
         for action in ordered_actions:
-            start, end = _first_evidence_range(action["segment_ids"], records)
+            start, end = _time_range(action["segment_ids"], records)
             time_range = f"{_timestamp(start)}-{_timestamp(end)}"
             zh.append(f"| {time_range} | {_cell(action['item_zh'])} | {_cell(action['owner'])} |")
-            en.append(f"| {time_range} | {_cell(action['item_en'])} | {_cell(action['owner'])} |")
+            english_owner = (
+                UNASSIGNED_ACTION_OWNER_EN
+                if _is_unassigned_action_owner(action["owner"])
+                else action["owner"]
+            )
+            en.append(f"| {time_range} | {_cell(action['item_en'])} | {_cell(english_owner)} |")
     else:
         zh.append("- 本次未出现可发布的明确行动项。")
         en.append("- No publishable action items were identified.")
@@ -5772,6 +8858,7 @@ def sanitize_reviewed_smart_minutes(
     *,
     segments: list[dict[str, Any]],
     source_audit: dict[str, Any] | None = None,
+    allow_cluster_name_consensus: bool = True,
 ) -> tuple[SmartMinutesSanitizationResult | None, list[str]]:
     """Deterministically repair a previously reviewed bilingual minutes artifact.
 
@@ -5790,7 +8877,10 @@ def sanitize_reviewed_smart_minutes(
     if not isinstance(source_minutes, dict):
         return None, ["reviewed_payload_minutes_invalid"]
 
-    records = canonical_transcript_records(segments)
+    records = canonical_transcript_records(
+        segments,
+        allow_cluster_name_consensus=allow_cluster_name_consensus,
+    )
     if not records:
         return None, ["empty_transcript"]
     required_participants = _required_project_participants(records)
@@ -5835,6 +8925,7 @@ def sanitize_reviewed_smart_minutes(
                 review_with_minutes,
                 errors=gate_errors,
                 action_scout=action_scout,
+                transcript_records=records,
             )
             if repaired_review is None:
                 return None, gate_errors
@@ -5850,6 +8941,21 @@ def sanitize_reviewed_smart_minutes(
             )
             if repaired_gate_errors:
                 return None, repaired_gate_errors
+
+            action_only_repair_prefixes = (
+                "dropped_unsupported_action:",
+                "dropped_external_delivery_status_action:",
+                "shortened_candidate_disposition_reason:",
+                "shortened_prior_finding_reason:",
+                "repaired_decision_support_basis:",
+            )
+            if any(
+                not change.startswith(action_only_repair_prefixes)
+                for change in repair_changes
+            ):
+                return None, [
+                    "reviewed_payload_non_action_repair_requires_regeneration"
+                ]
 
             def action_key(action: object) -> tuple[str, str, tuple[str, ...]] | None:
                 if not isinstance(action, dict):
@@ -6588,47 +9694,230 @@ def _grouped_theme_merge_fallback(
     *,
     target_theme_count: int,
 ) -> dict[str, Any] | None:
-    if not candidates or not 1 <= target_theme_count <= len(candidates):
+    # A positional grouping has no semantic evidence that its candidates belong
+    # together.  It is only safe to preserve every validated candidate as its
+    # own theme; otherwise the caller must surface the model failure instead of
+    # publishing a misleading merged outline.
+    if (
+        not candidates
+        or target_theme_count != len(candidates)
+    ):
         return None
-    themes: list[dict[str, Any]] = []
-    for index in range(target_theme_count):
-        start = index * len(candidates) // target_theme_count
-        end = (index + 1) * len(candidates) // target_theme_count
-        group = candidates[start:end]
-        if not group:
-            return None
-        title = group[0]["title"]
-        if len(group) > 1:
-            title = f"{group[0]['title']} / {group[-1]['title']}"
-        themes.append(
-            {
-                "title": title,
-                "start_segment_id": group[0]["start_segment_id"],
-                "end_segment_id": group[-1]["end_segment_id"],
-                "anchor_segment_ids": list(
-                    dict.fromkeys(
-                        [
-                            group[0]["anchor_segment_ids"][0],
-                            group[-1]["anchor_segment_ids"][-1],
-                        ]
-                    )
-                ),
-                "boundary_reason": (
-                    "Deterministic reduction preserves a contiguous candidate range."
-                ),
-                "source_candidate_indexes": [
-                    candidate["candidate_index"]
-                    for candidate in group
-                ],
-            }
-        )
-    return {
-        "read_marker": {
-            "candidate_count": len(candidates),
-            "last_candidate_index": candidates[-1]["candidate_index"],
-        },
-        "themes": themes,
+    return _fallback_theme_merge_payload(
+        candidates,
+        min_theme_count=target_theme_count,
+        max_theme_count=target_theme_count,
+    )
+
+
+def _repair_theme_merge_titles(
+    payload: object,
+    *,
+    candidates: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+    """Repair only structural title defects using already grounded title text."""
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("themes"), list):
+        return None, []
+
+    candidate_map = {
+        candidate["candidate_index"]: candidate
+        for candidate in candidates
     }
+    repaired = deepcopy(payload)
+    used_titles: set[str] = set()
+    changes: list[dict[str, str]] = []
+
+    for raw_theme in repaired["themes"]:
+        if not isinstance(raw_theme, dict):
+            return None, []
+        original = _plain(raw_theme.get("title"))
+        original_errors = _theme_title_errors(
+            original,
+            max_characters=MAX_THEME_TITLE_CHARS,
+        )
+        if original and not original_errors and original.casefold() not in used_titles:
+            used_titles.add(original.casefold())
+            continue
+
+        alternatives: list[str] = []
+        compacted_source = _THEME_TITLE_RATIONALE_PREFIX.sub(
+            "Rationale for ",
+            original,
+        )
+        compacted = _plain(
+            _THEME_TITLE_TRAILING_PUNCTUATION.sub(
+                "",
+                _THEME_TITLE_REPAIR_PREFIX.sub("", compacted_source),
+            )
+        )
+        if compacted:
+            compacted = compacted[0].upper() + compacted[1:]
+            alternatives.append(compacted)
+
+        raw_source_indexes = raw_theme.get("source_candidate_indexes")
+        if isinstance(raw_source_indexes, list):
+            for source_index in raw_source_indexes:
+                candidate = candidate_map.get(source_index)
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_title = _plain(candidate.get("title"))
+                if candidate_title:
+                    alternatives.append(candidate_title)
+
+        replacement = next(
+            (
+                alternative
+                for alternative in alternatives
+                if not _theme_title_errors(
+                    alternative,
+                    max_characters=MAX_THEME_TITLE_CHARS,
+                )
+                and alternative.casefold() not in used_titles
+            ),
+            None,
+        )
+        if replacement is None:
+            return None, []
+        raw_theme["title"] = replacement
+        used_titles.add(replacement.casefold())
+        changes.append({"before": original, "after": replacement})
+
+    return (repaired, changes) if changes else (None, [])
+
+
+def _repair_theme_merge_candidate_coverage(
+    payload: object,
+    *,
+    candidates: list[dict[str, Any]],
+    transcript_records: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Rebuild only source indexes that are implied by model-chosen ranges.
+
+    A merger can select valid time ranges yet echo stale local-topic indexes
+    after a preceding reduction.  The ranges already identify the covered
+    macro candidates, so restoring those indexes is safe.  This helper never
+    moves a boundary, invents a title, or creates a positional merge.
+    """
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"read_marker", "themes"}
+        or not isinstance(payload.get("themes"), list)
+        or not candidates
+    ):
+        return None, []
+    record_positions = {
+        _plain(record.get("segment_id")): position
+        for position, record in enumerate(transcript_records)
+        if isinstance(record, dict) and _plain(record.get("segment_id"))
+    }
+    candidate_positions: list[tuple[int, int, int]] = []
+    for candidate in candidates:
+        candidate_index = candidate.get("candidate_index")
+        start_position = candidate.get("start_position")
+        end_position = candidate.get("end_position")
+        if not all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            for value in (candidate_index, start_position, end_position)
+        ):
+            return None, []
+        candidate_positions.append(
+            (candidate_index, start_position, end_position)
+        )
+
+    repaired = deepcopy(payload)
+    covered_indexes: list[int] = []
+    changes: list[str] = []
+    for theme_index, theme in enumerate(repaired["themes"], start=1):
+        if not isinstance(theme, dict):
+            return None, []
+        start_id = _plain(theme.get("start_segment_id"))
+        end_id = _plain(theme.get("end_segment_id"))
+        start_position = record_positions.get(start_id)
+        end_position = record_positions.get(end_id)
+        if (
+            start_position is None
+            or end_position is None
+            or end_position < start_position
+        ):
+            return None, []
+        source_indexes = [
+            candidate_index
+            for candidate_index, candidate_start, candidate_end in candidate_positions
+            if start_position <= candidate_start and candidate_end <= end_position
+        ]
+        if not source_indexes:
+            return None, []
+        if theme.get("source_candidate_indexes") != source_indexes:
+            theme["source_candidate_indexes"] = source_indexes
+            changes.append(f"repaired_theme_merge_candidate_coverage:{theme_index}")
+        covered_indexes.extend(source_indexes)
+
+    expected_indexes = [candidate[0] for candidate in candidate_positions]
+    if covered_indexes != expected_indexes:
+        return None, []
+    return (repaired, changes) if changes else (None, [])
+
+
+def _normalize_cross_chunk_candidate_boundaries(
+    candidates: list[dict[str, Any]],
+    *,
+    transcript_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Assign chunk-overlap records to one adjacent macro candidate.
+
+    Local topic chunks deliberately include a small context overlap. Once those
+    chunks become global macro candidates, retaining the overlap makes the
+    global range contract mathematically impossible: two adjacent themes would
+    each need to contain the same record while remaining non-overlapping.
+    Preserve the earlier candidate's ownership of an overlapping boundary and
+    move the later candidate to the next transcript record.
+    """
+
+    normalized = deepcopy(candidates)
+    record_positions = {
+        record["segment_id"]: position
+        for position, record in enumerate(transcript_records)
+    }
+    changes: list[str] = []
+    for index, (previous, current) in enumerate(
+        zip(normalized, normalized[1:]),
+        start=2,
+    ):
+        previous_end = previous.get("end_position")
+        current_start = current.get("start_position")
+        current_end = current.get("end_position")
+        if not all(
+            isinstance(value, int)
+            for value in (previous_end, current_start, current_end)
+        ):
+            continue
+        if current_start > previous_end:
+            continue
+        replacement_start = previous_end + 1
+        if replacement_start > current_end:
+            # A fully nested range cannot be safely repartitioned without
+            # inventing a semantic split. Keep it for model review instead of
+            # silently dropping source material.
+            continue
+        current["start_position"] = replacement_start
+        current["start_segment_id"] = transcript_records[replacement_start][
+            "segment_id"
+        ]
+        current["start"] = transcript_records[replacement_start]["start"]
+        anchors = [
+            segment_id
+            for segment_id in current.get("anchor_segment_ids", [])
+            if isinstance(segment_id, str)
+            and replacement_start
+            <= record_positions.get(segment_id, -1)
+            <= current_end
+        ]
+        current["anchor_segment_ids"] = anchors or [current["start_segment_id"]]
+        changes.append(f"trimmed_cross_chunk_overlap_before:{index}")
+    return normalized, changes
 
 
 def _run_theme_candidate_reductions(
@@ -6662,7 +9951,10 @@ def _run_theme_candidate_reductions(
 
     for reduction_index, group in enumerate(groups, start=1):
         min_count = 1
-        max_count = min(2, len(group))
+        # Preserve local semantic distinctions for the global merger.  A later
+        # stage has the full chronological candidate set and can decide which
+        # neighbouring topics genuinely share a parent question.
+        max_count = len(group)
         messages = build_theme_merge_messages(
             group,
             transcript_records=records,
@@ -6766,6 +10058,59 @@ def _run_theme_candidate_reductions(
                     }
                     errors = repaired_errors
                 if outline is None:
+                    coverage_repaired, coverage_changes = (
+                        _repair_theme_merge_candidate_coverage(
+                            raw_payload,
+                            candidates=group,
+                            transcript_records=records,
+                        )
+                    )
+                    if coverage_repaired is not None:
+                        coverage_outline, coverage_errors = validate_theme_merge(
+                            coverage_repaired,
+                            candidates=group,
+                            transcript_records=records,
+                            min_theme_count=min_count,
+                            max_theme_count=max_count,
+                            require_meeting_edge_coverage=False,
+                            enforce_min_long_theme_span=False,
+                        )
+                        if coverage_outline is not None:
+                            raw_payload = coverage_repaired
+                            outline = coverage_outline
+                            status = {
+                                **status,
+                                "candidate_coverage_repair": coverage_changes,
+                            }
+                            errors = []
+                        else:
+                            errors = coverage_errors
+                if outline is None:
+                    title_repaired, title_changes = _repair_theme_merge_titles(
+                        raw_payload,
+                        candidates=group,
+                    )
+                    if title_repaired is not None:
+                        title_outline, title_errors = validate_theme_merge(
+                            title_repaired,
+                            candidates=group,
+                            transcript_records=records,
+                            min_theme_count=min_count,
+                            max_theme_count=max_count,
+                            require_meeting_edge_coverage=False,
+                            enforce_min_long_theme_span=False,
+                        )
+                        if title_outline is not None:
+                            raw_payload = title_repaired
+                            outline = title_outline
+                            status = {
+                                **status,
+                                "deterministic_title_repair": title_changes,
+                            }
+                            errors = []
+                        else:
+                            errors = title_errors
+                if outline is None:
                     fallback = _grouped_theme_merge_fallback(
                         group,
                         target_theme_count=max_count,
@@ -6865,11 +10210,18 @@ def _run_theme_candidate_reductions(
                 "origin_candidate_indexes": origin_indexes,
             }
         )
+    macro_candidates, boundary_normalization_changes = (
+        _normalize_cross_chunk_candidate_boundaries(
+            macro_candidates,
+            transcript_records=records,
+        )
+    )
     return macro_candidates, reduced_themes, {
         "status": "cached" if all_cached else "ok",
         "groups": reduction_statuses,
         "input_candidates": len(candidates),
         "output_candidates": len(macro_candidates),
+        "cross_chunk_boundary_normalization": boundary_normalization_changes,
     }
 
 
@@ -7130,7 +10482,10 @@ def _run_hierarchical_theme_outline(
     )
     if macro_candidates is None:
         return None, candidates, reduction_status
-    min_theme_count, max_theme_count = theme_count_bounds(records)
+    min_theme_count, max_theme_count = theme_count_bounds(
+        records,
+        macro_candidates=macro_candidates,
+    )
     merge_messages = build_theme_merge_messages(
         macro_candidates,
         transcript_records=records,
@@ -7222,6 +10577,93 @@ def _run_hierarchical_theme_outline(
                     "initial_validation_errors": merge_errors,
                 }
                 merge_errors = repaired_errors
+            if (
+                theme_outline is None
+                and _only_theme_merge_topology_errors(merge_errors)
+            ):
+                topology_messages = _theme_merge_topology_repair_messages(
+                    merge_messages,
+                    payload=raw_merge,
+                    errors=merge_errors,
+                    candidates=macro_candidates,
+                    min_theme_count=min_theme_count,
+                    max_theme_count=max_theme_count,
+                )
+                topology_payload, topology_status = request_deepseek_json(
+                    messages=topology_messages,
+                    config=config,
+                )
+                if topology_payload is not None:
+                    topology_outline, topology_errors = validate_theme_merge(
+                        topology_payload,
+                        candidates=macro_candidates,
+                        transcript_records=records,
+                        min_theme_count=min_theme_count,
+                        max_theme_count=max_theme_count,
+                    )
+                    raw_merge = topology_payload
+                    theme_outline = topology_outline
+                    merge_status = {
+                        **topology_status,
+                        "repair_attempted": True,
+                        "topology_repair_attempted": True,
+                        "initial_validation_errors": (
+                            merge_status.get("initial_validation_errors", [])
+                            if isinstance(merge_status, dict)
+                            else []
+                        ),
+                        "pre_topology_validation_errors": merge_errors,
+                    }
+                    merge_errors = topology_errors
+            if theme_outline is None:
+                coverage_repaired, coverage_changes = (
+                    _repair_theme_merge_candidate_coverage(
+                        raw_merge,
+                        candidates=macro_candidates,
+                        transcript_records=records,
+                    )
+                )
+                if coverage_repaired is not None:
+                    coverage_outline, coverage_errors = validate_theme_merge(
+                        coverage_repaired,
+                        candidates=macro_candidates,
+                        transcript_records=records,
+                        min_theme_count=min_theme_count,
+                        max_theme_count=max_theme_count,
+                    )
+                    if coverage_outline is not None:
+                        raw_merge = coverage_repaired
+                        theme_outline = coverage_outline
+                        merge_status = {
+                            **merge_status,
+                            "candidate_coverage_repair": coverage_changes,
+                        }
+                        merge_errors = []
+                    else:
+                        merge_errors = coverage_errors
+            if theme_outline is None:
+                title_repaired, title_changes = _repair_theme_merge_titles(
+                    raw_merge,
+                    candidates=macro_candidates,
+                )
+                if title_repaired is not None:
+                    title_outline, title_errors = validate_theme_merge(
+                        title_repaired,
+                        candidates=macro_candidates,
+                        transcript_records=records,
+                        min_theme_count=min_theme_count,
+                        max_theme_count=max_theme_count,
+                    )
+                    if title_outline is not None:
+                        raw_merge = title_repaired
+                        theme_outline = title_outline
+                        merge_status = {
+                            **merge_status,
+                            "deterministic_title_repair": title_changes,
+                        }
+                        merge_errors = []
+                    else:
+                        merge_errors = title_errors
             if theme_outline is None:
                 fallback = _grouped_theme_merge_fallback(
                     macro_candidates,
@@ -7434,10 +10876,19 @@ def generate_smart_minutes(
     review_passes: int = 1,
     checkpoint: dict[str, Any] | None = None,
     checkpoint_callback: Callable[[dict[str, Any]], None] | None = None,
+    allow_cluster_name_consensus: bool = True,
 ) -> tuple[SmartMinutesResult | None, dict[str, Any]]:
     if review_passes not in {1, 2}:
         return None, {"status": "configuration_error", "error": "review_passes_must_be_1_or_2"}
-    records = canonical_transcript_records(segments)
+    identity_policy = (
+        "cluster_consensus_allowed"
+        if allow_cluster_name_consensus
+        else "direct_visual_only"
+    )
+    records = canonical_transcript_records(
+        segments,
+        allow_cluster_name_consensus=allow_cluster_name_consensus,
+    )
     if not records:
         return None, {"status": "empty_transcript"}
     required_participants = _required_project_participants(records)
@@ -7454,9 +10905,9 @@ def generate_smart_minutes(
     checkpoint_is_valid = (
         isinstance(checkpoint, dict)
         and checkpoint.get("format") == SMART_MINUTES_CHECKPOINT_FORMAT
-        and checkpoint.get("prompt_version") == SMART_PROMPT_VERSION
         and checkpoint.get("transcript_sha256") == transcript_sha256
         and checkpoint.get("model") == config.model
+        and checkpoint.get("identity_policy") == identity_policy
     )
     cache: dict[str, Any] = (
         deepcopy(checkpoint)
@@ -7466,6 +10917,7 @@ def generate_smart_minutes(
             "prompt_version": SMART_PROMPT_VERSION,
             "transcript_sha256": transcript_sha256,
             "model": config.model,
+            "identity_policy": identity_policy,
             "action_scout": None,
             "action_scout_chunks": [],
             "last_rejected_action_scout_chunk": None,
@@ -7482,6 +10934,11 @@ def generate_smart_minutes(
             "translation": None,
         }
     )
+    # Each stage carries an input fingerprint and revalidates its own cached
+    # payload. A prompt-version bump should therefore rerun only affected
+    # stages, rather than forcing a long recording through a fresh stochastic
+    # synthesis that can regress an already reviewed draft.
+    cache["prompt_version"] = SMART_PROMPT_VERSION
 
     def save_checkpoint() -> None:
         if checkpoint_callback is not None:
@@ -7855,6 +11312,22 @@ def generate_smart_minutes(
             continue
         action_scout.append(action)
 
+    for action in explicit_requested_follow_up_candidates(records):
+        request_ids = set(action["segment_ids"])
+        if any(
+            existing.get("owner") == UNASSIGNED_ACTION_OWNER
+            and bool(request_ids.intersection(existing.get("segment_ids", [])))
+            for existing in action_scout
+            if isinstance(existing, dict)
+        ):
+            continue
+        action_scout.append(action)
+
+    _protect_direct_self_commitment_candidates(
+        action_scout,
+        transcript_records=records,
+    )
+
     if hierarchical_analysis:
         theme_outline, theme_candidates, theme_outline_status = (
             _run_hierarchical_theme_outline(
@@ -7992,6 +11465,14 @@ def generate_smart_minutes(
                         theme_outline=theme_outline,
                         transcript_records=records,
                     )
+                    + (
+                        validate_must_keep_action_coverage(
+                            corrected,
+                            action_scout,
+                        )
+                        if pass_index == review_passes == 1
+                        else []
+                    )
                 )
             )
         gate_errors = (
@@ -8005,7 +11486,12 @@ def generate_smart_minutes(
             if pass_index >= 2 and corrected is not None
             else []
         )
-        errors = sorted(set(validation_errors + gate_errors))
+        quality_errors = (
+            _publication_language_quality_errors(corrected)
+            if pass_index >= 2 and corrected is not None
+            else []
+        )
+        errors = sorted(set(validation_errors + gate_errors + quality_errors))
         if errors:
             failure_status = (
                 "review_schema_invalid"
@@ -8123,6 +11609,58 @@ def generate_smart_minutes(
             validation_errors=review_validation_errors,
         )
         review_input_sha256 = _messages_fingerprint(review_messages)
+        checkpoint_repaired = False
+        if (
+            pass_index == review_passes
+            and isinstance(previous_rejection, dict)
+            and isinstance(previous_rejection.get("payload"), dict)
+            and review_validation_errors
+        ):
+            checkpoint_repair, checkpoint_repair_changes = (
+                (
+                    _deterministic_coverage_review_repair(
+                        previous_rejection["payload"],
+                        errors=review_validation_errors,
+                        action_scout=action_scout,
+                        transcript_records=records,
+                        theme_outline=theme_outline,
+                    )
+                    if pass_index == 1
+                    else _deterministic_final_review_repair(
+                        previous_rejection["payload"],
+                        errors=review_validation_errors,
+                        action_scout=action_scout,
+                        transcript_records=records,
+                        theme_outline=theme_outline,
+                    )
+                )
+            )
+            if checkpoint_repair is not None:
+                (
+                    checkpoint_minutes,
+                    checkpoint_repair_errors,
+                    _checkpoint_repair_failure_status,
+                ) = validate_review_payload(
+                    checkpoint_repair,
+                    pass_index=pass_index,
+                    expected_keys=expected_review_keys,
+                    prior_findings=prior_findings,
+                )
+                if checkpoint_minutes is not None and not checkpoint_repair_errors:
+                    raw_review = checkpoint_repair
+                    review_status = {
+                        **(
+                            previous_rejection.get("status")
+                            if isinstance(previous_rejection.get("status"), dict)
+                            else {}
+                        ),
+                        "status": "deterministic_checkpoint_repair",
+                        "deterministic_repair_attempted": True,
+                        "deterministic_repair_phase": "checkpoint",
+                        "deterministic_repair_changes": checkpoint_repair_changes,
+                    }
+                    review_from_cache = False
+                    checkpoint_repaired = True
         cached_review = cached_reviews[pass_index - 1] if len(cached_reviews) >= pass_index else None
         cached_review_payload = cached_review.get("payload") if isinstance(cached_review, dict) else None
         cached_review_is_valid = (
@@ -8131,7 +11669,9 @@ def generate_smart_minutes(
             and set(cached_review_payload) == expected_review_keys
             and isinstance(cached_review_payload.get("findings"), list)
         )
-        if cached_review_is_valid:
+        if checkpoint_repaired:
+            pass
+        elif cached_review_is_valid:
             raw_review = cached_review["payload"]
             review_status = {
                 **(cached_review.get("status") if isinstance(cached_review.get("status"), dict) else {}),
@@ -8235,14 +11775,32 @@ def generate_smart_minutes(
             prior_findings=prior_findings,
         )
         review_repaired = False
-        def apply_deterministic_review_repair(*, phase: str) -> bool:
+        def apply_deterministic_review_repair(
+            *,
+            phase: str,
+            entity_fallback: bool,
+        ) -> bool:
             nonlocal corrected, raw_review, review_errors, review_failure_status
             nonlocal review_from_cache, review_repaired, review_status
             deterministically_repaired, deterministic_changes = (
-                _deterministic_final_review_repair(
-                    raw_review,
-                    errors=review_errors,
-                    action_scout=action_scout,
+                (
+                    _deterministic_coverage_review_repair(
+                        raw_review,
+                        errors=review_errors,
+                        action_scout=action_scout,
+                        transcript_records=records,
+                        theme_outline=theme_outline,
+                        entity_fallback=entity_fallback,
+                    )
+                    if pass_index == 1
+                    else _deterministic_final_review_repair(
+                        raw_review,
+                        errors=review_errors,
+                        action_scout=action_scout,
+                        transcript_records=records,
+                        theme_outline=theme_outline,
+                        entity_fallback=entity_fallback,
+                    )
                 )
             )
             if deterministically_repaired is None:
@@ -8273,9 +11831,102 @@ def generate_smart_minutes(
         # rewrite the complete review. This prevents cosmetic label fixes from
         # destabilising otherwise validated actions or themes.
         if review_errors and pass_index == review_passes:
-            apply_deterministic_review_repair(phase="pre_model")
+            apply_deterministic_review_repair(
+                phase="pre_model",
+                entity_fallback=False,
+            )
 
-        if review_errors and pass_index == review_passes:
+        field_repair_history: list[dict[str, Any]] = []
+        field_repair_progress = False
+
+        def apply_targeted_field_repair() -> bool:
+            nonlocal corrected, raw_review, review_errors, review_failure_status
+            nonlocal review_from_cache, review_repaired, review_status
+            field_targets = _field_repair_targets(
+                raw_review,
+                review_errors,
+                transcript_records=records,
+            )
+            if not field_targets:
+                return False
+            field_repair_payload, field_repair_status = request_deepseek_json(
+                messages=_targeted_field_repair_messages(field_targets),
+                config=config,
+                max_tokens=4_000,
+            )
+            field_repaired, field_changes = _apply_targeted_field_repairs(
+                raw_review,
+                field_repair_payload,
+                targets=field_targets,
+            )
+            if field_repaired is None:
+                return False
+            (
+                field_minutes,
+                field_errors,
+                field_failure_status,
+            ) = validate_review_payload(
+                field_repaired,
+                pass_index=pass_index,
+                expected_keys=expected_review_keys,
+                prior_findings=prior_findings,
+            )
+            if (
+                set(field_errors).difference(review_errors)
+                or len(field_errors) >= len(review_errors)
+            ):
+                return False
+            raw_review = field_repaired
+            corrected = field_minutes
+            review_errors = field_errors
+            review_failure_status = field_failure_status
+            field_repair_history.append(
+                {
+                    "status": field_repair_status,
+                    "target_count": len(field_targets),
+                    "applied_fields": field_changes,
+                }
+            )
+            review_status = {
+                **review_status,
+                "field_repair": {
+                    "attempts": len(field_repair_history),
+                    "history": field_repair_history,
+                },
+            }
+            review_from_cache = False
+            review_repaired = True
+            return True
+
+        if (
+            review_errors
+            and pass_index == review_passes
+            and not _requires_full_final_review_rewrite(review_errors)
+        ):
+            for attempt in range(2):
+                if not apply_targeted_field_repair():
+                    break
+                field_repair_progress = True
+                if not review_errors:
+                    break
+                apply_deterministic_review_repair(
+                    phase=f"after_field_repair_{attempt + 1}",
+                    entity_fallback=False,
+                )
+                if not review_errors:
+                    break
+
+        # A full JSON rewrite can overwrite a field-level repair with newly
+        # unsupported language. Use it only when constrained repairs made no
+        # evidence-preserving progress at all.
+        if (
+            review_errors
+            and pass_index == review_passes
+            and (
+                _requires_full_final_review_rewrite(review_errors)
+                or not field_repair_progress
+            )
+        ):
             repair_messages = _targeted_final_review_repair_messages(
                 base_messages=review_messages,
                 payload=raw_review,
@@ -8301,20 +11952,27 @@ def generate_smart_minutes(
                         prior_findings=prior_findings,
                     )
                 )
-                raw_review = repaired_review
-                corrected = repaired_minutes
-                review_errors = repaired_errors
-                review_failure_status = repaired_failure_status
-                review_status = {
-                    **review_status,
-                    "repair_status": repair_status,
-                    "repair_attempted": True,
-                }
-                review_from_cache = False
-                review_repaired = True
+                if (
+                    not set(repaired_errors).difference(review_errors)
+                    and len(repaired_errors) < len(review_errors)
+                ):
+                    raw_review = repaired_review
+                    corrected = repaired_minutes
+                    review_errors = repaired_errors
+                    review_failure_status = repaired_failure_status
+                    review_status = {
+                        **review_status,
+                        "repair_status": repair_status,
+                        "repair_attempted": True,
+                    }
+                    review_from_cache = False
+                    review_repaired = True
 
         if review_errors and pass_index == review_passes:
-            apply_deterministic_review_repair(phase="post_model")
+            apply_deterministic_review_repair(
+                phase="post_model",
+                entity_fallback=True,
+            )
 
         if not review_errors and pass_index == review_passes:
             normalized_review, normalization_changes = (
@@ -8469,6 +12127,13 @@ def generate_smart_minutes(
         and cached_translation.get("input_sha256") == translation_input_sha256
         and isinstance(cached_translation.get("payload"), dict)
     )
+    rejected_translation = cache.get("last_rejected_translation")
+    rejected_translation_is_reusable = (
+        not cached_translation_is_valid
+        and isinstance(rejected_translation, dict)
+        and rejected_translation.get("input_sha256") == translation_input_sha256
+        and isinstance(rejected_translation.get("payload"), dict)
+    )
     if cached_translation_is_valid:
         raw_translation = cached_translation["payload"]
         translation_status = {
@@ -8478,6 +12143,16 @@ def generate_smart_minutes(
                 else {}
             ),
             "status": "cached",
+        }
+    elif rejected_translation_is_reusable:
+        raw_translation = rejected_translation["payload"]
+        translation_status = {
+            **(
+                rejected_translation.get("status")
+                if isinstance(rejected_translation.get("status"), dict)
+                else {}
+            ),
+            "status": "revalidating_rejected_cache",
         }
     else:
         raw_translation, translation_status = request_deepseek_json(
@@ -8498,32 +12173,47 @@ def generate_smart_minutes(
             "synthesis": synthesis_status,
             "reviews": reviews,
         }
-    translated, translation_errors = validate_source_minutes(
+    bilingual, bilingual_errors = combine_publishable_minutes_languages(
+        current,
         raw_translation,
-        transcript_records=records,
-        required_project_participants=required_participants,
     )
-    if translated is not None:
-        translation_errors = sorted(
-            set(
-                translation_errors
-                + validate_theme_outline_coverage(
-                    translated,
-                    theme_outline=theme_outline,
-                    transcript_records=records,
-                )
-            )
-        )
-    if translated is None or translation_errors:
-        return None, {
-            "status": "translation_schema_invalid",
-            "errors": translation_errors,
-            "translation": translation_status,
-            "synthesis": synthesis_status,
-            "reviews": reviews,
-        }
-    bilingual, bilingual_errors = combine_minutes_languages(current, translated)
     if bilingual is None:
+        repair_messages = build_translation_repair_messages(
+            current,
+            raw_translation,
+            bilingual_errors,
+        )
+        repaired_translation, repair_status = request_deepseek_json(
+            messages=repair_messages,
+            config=config,
+        )
+        if repaired_translation is not None:
+            raw_translation = repaired_translation
+            translation_status = {
+                **repair_status,
+                "status": "repair",
+                "initial_validation_errors": bilingual_errors,
+            }
+            bilingual, bilingual_errors = combine_publishable_minutes_languages(
+                current,
+                raw_translation,
+            )
+            if bilingual is not None:
+                cache["translation"] = {
+                    "input_sha256": translation_input_sha256,
+                    "payload": raw_translation,
+                    "status": translation_status,
+                }
+                save_checkpoint()
+    if bilingual is None:
+        cache["last_rejected_translation"] = {
+            "input_sha256": translation_input_sha256,
+            "payload": raw_translation,
+            "status": translation_status,
+            "validation_errors": bilingual_errors,
+        }
+        cache["translation"] = None
+        save_checkpoint()
         return None, {
             "status": "translation_alignment_invalid",
             "errors": bilingual_errors,
@@ -8531,6 +12221,9 @@ def generate_smart_minutes(
             "synthesis": synthesis_status,
             "reviews": reviews,
         }
+    if cache.get("last_rejected_translation") is not None:
+        cache["last_rejected_translation"] = None
+        save_checkpoint()
 
     chinese, english = render_smart_minutes(bilingual, transcript_records=records)
     duration = max(record["end"] for record in records)
@@ -8545,6 +12238,7 @@ def generate_smart_minutes(
     audit = {
         "format": SMART_MINUTES_AUDIT_FORMAT,
         "transcript_sha256": transcript_sha256,
+        "identity_policy": identity_policy,
         "analysis_mode": (
             "hierarchical"
             if hierarchical_analysis
@@ -8553,7 +12247,8 @@ def generate_smart_minutes(
         "transcript_record_count": len(records),
         "model_evidence_record_count": len(analysis_records),
         "review_passes": review_passes,
-        "synthesis_validation_errors": synthesis_validation_errors,
+        "synthesis_initial_validation_errors": synthesis_validation_errors,
+        "final_review_validation_errors": [],
         "required_project_participants": required_participants,
         "required_action_candidate_groups": required_action_groups,
         "follow_up_context_hint_count": len(follow_up_hints),
@@ -8583,6 +12278,7 @@ def generate_smart_minutes(
             "status": "reviewed_draft",
             "engine": "deepseek-smart",
             "model": config.model,
+            "identity_policy": identity_policy,
             "analysis_mode": (
                 "hierarchical"
                 if hierarchical_analysis

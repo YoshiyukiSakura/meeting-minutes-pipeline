@@ -5,6 +5,7 @@ from meeting_minutes.action_items import (
     stable_segment_id,
     validate_published_action_item,
 )
+from meeting_minutes.identity_authority import ACTIVE_SPEAKER_HIGHLIGHT_SOURCE
 
 
 def _segment(start, end, speaker, text, *, name=None):
@@ -29,6 +30,18 @@ def _counterexample_segments():
         _segment(224.0, 228.0, "Riley", "I will figure out when to upgrade MPC."),
         _segment(230.0, 232.0, "Alex Example", "That upgrade does not require downtime."),
     ]
+
+
+def test_active_speaker_name_cannot_own_an_action_without_agent_confirmation():
+    segment = _segment(0.0, 4.0, "Speaker 1", "I will prepare the migration plan.", name="John")
+    segment["name_source"] = ACTIVE_SPEAKER_HIGHLIGHT_SOURCE
+
+    unconfirmed = build_action_ledger([segment])
+    assert unconfirmed["candidates"][0]["owner"] is None
+
+    segment["visual_identity_agent_audit"] = {"status": "confirmed"}
+    confirmed = build_action_ledger([segment])
+    assert confirmed["candidates"][0]["owner"] == "John"
 
 
 def test_counterexample_is_split_into_two_atomic_action_candidates():
@@ -456,6 +469,21 @@ def test_conversational_let_me_cue_is_not_a_follow_up_commitment():
                 "Billy",
                 "Let me ask you about the latest invoice.",
             ),
+        ]
+    )
+
+    assert ledger["candidates"] == []
+
+
+def test_idea_framed_let_me_is_not_a_follow_up_commitment():
+    ledger = build_action_ledger(
+        [
+            _segment(
+                0.0,
+                8.0,
+                "Billy",
+                "Let me continue my my idea was we're going to build an API gateway.",
+            )
         ]
     )
 

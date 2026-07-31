@@ -168,6 +168,51 @@ def direct_visual_enrollment_frame_count(visual_payload: dict[str, Any]) -> int:
     )
 
 
+def restrict_visual_enrollment_to_agent_confirmed_segments(
+    visual_payload: dict[str, Any],
+    segments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Exclude direct visual frames whose overlapping identity was not confirmed."""
+
+    confirmed_intervals = [
+        (
+            float(segment.get("start", 0.0)),
+            float(segment.get("end", 0.0)),
+            str(segment.get("name") or "").strip().casefold(),
+        )
+        for segment in segments
+        if str(segment.get("name") or "").strip()
+        and isinstance(segment.get("visual_identity_agent_audit"), dict)
+        and segment["visual_identity_agent_audit"].get("status") == "confirmed"
+    ]
+    frames: list[dict[str, Any]] = []
+    removed = 0
+    for frame in visual_payload.get("frames", []):
+        if not isinstance(frame, dict):
+            continue
+        if frame.get("name_source") not in _DIRECT_VISUAL_FRAME_SOURCES:
+            frames.append(frame)
+            continue
+        name = str(frame.get("name") or "").strip().casefold()
+        timestamp = float(frame.get("actualTime", frame.get("time", 0.0)) or 0.0)
+        supported = any(
+            start <= timestamp <= end and name == expected_name
+            for start, end, expected_name in confirmed_intervals
+        )
+        if supported:
+            frames.append(frame)
+        else:
+            removed += 1
+    return {
+        **visual_payload,
+        "frames": frames,
+        "agent_visual_audit_filter": {
+            "confirmed_intervals": len(confirmed_intervals),
+            "removed_direct_frames": removed,
+        },
+    }
+
+
 def clear_visual_voice_identity(segments: list[dict[str, Any]]) -> int:
     """Retract only labels produced by this stage before a rerun.
 

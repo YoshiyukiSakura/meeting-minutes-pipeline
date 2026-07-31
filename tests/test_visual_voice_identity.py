@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from meeting_minutes.visual_voice_identity import (
     _calibrate_precision_gate,
@@ -8,6 +9,7 @@ from meeting_minutes.visual_voice_identity import (
     clear_visual_voice_identity,
     direct_visual_enrollment_frame_count,
     load_visual_voice_config,
+    restrict_visual_enrollment_to_agent_confirmed_segments,
     select_visual_voice_enrollment,
 )
 
@@ -67,6 +69,58 @@ def test_select_visual_voice_enrollment_accepts_reviewed_active_slot_evidence():
     assert rejected == {}
     assert selected["Billy"][0]["visual_source"] == "visual_profile_reviewed_slot"
     assert direct_visual_enrollment_frame_count({"frames": frames}) == 4
+
+
+def test_visual_voice_enrollment_uses_only_agent_confirmed_segment_intervals():
+    visual_payload = {
+        "frames": [
+            {
+                "actualTime": 1.5,
+                "active": True,
+                "name": "John",
+                "name_source": "visual_profile_reviewed_slot",
+            },
+            {
+                "actualTime": 3.5,
+                "active": True,
+                "name": "Billy",
+                "name_source": "visual_profile_reviewed_slot",
+            },
+        ]
+    }
+    segments = [
+        {
+            "start": 1.0,
+            "end": 2.0,
+            "name": "John",
+            "visual_identity_agent_audit": {"status": "confirmed"},
+        },
+        {
+            "start": 3.0,
+            "end": 4.0,
+            "name": None,
+            "visual_identity_agent_audit": {"status": "unconfirmed"},
+        },
+    ]
+
+    filtered = restrict_visual_enrollment_to_agent_confirmed_segments(
+        visual_payload,
+        segments,
+    )
+
+    assert [frame["name"] for frame in filtered["frames"]] == ["John"]
+    assert filtered["agent_visual_audit_filter"] == {
+        "confirmed_intervals": 1,
+        "removed_direct_frames": 1,
+    }
+
+
+def test_load_visual_voice_config_rejects_invalid_minimum_score(tmp_path):
+    config = tmp_path / "invalid.json"
+    config.write_text('{"settings":{"minimum_score":0}}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="minimum_score"):
+        load_visual_voice_config(config)
 
 
 def test_voice_scores_need_precision_calibration_and_segment_consensus():

@@ -9,7 +9,11 @@ from typing import Any
 
 from .action_items import build_action_intent_recall, stable_segment_id, transcript_fingerprint
 from .jsonio import read_json, write_json
-from .minutes_contract import ShareableActionRow, ShareableProjectUpdateRow
+from .minutes_contract import (
+    UNASSIGNED_ACTION_OWNER,
+    ShareableActionRow,
+    ShareableProjectUpdateRow,
+)
 
 ACTION_EVIDENCE_FORMAT = "meeting-minutes/reviewed-action-evidence-v1"
 ACTION_INTENT_REVIEW_FORMAT = "meeting-minutes/reviewed-action-intents-v1"
@@ -28,6 +32,7 @@ SHARE_BUNDLE_FILENAMES = {
 _IDENTITY_CONFIDENCE = 0.6
 PROJECT_UPDATE_COVERAGE_MIN_SECONDS = 60.0
 PROJECT_UPDATE_EVIDENCE_MAX_TIME_PADDING_SECONDS = 5.0
+DISPLAY_TIMESTAMP_ROUNDING_TOLERANCE_SECONDS = 1.0
 ACTION_INTENT_REJECTION_REASONS = frozenset(
     {
         "not_an_action",
@@ -444,16 +449,22 @@ def validate_reviewed_action_evidence(
         ):
             errors.append(f"{prefix}:source_segment_outside_action_range")
 
-        owner_segment_id = entry.get("owner_evidence_segment_id")
-        owner_segment = records.get(str(owner_segment_id or ""))
-        if owner_segment is None:
-            errors.append(f"{prefix}:owner_evidence_unknown")
-        elif float(owner_segment.get("name_confidence", 0.0) or 0.0) < _IDENTITY_CONFIDENCE:
-            errors.append(f"{prefix}:owner_identity_low_confidence")
-        elif str(owner_segment.get("name") or "").strip() != row.owner:
-            errors.append(f"{prefix}:owner_evidence_mismatch")
-
         mode = entry.get("evidence_mode")
+        owner_segment_id = entry.get("owner_evidence_segment_id")
+        if row.owner == UNASSIGNED_ACTION_OWNER:
+            if owner_segment_id not in (None, ""):
+                errors.append(f"{prefix}:unassigned_owner_evidence_unexpected")
+            if mode != "reviewed_context":
+                errors.append(f"{prefix}:unassigned_owner_requires_reviewed_context")
+        else:
+            owner_segment = records.get(str(owner_segment_id or ""))
+            if owner_segment is None:
+                errors.append(f"{prefix}:owner_evidence_unknown")
+            elif float(owner_segment.get("name_confidence", 0.0) or 0.0) < _IDENTITY_CONFIDENCE:
+                errors.append(f"{prefix}:owner_identity_low_confidence")
+            elif str(owner_segment.get("name") or "").strip() != row.owner:
+                errors.append(f"{prefix}:owner_evidence_mismatch")
+
         if mode == "ledger":
             candidate = candidates.get(str(entry.get("candidate_id") or ""))
             if candidate is None:
@@ -651,7 +662,12 @@ def validate_reviewed_project_evidence(
             errors.append(f"{prefix}:source_participant_mismatch")
         source_start = min(float(segment.get("start", 0.0)) for segment in source_segments)
         source_end = max(float(segment.get("end", 0.0)) for segment in source_segments)
-        if source_start < row.start or source_end > row.end:
+        if (
+            source_start
+            < row.start - DISPLAY_TIMESTAMP_ROUNDING_TOLERANCE_SECONDS
+            or source_end
+            > row.end + DISPLAY_TIMESTAMP_ROUNDING_TOLERANCE_SECONDS
+        ):
             errors.append(f"{prefix}:source_segment_outside_project_range")
         if (
             source_start - row.start > PROJECT_UPDATE_EVIDENCE_MAX_TIME_PADDING_SECONDS
@@ -719,3 +735,224 @@ def validate_reviewed_project_evidence(
         if participant in row_participants and participant in exception_participants:
             errors.append(f"project_coverage_duplicated:{participant}")
     return sorted(set(errors))
+
+
+def build_reviewed_evidence_manifests(
+    *,
+    smart_minutes: dict[str, Any],
+    action_rows: list[ShareableActionRow],
+    project_rows: list[ShareableProjectUpdateRow],
+    segments: list[dict[str, Any]],
+    action_ledger: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]] | None, list[str]]:
+    """Bind a validated smart-minutes payload to internal publication evidence."""
+
+    minutes = smart_minutes.get("minutes")
+    if not isinstance(minutes, dict):
+        return None, ["smart_minutes_payload_invalid"]
+    raw_actions = minutes.get("actions")
+    raw_updates = minutes.get("project_updates")
+    if not isinstance(raw_actions, list) or not isinstance(raw_updates, list):
+        return None, ["smart_minutes_sections_invalid"]
+
+    records = {
+        stable_segment_id(segment, index): segment
+        for index, segment in enumerate(segments)
+    }
+    transcript_sha256 = transcript_fingerprint(segments)
+    ledger_sha256 = action_ledger_fingerprint(action_ledger)
+    errors: list[str] = []
+
+    def normalized_text(value: Any) -> str:
+        return re.sub(r"\s+", "", str(value or "")).strip("。.")
+
+    used_actions: set[int] = set()
+    action_entries: list[dict[str, Any]] = []
+    for row in action_rows:
+        matches = [
+            (index, action)
+            for index, action in enumerate(raw_actions)
+            if index not in used_actions
+            and isinstance(action, dict)
+            and _normalize_participant_name(action.get("owner")) == row.owner
+            and normalized_text(action.get("item_zh")) == normalized_text(row.item)
+        ]
+        if len(matches) != 1:
+            errors.append(f"smart_action_row_match_invalid:{row.index}")
+            continue
+        action_index, action = matches[0]
+        used_actions.add(action_index)
+        source_ids = [
+            segment_id
+            for segment_id in action.get("segment_ids", [])
+            if isinstance(segment_id, str)
+        ]
+        owner_evidence_id: str | None = None
+        if row.owner != UNASSIGNED_ACTION_OWNER:
+            owner_evidence_id = next(
+                (
+                    segment_id
+                    for segment_id in source_ids
+                    if segment_id in records
+                    and _trusted_named_segment(records[segment_id])
+                    and _normalize_participant_name(
+                        records[segment_id].get("name")
+                    )
+                    == row.owner
+                ),
+                None,
+            )
+        action_entries.append(
+            {
+                "row": row.index,
+                "source_segment_ids": source_ids,
+                "owner_evidence_segment_id": owner_evidence_id,
+                "evidence_mode": "reviewed_context",
+                "review_note": (
+                    "Bound to the source IDs retained by the validated "
+                    "smart-minutes review."
+                ),
+            }
+        )
+
+    action_evidence = {
+        "format": ACTION_EVIDENCE_FORMAT,
+        "transcript_sha256": transcript_sha256,
+        "action_ledger_sha256": ledger_sha256,
+        "rows": action_entries,
+    }
+
+    intent_items: list[dict[str, Any]] = []
+    for signal in action_intent_recall_signals(
+        segments=segments,
+        action_ledger=action_ledger,
+    ):
+        matching_rows = [
+            row
+            for row in action_rows
+            if row.owner == signal["participant"]
+            and signal["segment_id"]
+            in next(
+                (
+                    entry["source_segment_ids"]
+                    for entry in action_entries
+                    if entry["row"] == row.index
+                ),
+                [],
+            )
+        ]
+        if not matching_rows:
+            errors.append(
+                f"smart_action_intent_unresolved:{signal['signal_id']}"
+            )
+            continue
+        intent_items.append(
+            {
+                "signal_id": signal["signal_id"],
+                "disposition": "published",
+                "review_note": (
+                    "The reviewed action row retains this independently "
+                    "recalled self-intent segment."
+                ),
+            }
+        )
+    action_intent_review = {
+        "format": ACTION_INTENT_REVIEW_FORMAT,
+        "transcript_sha256": transcript_sha256,
+        "action_ledger_sha256": ledger_sha256,
+        "items": intent_items,
+    }
+
+    used_updates: set[int] = set()
+    project_entries: list[dict[str, Any]] = []
+    for row in project_rows:
+        matches = [
+            (index, update)
+            for index, update in enumerate(raw_updates)
+            if index not in used_updates
+            and isinstance(update, dict)
+            and _normalize_participant_name(update.get("participant"))
+            == row.participant
+            and normalized_text(update.get("project_zh"))
+            == normalized_text(row.project)
+            and normalized_text(update.get("update_zh"))
+            == normalized_text(row.update)
+        ]
+        if len(matches) != 1:
+            errors.append(f"smart_project_row_match_invalid:{row.index}")
+            continue
+        update_index, update = matches[0]
+        used_updates.add(update_index)
+        source_ids = [
+            segment_id
+            for segment_id in update.get("segment_ids", [])
+            if isinstance(segment_id, str)
+        ]
+        participant_evidence_id = next(
+            (
+                segment_id
+                for segment_id in source_ids
+                if segment_id in records
+                and _trusted_named_segment(records[segment_id])
+                and _normalize_participant_name(
+                    records[segment_id].get("name")
+                )
+                == row.participant
+            ),
+            None,
+        )
+        project_entries.append(
+            {
+                "row": row.index,
+                "source_segment_ids": source_ids,
+                "participant_evidence_segment_id": participant_evidence_id,
+                "review_note": (
+                    "Bound to the participant turns retained by the validated "
+                    "smart-minutes review."
+                ),
+            }
+        )
+    project_evidence = {
+        "format": PROJECT_EVIDENCE_FORMAT,
+        "transcript_sha256": transcript_sha256,
+        "action_ledger_sha256": ledger_sha256,
+        "coverage_min_seconds": PROJECT_UPDATE_COVERAGE_MIN_SECONDS,
+        "rows": project_entries,
+        "exceptions": [],
+    }
+
+    errors.extend(
+        f"action:{error}"
+        for error in validate_reviewed_action_evidence(
+            manifest=action_evidence,
+            rows=action_rows,
+            segments=segments,
+            action_ledger=action_ledger,
+        )
+    )
+    errors.extend(
+        f"intent:{error}"
+        for error in validate_reviewed_action_intent_review(
+            manifest=action_intent_review,
+            rows=action_rows,
+            action_evidence=action_evidence,
+            segments=segments,
+            action_ledger=action_ledger,
+        )
+    )
+    errors.extend(
+        f"project:{error}"
+        for error in validate_reviewed_project_evidence(
+            manifest=project_evidence,
+            rows=project_rows,
+            segments=segments,
+            action_ledger=action_ledger,
+        )
+    )
+    if errors:
+        return None, sorted(set(errors))
+    return {
+        "action_evidence": action_evidence,
+        "action_intent_review": action_intent_review,
+        "project_evidence": project_evidence,
+    }, []

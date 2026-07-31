@@ -38,6 +38,8 @@ NO_PUBLISHABLE_ACTIONS = "- 本次未出现可发布的明确行动项。"
 EN_ACTION_TABLE_HEADER = "| Time | Item | Owner |"
 EN_ACTION_TABLE_SEPARATOR = "| --- | --- | --- |"
 EN_NO_PUBLISHABLE_ACTIONS = "- No publishable action items were identified."
+UNASSIGNED_ACTION_OWNER = "待确认"
+EN_UNASSIGNED_ACTION_OWNER = "To confirm"
 
 FORBIDDEN_HEADINGS = (
     "## 基本信息",
@@ -70,6 +72,10 @@ _OWNER_SCHEDULE_QUALIFIER = re.compile(
     r"[（(][^）)]*(?:今天|明天|当天|本周|下周|周末|月底|本月|day|week|month|today|tomorrow)[^）)]*[）)]",
     re.IGNORECASE,
 )
+
+
+def _is_explicit_unassigned_action_owner(value: str) -> bool:
+    return value.strip() == UNASSIGNED_ACTION_OWNER
 
 
 @dataclass(frozen=True)
@@ -303,7 +309,7 @@ def validate_shareable_minutes(markdown: str, *, duration: float = 0.0) -> list[
                             errors.append(f"action_items_time_range_invalid:{row_index}")
                         if duration > 0 and (start >= duration or end > duration + 0.5):
                             errors.append(f"action_items_time_range_out_of_bounds:{row_index}")
-                if _UNKNOWN_ACTION_OWNER.search(cells[2]):
+                if _UNKNOWN_ACTION_OWNER.search(cells[2]) and not _is_explicit_unassigned_action_owner(cells[2]):
                     errors.append(f"action_items_owner_unresolved:{row_index}")
                 if _OWNER_SCHEDULE_QUALIFIER.search(cells[2]):
                     errors.append(f"action_items_owner_contains_schedule:{row_index}")
@@ -429,7 +435,12 @@ def _normalize_english_minutes(markdown: str) -> str:
             if match:
                 normalized_lines.append(f"{match.group('prefix')}（{match.group('start')}-{match.group('end')}）")
             else:
-                normalized_lines.append(line)
+                normalized_lines.append(
+                    line.replace(
+                        f"| {EN_UNASSIGNED_ACTION_OWNER} |",
+                        f"| {UNASSIGNED_ACTION_OWNER} |",
+                    )
+                )
     return "\n".join(normalized_lines)
 
 

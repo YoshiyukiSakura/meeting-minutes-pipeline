@@ -1,3 +1,6 @@
+import hashlib
+import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +62,460 @@ def test_voice_template_uses_generic_speaker_count(tmp_path):
     assert '"Speaker 3"' in guide
     assert "Alice" not in guide
     assert "Bob" not in guide
+
+
+def test_agent_visual_audit_batch_assembly_keeps_calibration(tmp_path, monkeypatch):
+    audit_dir = tmp_path / "work" / "agent_visual_audit"
+    audit_dir.mkdir(parents=True)
+    schema_path = audit_dir / "response.schema.json"
+    write_json(schema_path, {})
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"frame")
+    manifest = {
+        "format": "meeting-minutes/agent-visual-audit-v1",
+        "manifest_sha256": "test-manifest",
+        "calibrations": [
+            {
+                "calibration_id": "calibration-001",
+                "layout": "grid",
+                "frame": str(frame),
+                "expected_slot_names": {"top_left": "John"},
+            }
+        ],
+        "samples": [
+            {
+                "sample_id": "sample-001",
+                "layout": "grid",
+                "expected_name": "John",
+                "expected_slot": "top_left",
+                "start": 1.0,
+                "frame": str(frame),
+            },
+            {
+                "sample_id": "sample-002",
+                "layout": "grid",
+                "expected_name": "John",
+                "expected_slot": "top_left",
+                "start": 2.0,
+                "frame": str(frame),
+            },
+        ],
+    }
+
+    def fake_run(command, **kwargs):
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        request = json.loads(command[-1])
+        response = {
+            "format": "meeting-minutes/agent-visual-audit-v1",
+            "agent": "cursor",
+            "overall_verdict": "pass",
+            "calibrations": [
+                {
+                    "calibration_id": "calibration-001",
+                    "layout": "grid",
+                    "observed_slot_names": [{"slot": "top_left", "name": "John"}],
+                    "verdict": "confirm",
+                }
+            ],
+            "samples": [
+                {
+                    "sample_id": sample["sample_id"],
+                    "green_highlight": "visible",
+                    "observed_name": "John",
+                    "verdict": "confirm",
+                }
+                for sample in request["samples"]
+            ],
+        }
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(response), stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result, status = cli._run_agent_visual_audit(
+        agent="cursor",
+        args=SimpleNamespace(
+            cursor_bin="cursor-agent",
+            cursor_model="cursor-grok-4.5-high",
+            codex_bin="codex",
+            timeout=1,
+            batch_size=1,
+        ),
+        workspace=tmp_path,
+        output_dir=tmp_path,
+        bundle={"directory": audit_dir, "schema": schema_path},
+        manifest=manifest,
+    )
+
+    assert status["status"] == "ok", status
+    assert result is not None
+    assert result["calibrations"][0]["confirmed"] is True
+    assert all(sample["confirmed"] is True for sample in result["samples"])
+
+
+def test_agent_visual_audit_retry_reruns_only_unconfirmed_samples(
+    tmp_path,
+    monkeypatch,
+):
+    audit_dir = tmp_path / "work" / "agent_visual_audit"
+    audit_dir.mkdir(parents=True)
+    schema_path = audit_dir / "response.schema.json"
+    write_json(schema_path, {})
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"frame")
+    manifest = {
+        "format": "meeting-minutes/agent-visual-audit-v1",
+        "manifest_sha256": "test-manifest",
+        "calibrations": [],
+        "samples": [
+            {
+                "sample_id": "sample-001",
+                "layout": None,
+                "expected_name": "John",
+                "expected_slot": "top_left",
+                "start": 1.0,
+                "frame": str(frame),
+            },
+            {
+                "sample_id": "sample-002",
+                "layout": None,
+                "expected_name": "John",
+                "expected_slot": "top_left",
+                "start": 2.0,
+                "frame": str(frame),
+            },
+        ],
+    }
+    seed_response = {
+        "format": "meeting-minutes/agent-visual-audit-v1",
+        "agent": "cursor",
+        "overall_verdict": "needs_review",
+        "calibrations": [],
+        "samples": [
+            {
+                "sample_id": "sample-001",
+                "green_highlight": "visible",
+                "observed_name": "John",
+                "verdict": "confirm",
+            },
+            {
+                "sample_id": "sample-002",
+                "green_highlight": "visible",
+                "observed_name": None,
+                "verdict": "uncertain",
+            },
+        ],
+    }
+    calls = 0
+
+    def fake_run(command, **_kwargs):
+        nonlocal calls
+        calls += 1
+        request = json.loads(command[-1])
+        assert [sample["sample_id"] for sample in request["samples"]] == [
+            "sample-002"
+        ]
+        response = {
+            "format": "meeting-minutes/agent-visual-audit-v1",
+            "agent": "cursor",
+            "overall_verdict": "pass",
+            "calibrations": [],
+            "samples": [
+                {
+                    "sample_id": "sample-002",
+                    "green_highlight": "visible",
+                    "observed_name": "John",
+                    "verdict": "confirm",
+                }
+            ],
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(response),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result, status = cli._run_agent_visual_audit(
+        agent="cursor",
+        args=SimpleNamespace(
+            cursor_bin="cursor-agent",
+            cursor_model="cursor-grok-4.5-high",
+            codex_bin="codex",
+            timeout=1,
+            batch_size=1,
+        ),
+        workspace=tmp_path,
+        output_dir=tmp_path,
+        bundle={"directory": audit_dir, "schema": schema_path},
+        manifest=manifest,
+        seed_response=seed_response,
+        response_tag="retry-unconfirmed",
+    )
+
+    assert calls == 1
+    assert status["status"] == "ok"
+    assert status["reused_confirmed_samples"] == 1
+    assert result is not None
+    assert all(sample["confirmed"] is True for sample in result["samples"])
+    assert (
+        audit_dir
+        / "responses"
+        / "cursor.retry-unconfirmed.batch-001.stdout.txt"
+    ).is_file()
+
+
+def test_codex_visual_audit_command_terminates_variadic_images_before_prompt(
+    tmp_path,
+):
+    calibration = tmp_path / "calibration.png"
+    sample = tmp_path / "sample.png"
+    calibration.write_bytes(b"calibration")
+    sample.write_bytes(b"sample")
+    prompt = '{"audit":"active-speaker"}'
+
+    command = cli._agent_visual_audit_command(
+        agent="codex",
+        args=SimpleNamespace(codex_bin="codex"),
+        workspace=tmp_path,
+        output_dir=tmp_path,
+        bundle={"schema": tmp_path / "response.schema.json"},
+        manifest={
+            "calibrations": [{"frame": str(calibration)}],
+            "samples": [{"frame": str(sample)}],
+        },
+        response_path=tmp_path / "response.json",
+        prompt=prompt,
+    )
+
+    assert command[-2:] == ["--", prompt]
+    assert command.count("--image") == 2
+    assert command[command.index("--image") + 1] == str(calibration)
+
+
+def test_visual_agent_audit_reuses_only_a_valid_matching_manifest(tmp_path):
+    audit_dir = tmp_path / "work" / "agent_visual_audit"
+    responses_dir = audit_dir / "responses"
+    responses_dir.mkdir(parents=True)
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"frame")
+    manifest = {
+        "calibrations": [],
+        "samples": [
+            {
+                "sample_id": "sample-001",
+                "layout": None,
+                "expected_name": "John",
+                "expected_slot": "top_center",
+                "frame": str(frame),
+                "frame_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    manifest["manifest_sha256"] = hashlib.sha256(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    write_json(
+        responses_dir / "codex.normalized.json",
+        {
+            "status": "ok",
+            "agent": "codex",
+            "batches": [{"batch": 1, "status": "ok"}],
+            "response": {
+                "format": "meeting-minutes/agent-visual-audit-v1",
+                "agent": "codex",
+                "overall_verdict": "pass",
+                "manifest_sha256": manifest["manifest_sha256"],
+                "calibrations": [],
+                "samples": [
+                    {
+                        "sample_id": "sample-001",
+                        "green_highlight": "visible",
+                        "observed_name": "John",
+                        "verdict": "confirm",
+                    }
+                ],
+            },
+        },
+    )
+
+    reused, status = cli._reuse_matching_agent_visual_audit(
+        audit_dir=audit_dir,
+        agent="codex",
+        manifest=manifest,
+    )
+
+    assert reused is not None
+    assert status is not None
+    assert status["reused_matching_manifest"] is True
+    assert reused["samples"][0]["confirmed"] is True
+    mismatched, mismatched_status = cli._reuse_matching_agent_visual_audit(
+        audit_dir=audit_dir,
+        agent="codex",
+        manifest={**manifest, "manifest_sha256": "other-manifest"},
+    )
+    assert mismatched is None
+    assert mismatched_status is None
+
+
+def test_agent_visual_audit_keeps_completed_batches_when_a_later_batch_times_out(
+    tmp_path,
+    monkeypatch,
+):
+    audit_dir = tmp_path / "work" / "agent_visual_audit"
+    audit_dir.mkdir(parents=True)
+    schema_path = audit_dir / "response.schema.json"
+    write_json(schema_path, {})
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"frame")
+    manifest = {
+        "format": "meeting-minutes/agent-visual-audit-v1",
+        "manifest_sha256": "test-manifest",
+        "calibrations": [],
+        "samples": [
+            {
+                "sample_id": "sample-001",
+                "layout": None,
+                "expected_name": "John",
+                "expected_slot": "top_left",
+                "start": 1.0,
+                "frame": str(frame),
+            },
+            {
+                "sample_id": "sample-002",
+                "layout": None,
+                "expected_name": "John",
+                "expected_slot": "top_left",
+                "start": 2.0,
+                "frame": str(frame),
+            },
+            {
+                "sample_id": "sample-003",
+                "layout": None,
+                "expected_name": "John",
+                "expected_slot": "top_left",
+                "start": 3.0,
+                "frame": str(frame),
+            },
+        ],
+    }
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        request = json.loads(command[-1])
+        response = {
+            "format": "meeting-minutes/agent-visual-audit-v1",
+            "agent": "cursor",
+            "overall_verdict": "pass",
+            "calibrations": [],
+            "samples": [
+                {
+                    "sample_id": sample["sample_id"],
+                    "green_highlight": "visible",
+                    "observed_name": "John",
+                    "verdict": "confirm",
+                }
+                for sample in request["samples"]
+            ],
+        }
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(response), stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result, status = cli._run_agent_visual_audit(
+        agent="cursor",
+        args=SimpleNamespace(
+            cursor_bin="cursor-agent",
+            cursor_model="cursor-grok-4.5-high",
+            codex_bin="codex",
+            timeout=1,
+            batch_size=1,
+        ),
+        workspace=tmp_path,
+        output_dir=tmp_path,
+        bundle={"directory": audit_dir, "schema": schema_path},
+        manifest=manifest,
+    )
+
+    assert status["status"] == "partial"
+    assert status["failed_batches"][0]["error"] == "timeout"
+    assert calls == 2
+    assert result is not None
+    assert [sample["sample_id"] for sample in result["samples"]] == ["sample-001"]
+
+
+def test_agent_visual_audit_retries_one_empty_success_response(tmp_path, monkeypatch):
+    audit_dir = tmp_path / "work" / "agent_visual_audit"
+    audit_dir.mkdir(parents=True)
+    schema_path = audit_dir / "response.schema.json"
+    write_json(schema_path, {})
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"frame")
+    manifest = {
+        "format": "meeting-minutes/agent-visual-audit-v1",
+        "manifest_sha256": "test-manifest",
+        "calibrations": [],
+        "samples": [
+            {
+                "sample_id": "sample-001",
+                "layout": None,
+                "expected_name": "John",
+                "expected_slot": "top_left",
+                "start": 1.0,
+                "frame": str(frame),
+            }
+        ],
+    }
+    calls = 0
+
+    def fake_run(command, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        request = json.loads(command[-1])
+        response = {
+            "format": "meeting-minutes/agent-visual-audit-v1",
+            "agent": "cursor",
+            "overall_verdict": "pass",
+            "calibrations": [],
+            "samples": [
+                {
+                    "sample_id": sample["sample_id"],
+                    "green_highlight": "visible",
+                    "observed_name": "John",
+                    "verdict": "confirm",
+                }
+                for sample in request["samples"]
+            ],
+        }
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(response), stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result, status = cli._run_agent_visual_audit(
+        agent="cursor",
+        args=SimpleNamespace(
+            cursor_bin="cursor-agent",
+            cursor_model="cursor-grok-4.5-high",
+            codex_bin="codex",
+            timeout=1,
+            batch_size=1,
+        ),
+        workspace=tmp_path,
+        output_dir=tmp_path,
+        bundle={"directory": audit_dir, "schema": schema_path},
+        manifest=manifest,
+    )
+
+    assert status["status"] == "ok"
+    assert calls == 2
+    assert result is not None
+    assert result["samples"][0]["confirmed"] is True
+    assert status["batches"][0]["attempts"][0]["validation_errors"] == [
+        "response_not_json_object"
+    ]
 
 
 def test_voice_template_accepts_multiple_known_names(tmp_path):
@@ -235,7 +692,48 @@ def test_visual_voice_skip_retracts_prior_voiceprint_labels_on_visual_mismatch(t
     assert read_json(tmp_path / "same_session_visual_voice_registry.json")["status"] == "skipped_visual_identity_recording_mismatch"
 
 
-def test_visual_voice_invalid_config_persists_retraction(tmp_path):
+def test_visual_voice_requires_current_complete_agent_audit_for_direct_visual_names(tmp_path):
+    recording = tmp_path / "recording.mov"
+    recording.write_bytes(b"recording")
+    audio = tmp_path / "work" / "audio_16k_mono.wav"
+    audio.parent.mkdir()
+    audio.write_bytes(b"unused because identity audit blocks first")
+    write_json(
+        tmp_path / "metadata.json",
+        {"effective_input": str(recording), "duration": 10.0, "source_offset": 0.0},
+    )
+    write_json(
+        tmp_path / "transcript.json",
+        [
+            {
+                "id": "seg_00001",
+                "start": 1.0,
+                "end": 2.0,
+                "speaker": "Speaker 3",
+                "text": "I will follow up.",
+                "name": "Billy",
+                "name_source": "visual_active_speaker_highlight",
+                "name_confidence": 0.94,
+            }
+        ],
+    )
+
+    assert cli.visual_voice_identify_existing(
+        SimpleNamespace(output_dir=tmp_path, config=None, speechbrain_cache=None, visual_identity_path=None)
+    ) == 0
+
+    segment = read_json(tmp_path / "transcript.json")[0]
+    assert segment.get("name") is None
+    status = read_json(tmp_path / "run_status.json")["statuses"]["visual_voice_identity"]
+    assert status["status"] == "skipped_identity_audit_not_publishable"
+    assert status["identity_audit_status"]["publishable"] is False
+    registry = read_json(tmp_path / "same_session_visual_voice_registry.json")
+    assert registry["status"] == "skipped_identity_audit_not_publishable"
+
+
+def test_visual_voice_without_confirmed_visual_intervals_persists_retraction(
+    tmp_path,
+):
     recording = tmp_path / "recording.mov"
     recording.write_bytes(b"recording")
     recording_provenance = cli._visual_recording_provenance(recording, 10.0)
@@ -275,24 +773,25 @@ def test_visual_voice_invalid_config_persists_retraction(tmp_path):
             ],
         },
     )
-    invalid_config = tmp_path / "invalid-visual-voice-config.json"
-    write_json(invalid_config, {"settings": {"minimum_score": 0}})
-
-    with pytest.raises(ValueError, match="minimum_score"):
+    assert (
         cli.visual_voice_identify_existing(
             SimpleNamespace(
                 output_dir=tmp_path,
-                config=invalid_config,
+                config=None,
                 speechbrain_cache=None,
                 visual_identity_path=None,
             )
         )
+        == 0
+    )
 
     assert read_json(tmp_path / "transcript.json")[0].get("name") is None
     voice_status = read_json(tmp_path / "run_status.json")["statuses"]["visual_voice_identity"]
-    assert voice_status["status"] == "failed_visual_voice_revalidation"
+    assert voice_status["status"] == "skipped_no_direct_visual_enrollment_frames"
     assert voice_status["cleared_prior_visual_voice_assignments"] == 1
-    assert read_json(tmp_path / "same_session_visual_voice_registry.json")["status"] == "failed_visual_voice_revalidation"
+    assert read_json(tmp_path / "same_session_visual_voice_registry.json")["status"] == (
+        "skipped_no_direct_visual_enrollment_frames"
+    )
 
 
 def test_visual_voice_missing_explicit_visual_artifact_persists_retraction(tmp_path):
@@ -477,19 +976,24 @@ def test_direct_visual_cluster_failure_persists_retraction(tmp_path):
             ],
         },
     )
-    invalid_config = tmp_path / "invalid-cluster-config.json"
-    write_json(invalid_config, {"settings": {"minimum_turn_frame_votes": 0}})
-
-    with pytest.raises(ValueError, match="minimum_turn_frame_votes"):
+    assert (
         cli.direct_visual_cluster_identify_existing(
-            SimpleNamespace(output_dir=tmp_path, config=invalid_config, visual_identity_path=None)
+            SimpleNamespace(
+                output_dir=tmp_path,
+                config=None,
+                visual_identity_path=None,
+            )
         )
+        == 0
+    )
 
     assert read_json(tmp_path / "transcript.json")[0].get("name") is None
     cluster_status = read_json(tmp_path / "run_status.json")["statuses"]["direct_visual_cluster_identity"]
-    assert cluster_status["status"] == "failed_direct_visual_cluster_revalidation"
+    assert cluster_status["status"] == "skipped_no_direct_visual_active_frames"
     assert cluster_status["cleared_prior_cluster_assignments"] == 1
-    assert read_json(tmp_path / "direct_visual_cluster_identity.json")["status"] == "failed_direct_visual_cluster_revalidation"
+    assert read_json(tmp_path / "direct_visual_cluster_identity.json")["status"] == (
+        "skipped_no_direct_visual_active_frames"
+    )
 
 
 def test_visual_voice_command_accepts_explicit_visual_identity_artifact():
@@ -610,6 +1114,67 @@ def test_publish_minutes_validates_before_atomically_writing_canonical_document(
     assert "Riley" in (tmp_path / "share" / "transcript.md").read_text(encoding="utf-8")
     assert (tmp_path / "work" / "review" / "minutes.coverage.json").is_file()
     assert not (tmp_path / "minutes.coverage.json").exists()
+
+
+def test_publish_minutes_blocks_direct_visual_names_without_a_complete_agent_audit(tmp_path, capsys):
+    reviewed = tmp_path / "minutes.reviewed.md"
+    english_reviewed = tmp_path / "minutes.reviewed.en.md"
+    reviewed.write_text(
+        "\n".join(
+            [
+                "# 会议纪要",
+                "",
+                "## 议题与结论",
+                "",
+                "### 1. 议题（00:00-01:00）",
+                "- 现状：已确认当前状态。",
+                "- 讨论结果：形成了当前共识。",
+                "",
+                "## 项目进展",
+                "",
+                "- 本次未出现可发布的项目进展。",
+                "",
+                "## 已确认决定",
+                "",
+                "- 本次未出现可验证的最终决定。",
+                "",
+                "## 行动项",
+                "",
+                "- 本次未出现可发布的明确行动项。",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    english_reviewed.write_text(_english_minutes(), encoding="utf-8")
+    transcript = [
+        {
+            "start": 0.0,
+            "end": 59.0,
+            "speaker": "Speaker 1",
+            "name": "Riley",
+            "name_source": "visual_active_speaker_highlight",
+            "name_confidence": 0.95,
+            "text": "We reviewed the current status.",
+        }
+    ]
+    write_json(tmp_path / "transcript.json", transcript)
+    write_json(tmp_path / "action_items.json", build_action_ledger(transcript))
+    write_json(tmp_path / "metadata.json", {"duration": 60.0})
+
+    result = publish_minutes_file(
+        SimpleNamespace(
+            output_dir=tmp_path,
+            source=reviewed,
+            english_source=english_reviewed,
+            duration=0.0,
+            action_evidence=None,
+        )
+    )
+
+    assert result == 1
+    assert "publication_identity_audit_not_publishable:not_available_fail_closed" in capsys.readouterr().err
+    assert not (tmp_path / "share" / "minutes.md").exists()
 
 
 def test_publish_minutes_rejects_action_rows_without_internal_evidence(tmp_path, capsys):

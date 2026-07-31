@@ -22,6 +22,7 @@ from meeting_minutes.smart_minutes import (
     build_theme_merge_messages,
     build_theme_outline_messages,
     canonical_transcript_records,
+    combine_minutes_languages,
     flatten_theme_candidates,
     follow_up_context_hints,
     generate_smart_minutes,
@@ -29,6 +30,7 @@ from meeting_minutes.smart_minutes import (
     requires_hierarchical_analysis,
     required_action_candidate_groups,
     render_smart_minutes,
+    repair_source_minutes_text_fields,
     sanitize_reviewed_smart_minutes,
     theme_count_bounds,
     transcript_record_chunks,
@@ -37,6 +39,7 @@ from meeting_minutes.smart_minutes import (
     validate_publication_gate,
     validate_smart_minutes,
     validate_source_minutes,
+    validate_translation_against_source,
     validate_theme_chunk,
     validate_theme_merge,
     validate_theme_outline,
@@ -176,6 +179,446 @@ def _source_payload(segment_ids: list[str], *, english: bool = False) -> dict:
     }
 
 
+def test_translation_alignment_accepts_equivalent_number_weekday_and_compound_tokens():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["themes"][0]["title"] = "Web相关Box于周四（6日）进行41%复核"
+    translation["themes"][0]["title"] = (
+        "Review Web-related Box on Thursday (6th) after a forty-one percent check"
+    )
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert errors == []
+    bilingual, combine_errors = combine_minutes_languages(source, translation)
+    assert combine_errors == []
+    assert bilingual is not None
+
+
+def test_translation_alignment_accepts_chinese_percentage_numerals_and_lowercase_identifiers():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["project_updates"][0]["project"] = "API网关"
+    source["project_updates"][0]["update"] = "价格削减百分之四十一，需提高效率。"
+    translation["project_updates"][0]["project"] = "api gateway"
+    translation["project_updates"][0]["update"] = (
+        "A forty-one percent price cut requires higher efficiency."
+    )
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert errors == []
+
+
+def test_translation_alignment_accepts_chinese_year_duration():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["project_updates"][0]["update"] = "两年降价41%，需要提高效率。"
+    translation["project_updates"][0]["update"] = (
+        "A 41% price reduction over two years requires higher efficiency."
+    )
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert errors == []
+
+
+def test_translation_alignment_accepts_only_pronoun_for_chinese_single_person():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["project_updates"][0]["update"] = "目前仅由一人维护该系统。"
+    translation["project_updates"][0]["update"] = (
+        "Currently, the system is maintained only by him."
+    )
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert errors == []
+
+
+def test_translation_alignment_accepts_solely_pronoun_for_chinese_single_person():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["project_updates"][0]["update"] = "目前BPS仅由他一人维护。"
+    translation["project_updates"][0]["update"] = "Currently, BPS is maintained solely by him."
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert errors == []
+
+
+def test_translation_alignment_rejects_changed_chinese_percentage_numerals():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["project_updates"][0]["update"] = "价格削减四十一个百分点，需提高效率。"
+    translation["project_updates"][0]["update"] = (
+        "A fifty percentage-point price cut requires higher efficiency."
+    )
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert "translation_project_update:1:update:number_mismatch" in errors
+
+
+def test_translation_alignment_rejects_dropped_or_changed_numbers():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["project_updates"][0]["update"] = "价格削减41%，需提高效率。"
+    translation["project_updates"][0]["update"] = "A 50% price cut requires higher efficiency."
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert "translation_project_update:1:update:number_mismatch" in errors
+
+
+def test_translation_alignment_rejects_dropped_source_technical_identifier():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["project_updates"][0]["project"] = "API网关"
+    translation["project_updates"][0]["project"] = "Gateway"
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert "translation_project_update:1:project:source_token_missing:api" in errors
+
+
+def test_translation_alignment_rejects_malformed_target_before_merge():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    del translation["themes"][0]["title"]
+
+    errors = validate_translation_against_source(source, translation)
+    bilingual, combine_errors = combine_minutes_languages(source, translation)
+
+    assert "translation_target:themes:1:keys_invalid" in errors
+    assert bilingual is None
+    assert "translation_target:themes:1:keys_invalid" in combine_errors
+
+
+def test_publishable_translation_rejects_masking_artifact():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["themes"][0]["current_state"] = "需要通过接口重新测试。"
+    translation["themes"][0]["current_state"] = (
+        "A retest is needed through the relevant interface."
+    )
+
+    bilingual, errors = smart_minutes.combine_publishable_minutes_languages(
+        source,
+        translation,
+    )
+
+    assert bilingual is None
+    assert errors == [
+        "translation_quality:theme:1:current_state:quality_degraded_placeholder"
+    ]
+
+
+def test_translation_alignment_rejects_pending_operation_as_completed():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    source["themes"][0]["current_state"] = "地址生成需要通过BPS接口重新测试。"
+    translation["themes"][0]["current_state"] = (
+        "Address generation was retested through the BPS interface."
+    )
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert errors == [
+        "translation_theme:1:current_state:status_completion_mismatch:retest"
+    ]
+
+
+def test_validate_smart_minutes_rejects_requested_retest_as_completed():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "pending-retest",
+                "start": 0.0,
+                "end": 12.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": (
+                    "I need your help to retest address generation through the BPS "
+                    "interface."
+                ),
+            }
+        ]
+    )
+    minutes = {
+        "themes": [
+            {
+                "title_zh": "地址重试",
+                "title_en": "Address Retest",
+                "current_state_zh": "地址生成已通过BPS接口重新测试。",
+                "current_state_en": (
+                    "Address generation was retested through the BPS interface."
+                ),
+                "outcome_zh": "讨论形成方向，尚未决定。",
+                "outcome_en": "Direction discussed, not yet decided.",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+
+    cleaned, errors = validate_smart_minutes(
+        minutes,
+        transcript_records=records,
+        required_project_participants=[],
+    )
+
+    assert cleaned is None
+    assert errors == [
+        "theme:1:current_state:status_unsupported_completion:retest"
+    ]
+
+
+def test_status_fidelity_uses_adjacent_segment_for_split_request():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "pending-retest",
+                "start": 0.0,
+                "end": 6.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "I need your help to retest that particular issue.",
+            },
+            {
+                "id": "retest-context",
+                "start": 6.0,
+                "end": 12.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "Use the BPS interface to generate the address once again.",
+            },
+        ]
+    )
+    minutes = {
+        "themes": [
+            {
+                "title_zh": "地址重试",
+                "title_en": "Address Retest",
+                "current_state_zh": "地址生成已通过BPS接口重新测试。",
+                "current_state_en": (
+                    "Address generation was retested through the BPS interface."
+                ),
+                "outcome_zh": "讨论形成方向，尚未决定。",
+                "outcome_en": "Direction discussed, not yet decided.",
+                "evidence_segment_ids": [records[1]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+
+    cleaned, errors = validate_smart_minutes(
+        minutes,
+        transcript_records=records,
+        required_project_participants=[],
+    )
+
+    assert cleaned is None
+    assert errors == [
+        "theme:1:current_state:status_unsupported_completion:retest"
+    ]
+
+
+def test_status_fidelity_rejects_completed_regeneration_for_requested_retest():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "requested-retest",
+                "start": 0.0,
+                "end": 6.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "I need your help to retest that particular issue.",
+            },
+            {
+                "id": "requested-regeneration",
+                "start": 6.0,
+                "end": 12.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "Use the BPS interface to try to generate the address once again.",
+            },
+        ]
+    )
+    minutes = {
+        "themes": [
+            {
+                "title_zh": "地址重试",
+                "title_en": "Address Retest",
+                "current_state_zh": "地址生成已通过BPS接口尝试重新生成。",
+                "current_state_en": "Address regeneration was attempted through BPS.",
+                "outcome_zh": "讨论形成方向，尚未决定。",
+                "outcome_en": "Direction discussed, not yet decided.",
+                "evidence_segment_ids": [records[1]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+
+    cleaned, errors = validate_smart_minutes(
+        minutes,
+        transcript_records=records,
+        required_project_participants=[],
+    )
+
+    assert cleaned is None
+    assert errors == [
+        "theme:1:current_state:status_unsupported_completion:retest"
+    ]
+
+
+def test_status_fidelity_allows_completed_retest_when_evidence_confirms_it():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "completed-retest",
+                "start": 0.0,
+                "end": 12.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "We completed the retest through the BPS interface.",
+            }
+        ]
+    )
+    minutes = {
+        "themes": [
+            {
+                "title_zh": "地址重试",
+                "title_en": "Address Retest",
+                "current_state_zh": "地址生成已通过BPS接口重新测试。",
+                "current_state_en": (
+                    "Address generation was retested through the BPS interface."
+                ),
+                "outcome_zh": "讨论形成方向，尚未决定。",
+                "outcome_en": "Direction discussed, not yet decided.",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+
+    cleaned, errors = validate_smart_minutes(
+        minutes,
+        transcript_records=records,
+        required_project_participants=[],
+    )
+
+    assert cleaned is not None
+    assert errors == []
+
+
+def test_status_fidelity_keeps_completion_and_later_request_separate():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "completed-retest-pending-access",
+                "start": 0.0,
+                "end": 24.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": (
+                    "Address generation was retested through BPS. We need to continue "
+                    "production network investigation, log review, permission confirmation, "
+                    "and incident review, and request Cloudflare email access for Kirill."
+                ),
+            }
+        ]
+    )
+    minutes = {
+        "themes": [
+            {
+                "title_zh": "地址重试与访问请求",
+                "title_en": "Address Retest and Access Request",
+                "current_state_zh": (
+                    "地址生成已通过BPS接口重新测试。团队需要推进生产网络的只读排查、"
+                    "日志核对、权限确认和故障复盘，并请求为Kirill添加Cloudflare邮件访问。"
+                ),
+                "current_state_en": (
+                    "Address generation was retested through BPS. The team needs to continue "
+                    "production network investigation, log review, permission confirmation, "
+                    "and incident review, and requests Cloudflare email access for Kirill."
+                ),
+                "outcome_zh": "讨论形成方向，尚未决定。",
+                "outcome_en": "Direction discussed, not yet decided.",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+
+    cleaned, errors = validate_smart_minutes(
+        minutes,
+        transcript_records=records,
+        required_project_participants=[],
+    )
+
+    assert cleaned is not None
+    assert errors == []
+
+
+def test_translation_alignment_rejects_owner_or_evidence_drift():
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    source = _source_payload(segment_ids)
+    translation = _source_payload(segment_ids, english=True)
+    translation["actions"][0]["owner"] = "Xin"
+    translation["themes"][0]["key_points"][0]["segment_ids"] = [segment_ids[1]]
+
+    errors = validate_translation_against_source(source, translation)
+
+    assert "translation_action:1:owner_mismatch" in errors
+    assert "translation_theme:1:point:1:evidence_mismatch" in errors
+
+
 def _publication_review(
     minutes: dict,
     *,
@@ -232,6 +675,173 @@ def _action_scout(records: list[dict]) -> dict:
             }
         ]
     }
+
+
+def test_direct_requested_follow_up_is_retained_without_guessing_the_recipient():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "request",
+                "start": 117.0,
+                "end": 126.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "William might be Sebastian. I need your help here to retest that one particular thing.",
+            },
+            {
+                "id": "scope",
+                "start": 126.0,
+                "end": 135.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "Use the BPS interface to generate the NPC address again.",
+            },
+        ]
+    )
+
+    candidates = smart_minutes.explicit_requested_follow_up_candidates(records)
+
+    assert len(candidates) == 1
+    assert candidates[0]["owner"] == "待确认"
+    assert candidates[0]["basis"] == "requested_follow_up"
+    assert candidates[0]["must_keep"] is True
+    assert candidates[0]["unassigned_explicit_request"] is True
+    assert candidates[0]["segment_ids"] == [record["segment_id"] for record in records]
+
+    minutes = {
+        "themes": [
+            {
+                "title": "BPS retest request",
+                "current_state": "A BPS retest was requested.",
+                "outcome": "The speaker asked for help to retest BPS address generation.",
+                "evidence_segment_ids": [record["segment_id"] for record in records],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [
+            {
+                "owner": "待确认",
+                "item": "Retest BPS address generation.",
+                "segment_ids": [record["segment_id"] for record in records],
+            }
+        ],
+    }
+    cleaned, source_errors = validate_source_minutes(
+        minutes,
+        transcript_records=records,
+        required_project_participants=[],
+    )
+
+    assert source_errors == []
+    assert cleaned is not None
+    review = _publication_review(
+        cleaned,
+        candidate_dispositions=[
+            {
+                "candidate_index": 1,
+                "disposition": "kept",
+                "action_index": 1,
+                "reason_code": "supported",
+                "reason": "The direct request requires a BPS retest.",
+            }
+        ],
+    )
+    review["action_support"][0]["basis"] = "requested_follow_up"
+
+    assert validate_publication_gate(
+        review,
+        cleaned,
+        transcript_records=records,
+        action_scout=candidates,
+    ) == []
+
+
+def _collapsed_must_keep_fixture() -> tuple[list[dict], dict, dict, list[dict]]:
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "commitment-prepare",
+                "start": 0.0,
+                "end": 12.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "text": "I will prepare the product document.",
+            },
+            {
+                "id": "commitment-start",
+                "start": 240.0,
+                "end": 252.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "text": "I will prepare the technical brief.",
+            },
+            {
+                "id": "commitment-send",
+                "start": 480.0,
+                "end": 492.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "text": "I will send the document before Thursday.",
+            },
+        ]
+    )
+    combined_ids = [record["segment_id"] for record in records]
+    minutes = {
+        "themes": [],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [
+            {
+                "owner": "John",
+                "item": "准备产品文档、开始编写技术说明，并在周四前发送文档。",
+                "segment_ids": combined_ids,
+            }
+        ],
+    }
+    scout = [
+        {
+            "owner": "John",
+            "item": "准备产品说明文档。",
+            "segment_ids": [records[0]["segment_id"]],
+            "basis": "self_commitment",
+            "must_keep": True,
+        },
+        {
+            "owner": "John",
+            "item": "准备技术说明。",
+            "segment_ids": [records[1]["segment_id"]],
+            "basis": "self_commitment",
+            "must_keep": True,
+        },
+        {
+            "owner": "John",
+            "item": "在周四前发送文档。",
+            "segment_ids": [records[2]["segment_id"]],
+            "basis": "self_commitment",
+            "must_keep": True,
+        },
+    ]
+    review = _publication_review(
+        minutes,
+        candidate_dispositions=[
+            {
+                "candidate_index": index,
+                "disposition": "kept",
+                "action_index": 1,
+                "reason_code": "supported",
+                "reason": "The cited evidence supports this commitment.",
+            }
+            for index in range(1, 4)
+        ],
+    )
+    return records, minutes, review, scout
 
 
 def _implicit_follow_up_scout() -> dict:
@@ -295,6 +905,196 @@ def test_theme_outline_accepts_one_coherent_short_meeting_theme():
     assert outline is not None
     assert outline[0]["start"] == 0.0
     assert outline[0]["end"] == 70.0
+
+
+def test_grouped_theme_fallback_refuses_unproven_merge():
+    candidates = [
+        {
+            "candidate_index": 1,
+            "title": "Client GitLab migration",
+            "start_segment_id": "seg-1",
+            "end_segment_id": "seg-1",
+            "anchor_segment_ids": ["seg-1"],
+        },
+        {
+            "candidate_index": 2,
+            "title": "Operational security review",
+            "start_segment_id": "seg-2",
+            "end_segment_id": "seg-2",
+            "anchor_segment_ids": ["seg-2"],
+        },
+    ]
+
+    payload = smart_minutes._grouped_theme_merge_fallback(
+        candidates,
+        target_theme_count=1,
+    )
+
+    assert payload is None
+
+    preserved = smart_minutes._grouped_theme_merge_fallback(
+        candidates,
+        target_theme_count=2,
+    )
+    assert preserved is not None
+    assert [theme["title"] for theme in preserved["themes"]] == [
+        "Client GitLab migration",
+        "Operational security review",
+    ]
+
+
+def test_theme_merge_candidate_coverage_repair_rebuilds_stale_indexes():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "coverage-1",
+                "start": 0.0,
+                "end": 100.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "First topic.",
+            },
+            {
+                "id": "coverage-2",
+                "start": 110.0,
+                "end": 220.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "Second topic.",
+            },
+        ]
+    )
+    candidates = [
+        {
+            "candidate_index": index + 1,
+            "chunk_index": 1,
+            "local_topic_index": index + 1,
+            "title": f"Topic {index + 1}",
+            "summary": f"Topic {index + 1} summary.",
+            "importance": "substantive",
+            "start_segment_id": record["segment_id"],
+            "end_segment_id": record["segment_id"],
+            "anchor_segment_ids": [record["segment_id"]],
+            "start_position": index,
+            "end_position": index,
+            "start": record["start"],
+            "end": record["end"],
+        }
+        for index, record in enumerate(records)
+    ]
+    payload = {
+        "read_marker": {"candidate_count": 2, "last_candidate_index": 2},
+        "themes": [
+            {
+                "title": "Combined delivery question",
+                "start_segment_id": records[0]["segment_id"],
+                "end_segment_id": records[1]["segment_id"],
+                "anchor_segment_ids": [records[0]["segment_id"]],
+                "boundary_reason": "One parent delivery question.",
+                "source_candidate_indexes": [3, 4],
+            }
+        ],
+    }
+
+    repaired, changes = smart_minutes._repair_theme_merge_candidate_coverage(
+        payload,
+        candidates=candidates,
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert changes == ["repaired_theme_merge_candidate_coverage:1"]
+    assert repaired["themes"][0]["source_candidate_indexes"] == [1, 2]
+    outline, errors = validate_theme_merge(
+        repaired,
+        candidates=candidates,
+        transcript_records=records,
+        min_theme_count=1,
+        max_theme_count=1,
+    )
+    assert errors == []
+    assert outline is not None
+
+
+def test_theme_merge_prompt_fingerprints_the_planner_policy():
+    records = canonical_transcript_records(_segments())
+    candidates = [
+        {
+            "candidate_index": 1,
+            "chunk_index": 1,
+            "local_topic_index": 1,
+            "title": "Delivery visibility",
+            "summary": "Discussed delivery visibility.",
+            "importance": "substantive",
+            "start_segment_id": records[0]["segment_id"],
+            "end_segment_id": records[1]["segment_id"],
+            "anchor_segment_ids": [records[0]["segment_id"]],
+            "start": records[0]["start"],
+            "end": records[1]["end"],
+        }
+    ]
+
+    messages = build_theme_merge_messages(
+        candidates,
+        transcript_records=records,
+        min_theme_count=1,
+        max_theme_count=1,
+    )
+
+    assert json.loads(messages[1]["content"])["planner_policy_version"] == (
+        smart_minutes.THEME_MERGE_POLICY_VERSION
+    )
+
+
+def test_cross_chunk_boundary_normalization_assigns_overlap_to_one_theme():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": f"boundary-{index}",
+                "start": float(index * 10),
+                "end": float(index * 10 + 8),
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": f"Topic record {index}.",
+            }
+            for index in range(3)
+        ]
+    )
+    candidates = [
+        {
+            "title": "First topic",
+            "start_segment_id": records[0]["segment_id"],
+            "end_segment_id": records[1]["segment_id"],
+            "anchor_segment_ids": [records[0]["segment_id"]],
+            "start_position": 0,
+            "end_position": 1,
+            "start": records[0]["start"],
+            "end": records[1]["end"],
+        },
+        {
+            "title": "Second topic",
+            "start_segment_id": records[1]["segment_id"],
+            "end_segment_id": records[2]["segment_id"],
+            "anchor_segment_ids": [records[1]["segment_id"]],
+            "start_position": 1,
+            "end_position": 2,
+            "start": records[1]["start"],
+            "end": records[2]["end"],
+        },
+    ]
+
+    normalized, changes = smart_minutes._normalize_cross_chunk_candidate_boundaries(
+        candidates,
+        transcript_records=records,
+    )
+
+    assert changes == ["trimmed_cross_chunk_overlap_before:2"]
+    assert normalized[1]["start_position"] == 2
+    assert normalized[1]["start_segment_id"] == records[2]["segment_id"]
+    assert normalized[1]["anchor_segment_ids"] == [records[2]["segment_id"]]
 
 
 def test_long_theme_outline_rejects_count_overlap_and_short_residual_theme():
@@ -1453,6 +2253,258 @@ def test_theme_candidate_reduction_accepts_short_intermediate_macro_topic(
     assert len(reduced_themes) == 1
 
 
+def test_theme_candidate_reduction_compacts_grounded_overlong_title(
+    monkeypatch,
+):
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "centralization-topic",
+                "start": 120.0,
+                "end": 180.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "Centralize services to reduce dependency on the Russian team.",
+            }
+        ]
+    )
+    candidate = {
+        "candidate_index": 1,
+        "chunk_index": 1,
+        "local_topic_index": 1,
+        "title": "Intermediate operational discussion",
+        "summary": "The team discussed service centralization.",
+        "importance": "substantive",
+        "start_segment_id": records[0]["segment_id"],
+        "end_segment_id": records[0]["segment_id"],
+        "anchor_segment_ids": [records[0]["segment_id"]],
+        "start_position": 0,
+        "end_position": 0,
+        "start": records[0]["start"],
+        "end": records[0]["end"],
+    }
+    initial_response = {
+        "read_marker": {"candidate_count": 1, "last_candidate_index": 1},
+        "themes": [
+            {
+                "title": (
+                    "How to centralize services to reduce dependency on Russian team?"
+                ),
+                "start_segment_id": records[0]["segment_id"],
+                "end_segment_id": records[0]["segment_id"],
+                "anchor_segment_ids": [records[0]["segment_id"]],
+                "boundary_reason": "Service centralization is the specific topic.",
+                "source_candidate_indexes": [1],
+            }
+        ],
+    }
+    repaired_response = copy.deepcopy(initial_response)
+    repaired_response["themes"][0]["title"] = (
+        "What is the rationale for centralizing Russian team services?"
+    )
+    request_count = 0
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        nonlocal request_count
+        request_count += 1
+        response = initial_response if request_count == 1 else repaired_response
+        return response, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+    macro_candidates, reduced_themes, status = (
+        smart_minutes._run_theme_candidate_reductions(
+            candidates=[candidate],
+            records=records,
+            config=DeepSeekConfig(model="test-model"),
+            cache={"theme_outline_reductions": []},
+            save_checkpoint=lambda: None,
+        )
+    )
+
+    assert request_count == 2
+    assert status["status"] == "ok"
+    assert macro_candidates is not None
+    assert reduced_themes[0]["title"] == (
+        "Rationale for centralizing Russian team services"
+    )
+    assert reduced_themes[0]["start_segment_id"] == records[0]["segment_id"]
+    assert reduced_themes[0]["end_segment_id"] == records[0]["segment_id"]
+    assert reduced_themes[0]["anchor_segment_ids"] == [records[0]["segment_id"]]
+    assert reduced_themes[0]["source_candidate_indexes"] == [1]
+    assert status["groups"][0]["status"]["deterministic_title_repair"] == [
+        {
+            "before": (
+                "What is the rationale for centralizing Russian team services?"
+            ),
+            "after": "Rationale for centralizing Russian team services",
+        }
+    ]
+
+
+def test_theme_count_repair_guidance_requires_exact_adjacent_partition():
+    guidance = smart_minutes._validation_repair_guidance(
+        ["theme_outline_count_out_of_range:25!=10-10"]
+    )
+
+    assert guidance == [
+        (
+            "Return exactly 10 chronological themes. Partition every source "
+            "candidate index into non-empty adjacent groups, consuming each index "
+            "exactly once. When more candidates than themes exist, merge the "
+            "closest neighboring candidates under one truthful parent business "
+            "question; do not preserve one theme per candidate, omit an index, "
+            "or invent an index."
+        )
+    ]
+
+
+def test_theme_merge_topology_repair_lists_exact_allowed_partition():
+    messages = smart_minutes._theme_merge_topology_repair_messages(
+        [{"role": "system", "content": "merge"}],
+        payload={"read_marker": {}, "themes": []},
+        errors=[
+            "theme_merge_candidate_unknown:4",
+            "theme_outline_count_out_of_range:3!=2-2",
+        ],
+        candidates=[
+            {"candidate_index": 1},
+            {"candidate_index": 2},
+            {"candidate_index": 3},
+        ],
+        min_theme_count=2,
+        max_theme_count=2,
+    )
+    repair_request = json.loads(messages[-1]["content"])
+
+    assert repair_request["required_theme_count"] == 2
+    assert repair_request["allowed_source_candidate_indexes"] == [1, 2, 3]
+    assert repair_request["required_source_candidate_partition"] == [1, 2, 3]
+    assert "never invent an index" in repair_request["hard_constraints"][0]
+
+
+def test_one_pass_review_repair_neutralizes_owner_and_narrows_evidence():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "one-pass-action-a",
+                "start": 0.0,
+                "end": 10.0,
+                "speaker": "Speaker 1",
+                "text": "We should follow up.",
+            },
+            {
+                "id": "one-pass-action-b",
+                "start": 200.0,
+                "end": 210.0,
+                "speaker": "Speaker 1",
+                "text": "Later discussion.",
+            },
+        ]
+    )
+    review = {
+        "findings": [],
+        "minutes": {
+            "themes": [],
+            "project_updates": [],
+            "decisions": [],
+            "actions": [
+                {
+                    "owner": "Unknown Person",
+                    "item": "跟进相关事项",
+                    "segment_ids": [
+                        records[0]["segment_id"],
+                        records[1]["segment_id"],
+                    ],
+                }
+            ],
+        },
+    }
+
+    repaired, changes = smart_minutes._deterministic_coverage_review_repair(
+        review,
+        errors=[
+            "action:1:owner_unknown",
+            "action:1:evidence_span_too_wide:210.0>120.0",
+        ],
+        action_scout=[],
+        transcript_records=records,
+        theme_outline=[],
+    )
+
+    assert repaired is not None
+    assert set(repaired) == {"findings", "minutes"}
+    assert repaired["minutes"]["actions"][0]["owner"] == "待确认"
+    assert repaired["minutes"]["actions"][0]["segment_ids"] == [
+        records[0]["segment_id"]
+    ]
+    assert changes == [
+        "neutralized_unknown_action_owner:1",
+        "narrowed_action_evidence:1",
+    ]
+
+
+def test_one_pass_review_repair_restores_missing_must_keep_action():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "john-deadline",
+                "start": 0.0,
+                "end": 8.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.99,
+                "name_source": "visual_active_speaker_highlight",
+                "text": "I will send the document before Thursday.",
+            }
+        ],
+        allow_cluster_name_consensus=False,
+    )
+    candidate = {
+        "owner": "John",
+        "item": "在周四前发送文档",
+        "segment_ids": [records[0]["segment_id"]],
+        "basis": "self_commitment",
+        "must_keep": True,
+    }
+    review = {
+        "findings": [],
+        "minutes": {
+            "themes": [],
+            "project_updates": [],
+            "decisions": [],
+            "actions": [],
+        },
+    }
+
+    assert smart_minutes.validate_must_keep_action_coverage(
+        review["minutes"],
+        [candidate],
+    ) == ["must_keep_action_missing:1"]
+
+    repaired, changes = smart_minutes._deterministic_coverage_review_repair(
+        review,
+        errors=["must_keep_action_missing:1"],
+        action_scout=[candidate],
+        transcript_records=records,
+        theme_outline=[],
+    )
+
+    assert repaired is not None
+    assert repaired["minutes"]["actions"] == [
+        {
+            "owner": "John",
+            "item": "在周四前发送文档",
+            "segment_ids": [records[0]["segment_id"]],
+        }
+    ]
+    assert smart_minutes.validate_must_keep_action_coverage(
+        repaired["minutes"],
+        [candidate],
+    ) == []
+    assert changes == ["restored_must_keep_action_candidate:1"]
+
+
 def test_long_meeting_theme_count_range_and_compact_evidence_packet():
     records = canonical_transcript_records(
         [
@@ -1526,7 +2578,46 @@ def test_long_meeting_theme_count_range_and_compact_evidence_packet():
             ]
         )
     ) == (5, 8)
+    assert theme_count_bounds(
+        canonical_transcript_records(
+            [
+                {
+                    "id": "full-duration",
+                    "start": 0.0,
+                    "end": 8506.68,
+                    "speaker": "Speaker 1",
+                    "name": "Billy",
+                    "name_confidence": 0.95,
+                    "text": "Full duration marker.",
+                }
+            ]
+        ),
+        macro_candidate_count=12,
+    ) == (9, 10)
     assert len(evidence) == len(records)
+
+
+def test_density_theme_bounds_require_a_span_feasible_macro_partition():
+    records = [{"end": 4795.0}]
+    feasible_macros = [
+        {"start": float(index * 200), "end": float(index * 200 + 190)}
+        for index in range(12)
+    ]
+    short_macros = [
+        {"start": float(index * 100), "end": float(index * 100 + 50)}
+        for index in range(12)
+    ]
+
+    assert smart_minutes._max_span_feasible_theme_count(feasible_macros) == 12
+    assert theme_count_bounds(
+        records,
+        macro_candidates=feasible_macros,
+    ) == (10, 10)
+    assert smart_minutes._max_span_feasible_theme_count(short_macros) == 4
+    assert theme_count_bounds(
+        records,
+        macro_candidates=short_macros,
+    ) == (3, 4)
 
 
 def test_hierarchical_long_meeting_never_sends_full_transcript_and_resumes(
@@ -3281,6 +4372,64 @@ def test_final_gate_rejects_false_unsupported_commitment_reason_for_owned_work()
     ]
 
 
+def test_direct_self_commitment_protection_recognizes_clear_variants():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "make-sure",
+                "start": 0.0,
+                "end": 8.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "name_source": "visual_active_speaker_highlight",
+                "text": "I'm going to make sure that we work on the document and present it.",
+            },
+            {
+                "id": "start-work",
+                "start": 9.0,
+                "end": 15.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "name_source": "visual_active_speaker_highlight",
+                "text": "I'll start working on it today.",
+            },
+            {
+                "id": "send-before-thursday",
+                "start": 16.0,
+                "end": 25.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "name_source": "visual_active_speaker_highlight",
+                "text": "I want to send the document before Thursday so the team can review it.",
+            },
+        ],
+        allow_cluster_name_consensus=False,
+    )
+    candidates = [
+        {
+            "owner": "John",
+            "item": "Prepare the document.",
+            "segment_ids": [record["segment_id"]],
+            "basis": "self_commitment",
+        }
+        for record in records
+    ]
+
+    smart_minutes._protect_direct_self_commitment_candidates(
+        candidates,
+        transcript_records=records,
+    )
+
+    assert all(
+        smart_minutes._positive_self_commitment([record])
+        for record in records
+    )
+    assert all(candidate.get("must_keep") is True for candidate in candidates)
+
+
 def test_final_gate_allows_rejection_of_an_incomplete_self_commitment():
     records = canonical_transcript_records(
         [
@@ -3590,6 +4739,223 @@ def test_deterministic_final_repair_drops_external_delivery_status_action():
     }
 
 
+def test_final_gate_rejects_collapsed_distinct_must_keep_candidates():
+    records, minutes, review, scout = _collapsed_must_keep_fixture()
+
+    errors = validate_publication_gate(
+        review,
+        minutes,
+        transcript_records=records,
+        action_scout=scout,
+    )
+
+    assert errors == [
+        "publication_gate_candidate_disposition:2:"
+        "must_keep_candidates_collapsed:1",
+        "publication_gate_candidate_disposition:3:"
+        "must_keep_candidates_collapsed:1",
+    ]
+
+
+def test_deterministic_final_repair_splits_collapsed_must_keep_candidates():
+    records, _minutes, review, scout = _collapsed_must_keep_fixture()
+    errors = validate_publication_gate(
+        review,
+        review["minutes"],
+        transcript_records=records,
+        action_scout=scout,
+    )
+    errors.append("action:1:evidence_span_too_wide:492.0>120.0")
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=errors,
+        action_scout=scout,
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert "split_must_keep_action:1:3" in changes
+    assert repaired["minutes"]["actions"] == [
+        {
+            "owner": candidate["owner"],
+            "item": candidate["item"],
+            "segment_ids": candidate["segment_ids"],
+        }
+        for candidate in scout
+    ]
+    assert [
+        disposition["action_index"]
+        for disposition in repaired["candidate_dispositions"]
+    ] == [1, 2, 3]
+    assert repaired["action_support"] == [
+        {
+            "action_index": index,
+            "segment_ids": candidate["segment_ids"],
+            "basis": candidate["basis"],
+        }
+        for index, candidate in enumerate(scout, start=1)
+    ]
+    assert validate_publication_gate(
+        repaired,
+        repaired["minutes"],
+        transcript_records=records,
+        action_scout=scout,
+    ) == []
+
+
+def test_deterministic_final_repair_restores_rejected_must_keep_candidate():
+    records, _minutes, _review, full_scout = _collapsed_must_keep_fixture()
+    scout = full_scout[:2]
+    minutes = {
+        "themes": [],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [
+            {
+                "owner": scout[0]["owner"],
+                "item": scout[0]["item"],
+                "segment_ids": scout[0]["segment_ids"],
+            }
+        ],
+    }
+    review = _publication_review(
+        minutes,
+        candidate_dispositions=[
+            {
+                "candidate_index": 1,
+                "disposition": "kept",
+                "action_index": 1,
+                "reason_code": "supported",
+                "reason": "The first commitment is supported.",
+            },
+            {
+                "candidate_index": 2,
+                "disposition": "rejected",
+                "action_index": None,
+                "reason_code": "unsupported_item",
+                "reason": "The second commitment is already covered.",
+            },
+        ],
+    )
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=[
+            "publication_gate_candidate_disposition:2:"
+            "must_keep_candidate_rejected"
+        ],
+        action_scout=scout,
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert "restored_supported_candidate:2" in changes
+    assert repaired["minutes"]["actions"][1] == {
+        "owner": scout[1]["owner"],
+        "item": scout[1]["item"],
+        "segment_ids": scout[1]["segment_ids"],
+    }
+    assert repaired["candidate_dispositions"][1]["action_index"] == 2
+    assert validate_publication_gate(
+        repaired,
+        repaired["minutes"],
+        transcript_records=records,
+        action_scout=scout,
+    ) == []
+
+
+def test_deterministic_final_repair_neutralizes_nested_theme_and_update_literals():
+    records = canonical_transcript_records(_segments())
+    minutes = _source_payload([record["segment_id"] for record in records])
+    minutes["themes"][0]["current_state"] = "当前方案仍在讨论，使用Kubernetes处理90%的流量。"
+    minutes["project_updates"][0]["update"] = "当前状态已记录，处理90%的流量。"
+    minutes["actions"] = []
+    review = _publication_review(minutes, candidate_dispositions=[])
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=[
+            "theme:1:current_state:named_entity_ungrounded:Kubernetes",
+            "theme:1:current_state:number_ungrounded:90",
+            "project_update:1:number_ungrounded:90",
+        ],
+        action_scout=[],
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert "dropped_ungrounded_theme_entity_clause:1:current_state" in changes
+    assert "neutralized_ungrounded_project_update_literals:1" in changes
+    assert "Kubernetes" not in repaired["minutes"]["themes"][0]["current_state"]
+    assert "90" not in repaired["minutes"]["themes"][0]["current_state"]
+    assert "90" not in repaired["minutes"]["project_updates"][0]["update"]
+
+
+def test_deterministic_final_repair_rebuilds_wide_follow_up_update():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "john-prepare",
+                "start": 0.0,
+                "end": 12.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "text": "I will prepare the product document.",
+            },
+            {
+                "id": "john-send",
+                "start": 300.0,
+                "end": 312.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "text": "I will send it before Thursday.",
+            },
+        ]
+    )
+    action = {
+        "owner": "John",
+        "item": "准备产品文档。",
+        "segment_ids": [records[0]["segment_id"]],
+    }
+    minutes = {
+        "themes": [],
+        "project_updates": [
+            {
+                "participant": "John",
+                "project": "后续跟进",
+                "update": "准备产品文档，并在周四前发送。",
+                "segment_ids": [
+                    records[0]["segment_id"],
+                    records[1]["segment_id"],
+                ],
+            }
+        ],
+        "decisions": [],
+        "actions": [action],
+    }
+    review = _publication_review(minutes)
+    scout = [{**action, "basis": "self_commitment"}]
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=["project_update:1:evidence_span_too_wide:312.0>120.0"],
+        action_scout=scout,
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert "rebuilt_project_update:1" in changes
+    assert repaired["minutes"]["project_updates"][0] == {
+        "participant": "John",
+        "project": "后续跟进",
+        "update": "准备产品文档。",
+        "segment_ids": [records[0]["segment_id"]],
+    }
+
+
 def test_final_gate_rejects_negated_self_commitment_support():
     segments = copy.deepcopy(_segments())
     segments[0]["text"] = "I will not review the latest invoice."
@@ -3682,6 +5048,7 @@ def test_final_review_prompt_is_a_precision_first_publication_gate():
     assert "There is no desired action count" in messages[0]["content"]
     assert "Never combine two follow-ups" in messages[0]["content"]
     assert "within a 120-second window" in messages[0]["content"]
+    assert "completed, in progress, requested" in messages[0]["content"]
     assert "candidate_dispositions" in messages[0]["content"]
     assert "prior_finding_dispositions" in messages[0]["content"]
 
@@ -3880,7 +5247,7 @@ def test_deterministic_final_repair_drops_invalid_action_and_rebuilds_update():
 def test_deterministic_final_repair_neutralizes_entities_and_deduplicates_updates():
     records = canonical_transcript_records(_segments())
     minutes = _source_payload([record["segment_id"] for record in records])
-    minutes["actions"][0]["item"] = "继续推进 GitLab 集成"
+    minutes["actions"][0]["item"] = "继续推进集成工作，处理 GitLab 配置。"
     minutes["project_updates"][0].update(
         {
             "project": "GitLab 集成",
@@ -3908,7 +5275,7 @@ def test_deterministic_final_repair_neutralizes_entities_and_deduplicates_update
     )
 
     assert repaired is not None
-    assert "neutralized_ungrounded_action_entities:1" in changes
+    assert "dropped_ungrounded_action_entity_clause:1" in changes
     assert "rebuilt_project_update:1" in changes
     assert "dropped_duplicate_project_update:2" in changes
     assert "GitLab" not in repaired["minutes"]["actions"][0]["item"]
@@ -3922,6 +5289,533 @@ def test_deterministic_final_repair_neutralizes_entities_and_deduplicates_update
     ]
 
 
+def test_deterministic_final_repair_drops_ungrounded_decision_and_shortens_reason():
+    records = canonical_transcript_records(_segments())
+    minutes = _source_payload([record["segment_id"] for record in records])
+    minutes["decisions"] = [
+        {
+            "text": "BPS will be the core system for Kirill.",
+            "segment_ids": [records[1]["segment_id"]],
+        }
+    ]
+    review = _publication_review(minutes)
+    review["candidate_dispositions"][0]["reason"] = "x" * 121
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=[
+            "decision:1:named_entity_ungrounded:BPS",
+            "decision:1:named_entity_ungrounded:Kirill",
+            "publication_gate_decision_support:1:explicit_agreement_not_grounded",
+            "publication_gate_candidate_disposition:1:reason_too_long",
+        ],
+        action_scout=_action_scout(records)["actions"],
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert "dropped_ungrounded_decision:1" in changes
+    assert "shortened_candidate_disposition_reason:1" in changes
+    assert repaired["minutes"]["decisions"] == []
+    assert repaired["decision_support"] == []
+    assert len(repaired["candidate_dispositions"][0]["reason"]) <= (
+        smart_minutes.FINAL_REVIEW_REASON_MAX_CHARS
+    )
+    cleaned, source_errors = validate_source_minutes(
+        repaired["minutes"],
+        transcript_records=records,
+        required_project_participants=["Billy"],
+    )
+    assert source_errors == []
+    assert cleaned is not None
+    assert validate_publication_gate(
+        repaired,
+        cleaned,
+        transcript_records=records,
+        action_scout=_action_scout(records)["actions"],
+    ) == []
+
+
+def test_deterministic_final_repair_reindexes_surviving_decision_support():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "decision-1",
+                "start": 0.0,
+                "end": 10.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "We should discuss the deployment plan.",
+            },
+            {
+                "id": "decision-2",
+                "start": 11.0,
+                "end": 21.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "text": "We selected the single deployment path.",
+            },
+        ]
+    )
+    minutes = {
+        "themes": [],
+        "project_updates": [],
+        "decisions": [
+            {
+                "text": "BPS is approved.",
+                "segment_ids": [records[0]["segment_id"]],
+            },
+            {
+                "text": "The single deployment path was selected.",
+                "segment_ids": [records[1]["segment_id"]],
+            },
+        ],
+        "actions": [],
+    }
+    review = {
+        "findings": [],
+        "minutes": minutes,
+        "prior_finding_dispositions": [],
+        "candidate_dispositions": [],
+        "action_support": [],
+        "decision_support": [
+            {
+                "decision_index": 1,
+                "segment_ids": [records[0]["segment_id"]],
+                "basis": "explicit_agreement",
+            },
+            {
+                "decision_index": 2,
+                "segment_ids": [records[1]["segment_id"]],
+                "basis": "selected_direction",
+            },
+        ],
+        "publishable": True,
+    }
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=[
+            "decision:1:named_entity_ungrounded:BPS",
+            "publication_gate_decision_support:1:explicit_agreement_not_grounded",
+        ],
+        action_scout=[],
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert "dropped_ungrounded_decision:1" in changes
+    assert repaired["minutes"]["decisions"] == [minutes["decisions"][1]]
+    assert repaired["decision_support"] == [
+        {
+            "decision_index": 1,
+            "segment_ids": [records[1]["segment_id"]],
+            "basis": "selected_direction",
+        }
+    ]
+
+
+def test_deterministic_final_repair_neutralizes_future_owner_after_action_drop():
+    records = canonical_transcript_records(_segments())
+    minutes = _source_payload([record["segment_id"] for record in records])
+    minutes["themes"][0]["outcome"] = "Billy will build the API gateway."
+    review = _publication_review(minutes)
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=["publication_gate_action_support:1:self_commitment_not_grounded"],
+        action_scout=_action_scout(records)["actions"],
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert "dropped_unsupported_action:1" in changes
+    assert "neutralized_future_owner_theme:1" in changes
+    assert "Billy" not in repaired["minutes"]["themes"][0]["outcome"]
+    _, source_errors = validate_source_minutes(
+        repaired["minutes"],
+        transcript_records=records,
+        required_project_participants=[],
+    )
+    assert not [
+        error
+        for error in source_errors
+        if error.startswith("theme:1:future_owner_without_action:")
+    ]
+
+
+def test_deterministic_final_repair_neutralizes_unconfirmed_generic_outcome():
+    records = canonical_transcript_records(_segments())
+    minutes = _source_payload([record["segment_id"] for record in records])
+    minutes["themes"][0]["outcome"] = "团队同意将构建 API 网关并实施数据库复制。"
+    review = _publication_review(minutes)
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=["theme:1:outcome_unconfirmed_commitment"],
+        action_scout=_action_scout(records)["actions"],
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert changes == ["neutralized_unconfirmed_theme_outcome:1"]
+    assert repaired["minutes"]["themes"][0]["outcome"] == (
+        "讨论了相关方案与后续安排，尚未形成有明确证据支持的最终决定。"
+    )
+
+
+def test_deterministic_final_repair_neutralizes_ungrounded_consensus_outcome():
+    records = canonical_transcript_records(_segments())
+    minutes = _source_payload([record["segment_id"] for record in records])
+    minutes["themes"][0]["outcome"] = "讨论形成共识：团队将继续推进该方案。"
+    review = _publication_review(minutes)
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=["theme:1:outcome_ungrounded_consensus"],
+        action_scout=_action_scout(records)["actions"],
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert changes == ["neutralized_unconfirmed_theme_outcome:1"]
+    assert repaired["minutes"]["themes"][0]["outcome"] == (
+        "讨论了相关方案与后续安排，尚未形成有明确证据支持的最终决定。"
+    )
+
+
+def test_deterministic_final_repair_restores_outline_evidence_for_short_theme():
+    segments = _segments() + [
+        {
+            "id": "outline-end",
+            "start": 190.0,
+            "end": 200.0,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_confidence": 0.95,
+            "text": "The closing portion of the same topic.",
+        }
+    ]
+    records = canonical_transcript_records(segments)
+    minutes = _source_payload([records[0]["segment_id"], records[1]["segment_id"]])
+    review = _publication_review(minutes)
+    outline = [
+        {
+            "start_segment_id": records[0]["segment_id"],
+            "end_segment_id": records[2]["segment_id"],
+            "anchor_segment_ids": [records[2]["segment_id"]],
+        }
+    ]
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=[
+            "theme:1:outline_anchor_missing",
+            "theme:1:span_too_short:70.0<180.0",
+        ],
+        action_scout=_action_scout(records)["actions"],
+        transcript_records=records,
+        theme_outline=outline,
+    )
+
+    assert repaired is not None
+    assert changes == ["restored_theme_outline_evidence:1"]
+    assert records[2]["segment_id"] in repaired["minutes"]["themes"][0][
+        "evidence_segment_ids"
+    ]
+
+
+def test_deterministic_final_repair_drops_anonymous_point_without_guessing_name():
+    records = canonical_transcript_records(
+        _segments(),
+        allow_cluster_name_consensus=False,
+    )
+    minutes = _source_payload([record["segment_id"] for record in records])
+    minutes["themes"][0]["evidence_segment_ids"] = [records[1]["segment_id"]]
+    minutes["themes"][0]["key_points"] = [
+        {
+            "speaker": "Speaker 1",
+            "text": "NPC raised a visibility concern.",
+            "segment_ids": [records[1]["segment_id"]],
+        }
+    ]
+    review = _publication_review(minutes)
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=[
+            "theme:1:point:1:named_entity_ungrounded:NPC",
+            "theme:1:point:1:speaker_anonymous",
+        ],
+        action_scout=_action_scout(records)["actions"],
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert changes == ["dropped_unattributed_theme_point:1:1"]
+    assert repaired["minutes"]["themes"][0]["key_points"] == []
+
+
+def test_deterministic_final_repair_keeps_entity_named_in_current_action_evidence():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "john-commitment",
+                "start": 0.0,
+                "end": 15.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.95,
+                "name_source": "visual_active_speaker_highlight",
+                "text": "I will prepare the document with Billy.",
+            },
+            {
+                "id": "neutral-context",
+                "start": 16.0,
+                "end": 25.0,
+                "speaker": "Speaker 2",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "The document will describe the current product.",
+            },
+        ],
+        allow_cluster_name_consensus=False,
+    )
+    minutes = {
+        "themes": [
+            {
+                "title": "文档准备",
+                "current_state": "讨论了产品说明文档。",
+                "outcome": "尚未形成最终决定。",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [
+                    {
+                        "speaker": "John",
+                        "text": "John将与Billy一起准备文档。",
+                        "segment_ids": [records[0]["segment_id"]],
+                    }
+                ],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [
+            {
+                "owner": "John",
+                "item": "与Billy一起准备文档。",
+                "segment_ids": [records[0]["segment_id"]],
+            }
+        ],
+    }
+    review = _publication_review(minutes)
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=["action:1:named_entity_ungrounded:Billy"],
+        action_scout=[],
+        transcript_records=records,
+    )
+
+    assert repaired is None
+    assert changes == []
+
+
+def test_deterministic_final_repair_corrects_or_drops_mismatched_point_speakers():
+    segments = _segments()
+    segments[0]["name_source"] = "visual_active_speaker_highlight"
+    records = canonical_transcript_records(
+        segments,
+        allow_cluster_name_consensus=False,
+    )
+    minutes = _source_payload([record["segment_id"] for record in records])
+    minutes["themes"][0]["key_points"] = [
+        {
+            "speaker": "John",
+            "text": "Billy discussed the invoice review.",
+            "segment_ids": [records[0]["segment_id"]],
+        },
+        {
+            "speaker": "Billy",
+            "text": "An unresolved participant raised a visibility concern.",
+            "segment_ids": [records[1]["segment_id"]],
+        },
+    ]
+    review = _publication_review(minutes)
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=[
+            "theme:1:point:1:speaker_evidence_mismatch",
+            "theme:1:point:2:speaker_evidence_mismatch",
+        ],
+        action_scout=_action_scout(records)["actions"],
+        transcript_records=records,
+    )
+
+    assert repaired is not None
+    assert "corrected_theme_point_speaker:1:1" in changes
+    assert "dropped_unattributed_theme_point:1:2" in changes
+    assert repaired["minutes"]["themes"][0]["key_points"] == [
+        {
+            "speaker": "Billy",
+            "text": "Billy discussed the invoice review.",
+            "segment_ids": [records[0]["segment_id"]],
+        }
+    ]
+
+
+def test_direct_only_transcript_records_keep_cluster_extensions_anonymous():
+    segments = _segments()
+    segments[0]["name_source"] = "visual_active_speaker_highlight"
+    segments[1].update(
+        {
+            "name": "Billy",
+            "name_confidence": 0.95,
+            "name_source": "voice_registry",
+        }
+    )
+    records = canonical_transcript_records(
+        segments,
+        allow_cluster_name_consensus=False,
+    )
+
+    assert records[0]["identity_kind"] == "direct"
+    assert records[1]["identity_kind"] == "anonymous"
+    assert records[1]["speaker"] == "Speaker 1"
+
+
+def test_idea_framed_let_me_is_not_a_positive_self_commitment():
+    assert not smart_minutes._positive_self_commitment(
+        [
+            {
+                "text": "Let me continue my my idea was we're going to build an API gateway.",
+            }
+        ]
+    )
+
+
+def test_generate_smart_minutes_rejects_checkpoint_from_another_identity_policy(
+    monkeypatch,
+):
+    segments = _segments()
+    for segment in segments:
+        segment.update(
+            {
+                "name": "Billy",
+                "name_confidence": 0.95,
+                "name_source": "visual_active_speaker_highlight",
+            }
+        )
+    records = canonical_transcript_records(
+        segments,
+        allow_cluster_name_consensus=False,
+    )
+    valid = _source_payload([record["segment_id"] for record in records])
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _publication_review(valid),
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+    calls: list[list[dict[str, str]]] = []
+    checkpoints: list[dict] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        calls.append(messages)
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+    stale_checkpoint = {
+        "format": smart_minutes.SMART_MINUTES_CHECKPOINT_FORMAT,
+        "prompt_version": smart_minutes.SMART_PROMPT_VERSION,
+        "transcript_sha256": smart_minutes.transcript_fingerprint(segments),
+        "model": "test-model",
+        "identity_policy": "cluster_consensus_allowed",
+    }
+
+    result, status = generate_smart_minutes(
+        segments=segments,
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+        checkpoint=stale_checkpoint,
+        checkpoint_callback=lambda payload: checkpoints.append(copy.deepcopy(payload)),
+        allow_cluster_name_consensus=False,
+    )
+
+    assert result is not None, status
+    assert len(calls) == 7
+    assert checkpoints[0]["identity_policy"] == "direct_visual_only"
+    assert result.audit["identity_policy"] == "direct_visual_only"
+
+
+def test_generate_smart_minutes_repairs_rejected_checkpoint_before_model_retry(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        _publication_review(valid),
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+    checkpoints: list[dict] = []
+
+    def initial_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", initial_request)
+    first, first_status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+        checkpoint_callback=lambda payload: checkpoints.append(copy.deepcopy(payload)),
+    )
+
+    assert first is not None, first_status
+    checkpoint = copy.deepcopy(checkpoints[-1])
+    rejected_payload = _publication_review(copy.deepcopy(valid))
+    rejected_payload["minutes"]["themes"][0]["key_points"][0]["speaker"] = "John"
+    checkpoint["reviews"] = [copy.deepcopy(checkpoint["reviews"][0])]
+    checkpoint["last_rejected_review"] = {
+        "pass": 2,
+        "input_sha256": "rejected-checkpoint",
+        "payload": rejected_payload,
+        "status": {"status": "review_schema_invalid"},
+        "validation_errors": ["theme:1:point:1:speaker_evidence_mismatch"],
+    }
+
+    def unexpected_model_request(*, messages, config, max_tokens=16000):
+        raise AssertionError("checkpoint repair should avoid another model request")
+
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.request_deepseek_json",
+        unexpected_model_request,
+    )
+    resumed, resumed_status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+        checkpoint=checkpoint,
+    )
+
+    assert resumed is not None, resumed_status
+    final_status = resumed.audit["reviews"][1]["status"]
+    assert final_status["status"] == "deterministic_checkpoint_repair"
+    assert final_status["deterministic_repair_phase"] == "checkpoint"
+    assert "corrected_theme_point_speaker:1:1" in final_status[
+        "deterministic_repair_changes"
+    ]
+
+
 def test_entity_neutralization_removes_empty_related_modifiers_in_both_languages():
     assert smart_minutes._neutralize_ungrounded_entities(
         "排查并修复相关集成中的认证失败问题",
@@ -3931,6 +5825,376 @@ def test_entity_neutralization_removes_empty_related_modifiers_in_both_languages
         "Create related applications and configure interconnections.",
         {"Authentik"},
     ) == "Create applications and configure interconnections."
+
+
+def test_deterministic_repair_expands_theme_local_evidence_for_entity():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "theme-anchor",
+                "start": 0.0,
+                "end": 12.0,
+                "speaker": "Speaker 1",
+                "text": "The interface needs another test.",
+            },
+            {
+                "id": "bps-detail",
+                "start": 36.0,
+                "end": 48.0,
+                "speaker": "Speaker 2",
+                "text": "Please retest through the BPS interface.",
+            },
+        ],
+        allow_cluster_name_consensus=False,
+    )
+    minutes = {
+        "themes": [
+            {
+                "title": "接口复测",
+                "current_state": "需要通过BPS接口重新测试。",
+                "outcome": "尚未形成最终决定。",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+    review = _publication_review(minutes, candidate_dispositions=[])
+    outline = [
+        {
+            "start": 0.0,
+            "end": 60.0,
+            "anchor_segment_ids": [records[0]["segment_id"]],
+        }
+    ]
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=["theme:1:current_state:named_entity_ungrounded:BPS"],
+        action_scout=[],
+        transcript_records=records,
+        theme_outline=outline,
+        entity_fallback=False,
+    )
+
+    assert repaired is not None
+    assert "expanded_theme_entity_evidence:1:current_state:1" in changes
+    assert repaired["minutes"]["themes"][0]["evidence_segment_ids"] == [
+        records[0]["segment_id"],
+        records[1]["segment_id"],
+    ]
+    assert repaired["minutes"]["themes"][0]["current_state"] == "需要通过BPS接口重新测试。"
+
+
+def test_deterministic_repair_does_not_expand_entity_outside_theme_range():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "theme-anchor",
+                "start": 0.0,
+                "end": 12.0,
+                "speaker": "Speaker 1",
+                "text": "The interface needs another test.",
+            },
+            {
+                "id": "out-of-range-bps",
+                "start": 600.0,
+                "end": 612.0,
+                "speaker": "Speaker 2",
+                "text": "Please retest through the BPS interface.",
+            },
+        ],
+        allow_cluster_name_consensus=False,
+    )
+    minutes = {
+        "themes": [
+            {
+                "title": "接口复测",
+                "current_state": "需要通过BPS接口重新测试。",
+                "outcome": "尚未形成最终决定。",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+    review = _publication_review(minutes, candidate_dispositions=[])
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=["theme:1:current_state:named_entity_ungrounded:BPS"],
+        action_scout=[],
+        transcript_records=records,
+        theme_outline=[
+            {
+                "start": 0.0,
+                "end": 60.0,
+                "anchor_segment_ids": [records[0]["segment_id"]],
+            }
+        ],
+        entity_fallback=False,
+    )
+
+    assert repaired is None
+    assert changes == []
+
+
+def test_theme_entity_expansion_never_relabels_anonymous_point():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "anonymous-point",
+                "start": 0.0,
+                "end": 12.0,
+                "speaker": "Speaker 1",
+                "text": "The interface needs another test.",
+            },
+            {
+                "id": "john-bps",
+                "start": 20.0,
+                "end": 32.0,
+                "speaker": "Speaker 2",
+                "name": "John",
+                "name_confidence": 0.99,
+                "name_source": "visual_active_speaker_highlight",
+                "text": "Please retest through the BPS interface.",
+            },
+        ],
+        allow_cluster_name_consensus=False,
+    )
+    minutes = {
+        "themes": [
+            {
+                "title": "接口复测",
+                "current_state": "接口需要再次测试。",
+                "outcome": "尚未形成最终决定。",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [
+                    {
+                        "speaker": "Speaker 1",
+                        "text": "需要通过BPS接口重新测试。",
+                        "segment_ids": [records[0]["segment_id"]],
+                    }
+                ],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+    review = _publication_review(minutes, candidate_dispositions=[])
+
+    repaired, changes = _deterministic_final_review_repair(
+        review,
+        errors=["theme:1:point:1:text:named_entity_ungrounded:BPS"],
+        action_scout=[],
+        transcript_records=records,
+        theme_outline=[
+            {
+                "start": 0.0,
+                "end": 60.0,
+                "anchor_segment_ids": [records[0]["segment_id"]],
+            }
+        ],
+        entity_fallback=False,
+    )
+
+    assert repaired is None
+    assert changes == []
+    assert review["minutes"]["themes"][0]["key_points"][0]["speaker"] == "Speaker 1"
+
+
+def test_targeted_field_repair_removes_masking_without_identity_change():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "john-commitment",
+                "start": 0.0,
+                "end": 15.0,
+                "speaker": "Speaker 1",
+                "name": "John",
+                "name_confidence": 0.99,
+                "name_source": "visual_active_speaker_highlight",
+                "text": "I will start writing the document today and finish it with Billy.",
+            }
+        ],
+        allow_cluster_name_consensus=False,
+    )
+    minutes = {
+        "themes": [],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [
+            {
+                "owner": "John",
+                "item": "与Billy一起完成。",
+                "segment_ids": [records[0]["segment_id"]],
+            }
+        ],
+    }
+    review = _publication_review(minutes)
+    errors = ["action:1:item:quality_incomplete_action"]
+
+    targets = smart_minutes._field_repair_targets(
+        review,
+        errors,
+        transcript_records=records,
+    )
+    repaired, applied = smart_minutes._apply_targeted_field_repairs(
+        review,
+        {
+            "repairs": [
+                {
+                    "field": "action:1:item",
+                    "text": "开始与Billy共同编写文档。",
+                }
+            ]
+        },
+        targets=targets,
+    )
+
+    assert repaired is not None
+    assert applied == ["action:1:item"]
+    assert repaired["minutes"]["actions"][0]["owner"] == "John"
+    assert repaired["minutes"]["actions"][0]["segment_ids"] == [
+        records[0]["segment_id"]
+    ]
+    assert smart_minutes._publication_language_quality_errors(
+        repaired["minutes"]
+    ) == []
+
+
+def test_targeted_field_repair_repairs_status_inversion():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "pending-retest",
+                "start": 0.0,
+                "end": 12.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "I need your help to retest address generation through BPS.",
+            }
+        ]
+    )
+    minutes = {
+        "themes": [
+            {
+                "title": "地址重试",
+                "current_state": "地址生成已通过BPS接口重新测试。",
+                "outcome": "讨论形成方向，尚未决定。",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+    review = _publication_review(minutes, candidate_dispositions=[])
+    errors = ["theme:1:current_state:status_unsupported_completion:retest"]
+
+    targets = smart_minutes._field_repair_targets(
+        review,
+        errors,
+        transcript_records=records,
+    )
+    repaired, applied = smart_minutes._apply_targeted_field_repairs(
+        review,
+        {
+            "repairs": [
+                {
+                    "field": "theme:1:current_state",
+                    "text": "地址生成需要通过BPS接口重新测试。",
+                }
+            ]
+        },
+        targets=targets,
+    )
+
+    assert [target["field"] for target in targets] == ["theme:1:current_state"]
+    assert applied == ["theme:1:current_state"]
+    assert repaired is not None
+    assert repaired["minutes"]["themes"][0]["current_state"] == (
+        "地址生成需要通过BPS接口重新测试。"
+    )
+
+
+def test_repair_source_minutes_text_fields_preserves_reviewed_structure(monkeypatch):
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "pending-retest",
+                "start": 0.0,
+                "end": 8.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "I need your help to retest that particular issue.",
+            },
+            {
+                "id": "retest-context",
+                "start": 8.0,
+                "end": 16.0,
+                "speaker": "Speaker 4",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "Use the BPS interface to generate the address once again.",
+            },
+        ]
+    )
+    source = {
+        "themes": [
+            {
+                "title": "地址重试",
+                "current_state": "地址生成已通过BPS接口重新测试。",
+                "outcome": "讨论形成方向，尚未决定。",
+                "evidence_segment_ids": [records[1]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        assert max_tokens == 4_000
+        assert "text fields" in messages[0]["content"]
+        return {
+            "repairs": [
+                {
+                    "field": "theme:1:current_state",
+                    "text": "地址生成需要通过BPS接口重新测试。",
+                }
+            ]
+        }, {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(smart_minutes, "request_deepseek_json", fake_request)
+
+    repaired, status = repair_source_minutes_text_fields(
+        source,
+        transcript_records=records,
+        required_project_participants=[],
+        config=DeepSeekConfig(model="test-model"),
+    )
+
+    assert repaired is not None
+    assert status["status"] == "repaired"
+    assert status["field_repair"][0]["applied_fields"] == [
+        "theme:1:current_state"
+    ]
+    assert repaired["themes"][0]["current_state"] == (
+        "地址生成需要通过BPS接口重新测试。"
+    )
+    assert repaired["themes"][0]["evidence_segment_ids"] == [
+        records[1]["segment_id"]
+    ]
 
 
 def test_deterministic_final_repair_drops_out_of_outline_theme_point():
@@ -4205,6 +6469,35 @@ def test_sanitize_reviewed_minutes_drops_audited_external_delivery_status_action
     assert result.final_review["candidate_dispositions"][1]["action_index"] is None
 
 
+def test_sanitize_reviewed_minutes_rejects_non_action_repair_that_would_desync_languages():
+    segments = _segments()
+    records = canonical_transcript_records(segments)
+    minutes = _minutes_payload([record["segment_id"] for record in records])
+    minutes["decisions"] = [
+        {
+            "text_zh": "BPS 已获批准。",
+            "text_en": "BPS was approved.",
+            "segment_ids": [records[0]["segment_id"]],
+        }
+    ]
+    source = {"format": SMART_MINUTES_FORMAT, "minutes": minutes}
+    chinese_source = smart_minutes._bilingual_to_source(minutes, language="zh")
+    final_review = _publication_review(chinese_source)
+    audit = {
+        "reviews": [{"findings": []}, final_review],
+        "action_scout": {"actions": _action_scout(records)["actions"]},
+    }
+
+    result, errors = sanitize_reviewed_smart_minutes(
+        source,
+        segments=segments,
+        source_audit=audit,
+    )
+
+    assert result is None
+    assert errors == ["reviewed_payload_non_action_repair_requires_regeneration"]
+
+
 def test_deterministic_final_repair_neutralizes_anonymous_theme_reference():
     records = canonical_transcript_records(_segments())
     minutes = _source_payload([record["segment_id"] for record in records])
@@ -4306,6 +6599,78 @@ def test_validator_narrows_project_update_evidence_to_participant_speech():
     assert cleaned["project_updates"][0]["segment_ids"] == [records[1]["segment_id"]]
 
 
+def test_validator_rejects_project_update_built_from_distant_statuses():
+    segments = _segments() + [
+        {
+            "id": "late-status",
+            "start": 500.0,
+            "end": 510.0,
+            "speaker": "Speaker 1",
+            "name": "Billy",
+            "name_confidence": 0.95,
+            "text": "I will send the meeting notes after the review.",
+        }
+    ]
+    records = canonical_transcript_records(segments)
+    payload = _minutes_payload([record["segment_id"] for record in records[:2]])
+    payload["project_updates"][0].update(
+        {
+            "update_zh": "复核发票并发送会议纪要。",
+            "update_en": "Review the invoice and send the meeting notes.",
+            "segment_ids": [records[0]["segment_id"], records[2]["segment_id"]],
+        }
+    )
+
+    cleaned, errors = validate_smart_minutes(
+        payload,
+        transcript_records=records,
+        required_project_participants=["Billy"],
+    )
+
+    assert cleaned is None
+    assert any(
+        error.startswith("project_update:1:evidence_span_too_wide:")
+        for error in errors
+    )
+
+
+def test_validator_rejects_cjk_adjacent_number_missing_from_project_update_evidence():
+    records = canonical_transcript_records(_segments())
+    payload = _minutes_payload([record["segment_id"] for record in records])
+    payload["project_updates"][0].update(
+        {
+            "update_zh": "当前处理90%的流量。",
+            "update_en": "Currently handles 90% of traffic.",
+            "segment_ids": [records[0]["segment_id"]],
+        }
+    )
+
+    cleaned, errors = validate_smart_minutes(
+        payload,
+        transcript_records=records,
+        required_project_participants=["Billy"],
+    )
+
+    assert cleaned is None
+    assert "project_update:1:number_ungrounded:90" in errors
+
+
+def test_validator_rejects_cjk_adjacent_number_missing_from_theme_evidence():
+    records = canonical_transcript_records(_segments())
+    payload = _minutes_payload([record["segment_id"] for record in records])
+    payload["themes"][0]["current_state_zh"] = "当前处理90%的流量。"
+    payload["themes"][0]["current_state_en"] = "Currently handles 90% of traffic."
+
+    cleaned, errors = validate_smart_minutes(
+        payload,
+        transcript_records=records,
+        required_project_participants=["Billy"],
+    )
+
+    assert cleaned is None
+    assert "theme:1:current_state:number_ungrounded:90" in errors
+
+
 def test_validator_rejects_unknown_extra_evidence_instead_of_silently_dropping_it():
     records = canonical_transcript_records(_segments())
     payload = _minutes_payload([record["segment_id"] for record in records])
@@ -4353,6 +6718,49 @@ def test_validator_rejects_anonymous_key_point_speaker():
     assert "theme:1:point:1:speaker_anonymous" in errors
 
 
+def test_validator_allows_neutral_theme_without_named_evidence_points():
+    records = canonical_transcript_records(
+        [
+            {
+                "id": "unresolved-topic",
+                "start": 0.0,
+                "end": 20.0,
+                "speaker": "Speaker 1",
+                "name": None,
+                "name_confidence": 0.0,
+                "text": "An unresolved participant discussed the architecture tradeoff.",
+            }
+        ]
+    )
+    payload = {
+        "themes": [
+            {
+                "title_zh": "架构取舍讨论",
+                "title_en": "Architecture Trade-off Discussion",
+                "current_state_zh": "讨论了架构取舍。",
+                "current_state_en": "The architecture trade-off was discussed.",
+                "outcome_zh": "尚未形成最终决定。",
+                "outcome_en": "No final decision was made.",
+                "evidence_segment_ids": [records[0]["segment_id"]],
+                "key_points": [],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+
+    cleaned, errors = validate_smart_minutes(
+        payload,
+        transcript_records=records,
+        required_project_participants=[],
+    )
+
+    assert errors == []
+    assert cleaned is not None
+    assert cleaned["themes"][0]["key_points"] == []
+
+
 def test_validator_rejects_named_future_theme_claim_without_nearby_action():
     segments = _segments() + [
         {
@@ -4376,6 +6784,57 @@ def test_validator_rejects_named_future_theme_claim_without_nearby_action():
 
     assert cleaned is None
     assert "theme:1:future_owner_without_action:Xin" in errors
+
+
+def test_validator_rejects_unconfirmed_generic_theme_commitment():
+    records = canonical_transcript_records(_segments())
+    payload = _minutes_payload([record["segment_id"] for record in records])
+    payload["themes"][0]["outcome_zh"] = "团队同意将构建 API 网关并实施数据库复制。"
+    payload["themes"][0]["outcome_en"] = (
+        "The team agreed to build the API gateway and implement database replication."
+    )
+
+    cleaned, errors = validate_smart_minutes(
+        payload,
+        transcript_records=records,
+        required_project_participants=["Billy"],
+    )
+
+    assert cleaned is None
+    assert "theme:1:outcome_unconfirmed_commitment" in errors
+
+
+def test_validator_rejects_ungrounded_theme_consensus():
+    records = canonical_transcript_records(_segments())
+    payload = _minutes_payload([record["segment_id"] for record in records])
+    payload["themes"][0]["outcome_zh"] = "讨论形成共识：AI将替代开发者。"
+    payload["themes"][0]["outcome_en"] = "Consensus: AI will replace developers."
+
+    cleaned, errors = validate_smart_minutes(
+        payload,
+        transcript_records=records,
+        required_project_participants=["Billy"],
+    )
+
+    assert cleaned is None
+    assert "theme:1:outcome_ungrounded_consensus" in errors
+
+
+def test_validator_rejects_slash_joined_theme_title():
+    records = canonical_transcript_records(_segments())
+    payload = _minutes_payload([record["segment_id"] for record in records])
+    payload["themes"][0]["title_zh"] = (
+        "API网关、高可用性与数据库扩展 / 团队效率和安全风险"
+    )
+
+    cleaned, errors = validate_smart_minutes(
+        payload,
+        transcript_records=records,
+        required_project_participants=["Billy"],
+    )
+
+    assert cleaned is None
+    assert "theme:1:title_zh_combined_topic" in errors
 
 
 def test_validator_rejects_entity_rewrite_not_present_in_action_evidence():
@@ -4632,6 +7091,67 @@ def test_generate_smart_minutes_runs_synthesis_then_full_review(monkeypatch):
     assert "Billy" in result.english_markdown
 
 
+def test_final_review_forces_structural_rewrite_after_theme_count_mismatch(
+    monkeypatch,
+):
+    records = canonical_transcript_records(_segments())
+    valid = _source_payload([record["segment_id"] for record in records])
+    invalid_final_review = _publication_review(copy.deepcopy(valid))
+    invalid_final_review["minutes"]["themes"].append(
+        copy.deepcopy(valid["themes"][0])
+    )
+    repaired_final_review = _publication_review(copy.deepcopy(valid))
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        invalid_final_review,
+        repaired_final_review,
+        _source_payload([record["segment_id"] for record in records], english=True),
+    ]
+    calls: list[list[dict[str, str]]] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        calls.append(messages)
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr(
+        "meeting_minutes.smart_minutes.request_deepseek_json",
+        fake_request,
+    )
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=2,
+    )
+
+    assert result is not None, status
+    assert status["status"] == "reviewed_draft"
+    assert len(calls) == 8
+    assert "invalid_review" in calls[6][1]["content"]
+    final_review_status = result.audit["reviews"][1]["status"]
+    assert final_review_status["repair_attempted"] is True
+    assert "field_repair" not in final_review_status
+
+
+def test_structural_review_rewrite_includes_outline_window_failures():
+    assert smart_minutes._requires_full_final_review_rewrite(
+        ["theme:1:outside_outline_range:seg_3"]
+    )
+    assert smart_minutes._requires_full_final_review_rewrite(
+        ["theme:2:outline_anchor_missing"]
+    )
+    assert smart_minutes._requires_full_final_review_rewrite(
+        ["theme:3:span_too_short:40.0<180.0"]
+    )
+    assert not smart_minutes._requires_full_final_review_rewrite(
+        ["theme:1:point:1:speaker_evidence_mismatch"]
+    )
+
+
 def test_review_pass_repairs_a_locally_invalid_synthesis(monkeypatch):
     records = canonical_transcript_records(_segments())
     valid = _source_payload([record["segment_id"] for record in records])
@@ -4673,9 +7193,10 @@ def test_review_pass_repairs_a_locally_invalid_synthesis(monkeypatch):
 
     assert result is not None
     assert status["status"] == "reviewed_draft"
-    assert result.audit["synthesis_validation_errors"] == [
+    assert result.audit["synthesis_initial_validation_errors"] == [
         "theme:1:keys_invalid"
     ]
+    assert result.audit["final_review_validation_errors"] == []
 
 
 def test_second_review_repairs_first_review_owner_mismatch(monkeypatch):
@@ -5124,7 +7645,6 @@ def test_final_review_repairs_local_schema_failure_once(monkeypatch):
         valid,
         {"findings": [], "minutes": valid},
         invalid_final,
-        _publication_review(valid),
         _source_payload([record["segment_id"] for record in records], english=True),
     ]
 
@@ -5141,7 +7661,7 @@ def test_final_review_repairs_local_schema_failure_once(monkeypatch):
 
     assert result is not None
     assert status["status"] == "reviewed_draft"
-    assert result.audit["reviews"][1]["status"]["repair_attempted"] is True
+    assert result.audit["reviews"][1]["status"]["deterministic_repair_attempted"] is True
 
 
 def test_final_review_deterministically_repairs_source_and_publication_gate_errors(monkeypatch):
@@ -5401,6 +7921,78 @@ def test_changed_upstream_payload_invalidates_dependent_stage_caches(monkeypatch
     assert resumed.status["translation"]["status"] == "cached"
 
 
+def test_invalid_translation_payload_is_not_reused_from_checkpoint(monkeypatch):
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    valid = _source_payload(segment_ids)
+    invalid_translation = _source_payload(segment_ids, english=True)
+    invalid_translation["actions"][0]["owner"] = "Xin"
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        invalid_translation,
+        invalid_translation,
+    ]
+    checkpoints: list[dict] = []
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+        checkpoint_callback=lambda payload: checkpoints.append(copy.deepcopy(payload)),
+    )
+
+    assert result is None
+    assert status["status"] == "translation_alignment_invalid"
+    assert "translation_action:1:owner_mismatch" in status["errors"]
+    assert checkpoints[-1]["translation"] is None
+    assert (
+        "translation_action:1:owner_mismatch"
+        in checkpoints[-1]["last_rejected_translation"]["validation_errors"]
+    )
+
+
+def test_translation_alignment_repairs_invalid_target_once(monkeypatch):
+    records = canonical_transcript_records(_segments())
+    segment_ids = [record["segment_id"] for record in records]
+    valid = _source_payload(segment_ids)
+    invalid_translation = _source_payload(segment_ids, english=True)
+    invalid_translation["actions"][0]["owner"] = "Xin"
+    repaired_translation = _source_payload(segment_ids, english=True)
+    responses = [
+        _action_scout(records),
+        _implicit_follow_up_scout(),
+        _theme_outline(records),
+        valid,
+        {"findings": [], "minutes": valid},
+        invalid_translation,
+        repaired_translation,
+    ]
+
+    def fake_request(*, messages, config, max_tokens=16000):
+        return responses.pop(0), {"status": "ok", "requested_model": config.model}
+
+    monkeypatch.setattr("meeting_minutes.smart_minutes.request_deepseek_json", fake_request)
+
+    result, status = generate_smart_minutes(
+        segments=_segments(),
+        config=DeepSeekConfig(model="test-model"),
+        review_passes=1,
+    )
+
+    assert result is not None
+    assert status["status"] == "reviewed_draft"
+    assert result.status["translation"]["status"] == "repair"
+
+
 def test_renderer_sorts_model_rows_by_source_time():
     segments = [
         {
@@ -5485,3 +8077,56 @@ def test_renderer_sorts_model_rows_by_source_time():
     assert english.index("| 00:00:00-00:00:20 | Review the invoice.") < english.index(
         "| 00:00:40-00:01:00 | Test the merchant flow."
     )
+
+
+def test_renderer_shows_a_time_range_for_multi_segment_key_points():
+    records = canonical_transcript_records(
+        [
+            {
+                "start": 0.0,
+                "end": 5.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.94,
+                "text": "The first part of the update.",
+            },
+            {
+                "start": 20.0,
+                "end": 25.0,
+                "speaker": "Speaker 1",
+                "name": "Billy",
+                "name_confidence": 0.94,
+                "text": "The second part of the update.",
+            },
+        ]
+    )
+    first, second = [record["segment_id"] for record in records]
+    payload = {
+        "themes": [
+            {
+                "title_zh": "状态更新",
+                "title_en": "Status Update",
+                "current_state_zh": "讨论了状态。",
+                "current_state_en": "Status was discussed.",
+                "outcome_zh": "尚未形成最终决定。",
+                "outcome_en": "No final decision was made.",
+                "evidence_segment_ids": [first, second],
+                "key_points": [
+                    {
+                        "speaker": "Billy",
+                        "text_zh": "Billy 说明了两个部分。",
+                        "text_en": "Billy described both parts.",
+                        "segment_ids": [first, second],
+                    }
+                ],
+            }
+        ],
+        "project_updates": [],
+        "decisions": [],
+        "actions": [],
+    }
+
+    chinese, english = render_smart_minutes(payload, transcript_records=records)
+
+    assert "关键观点（00:00:00-00:00:25，Billy）" in chinese
+    assert "Key point (00:00:00-00:00:25, Billy)" in english

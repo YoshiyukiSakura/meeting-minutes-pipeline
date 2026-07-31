@@ -2,7 +2,11 @@ import hashlib
 
 from meeting_minutes.action_items import build_action_ledger, stable_segment_id, transcript_fingerprint
 from meeting_minutes.jsonio import read_json, write_json
-from meeting_minutes.minutes_contract import ShareableActionRow, ShareableProjectUpdateRow
+from meeting_minutes.minutes_contract import (
+    UNASSIGNED_ACTION_OWNER,
+    ShareableActionRow,
+    ShareableProjectUpdateRow,
+)
 from meeting_minutes.publication import (
     ACTION_EVIDENCE_FORMAT,
     ACTION_INTENT_REVIEW_FORMAT,
@@ -10,6 +14,7 @@ from meeting_minutes.publication import (
     PROJECT_UPDATE_COVERAGE_MIN_SECONDS,
     PUBLICATION_FORMAT,
     action_ledger_fingerprint,
+    build_reviewed_evidence_manifests,
     payload_fingerprint,
     recompute_project_update_coverage,
     sync_publication_status,
@@ -186,6 +191,82 @@ def test_reviewed_context_action_evidence_requires_matching_named_owner_and_sour
         action_ledger=ledger,
     )
     assert "action_evidence_row:1:owner_evidence_unknown" in errors
+
+
+def test_smart_evidence_builder_preserves_explicit_unassigned_action_owner():
+    segments = [
+        *_segments(),
+        {
+            "start": 10.0,
+            "end": 20.0,
+            "speaker": "Speaker 2",
+            "text": "Please retest the NPC address generation.",
+        },
+    ]
+    ledger = build_action_ledger(segments)
+    named_id = stable_segment_id(segments[0], 0)
+    unassigned_id = stable_segment_id(segments[1], 1)
+    action_rows = [
+        ShareableActionRow(
+            index=1,
+            time_range="00:00-00:10",
+            start=0.0,
+            end=10.0,
+            item="部署 MPC",
+            owner="Riley",
+        ),
+        ShareableActionRow(
+            index=2,
+            time_range="00:10-00:20",
+            start=10.0,
+            end=20.0,
+            item="重新测试 NPC 地址生成",
+            owner=UNASSIGNED_ACTION_OWNER,
+        ),
+    ]
+    smart_minutes = {
+        "format": "meeting-minutes/smart-v1",
+        "minutes": {
+            "themes": [],
+            "decisions": [],
+            "project_updates": [],
+            "actions": [
+                {
+                    "owner": "Riley",
+                    "item_zh": "部署 MPC",
+                    "item_en": "Deploy MPC.",
+                    "segment_ids": [named_id],
+                },
+                {
+                    "owner": UNASSIGNED_ACTION_OWNER,
+                    "item_zh": "重新测试 NPC 地址生成",
+                    "item_en": "Retest NPC address generation.",
+                    "segment_ids": [unassigned_id],
+                },
+            ],
+        },
+    }
+
+    manifests, errors = build_reviewed_evidence_manifests(
+        smart_minutes=smart_minutes,
+        action_rows=action_rows,
+        project_rows=[],
+        segments=segments,
+        action_ledger=ledger,
+    )
+
+    assert errors == []
+    assert manifests is not None
+    assert manifests["action_evidence"]["rows"][1] == {
+        "row": 2,
+        "source_segment_ids": [unassigned_id],
+        "owner_evidence_segment_id": None,
+        "evidence_mode": "reviewed_context",
+        "review_note": (
+            "Bound to the source IDs retained by the validated smart-minutes "
+            "review."
+        ),
+    }
 
 
 def test_action_intent_review_requires_exact_disposition_and_linked_published_source():
@@ -377,19 +458,21 @@ def test_project_evidence_cannot_reuse_an_accepted_action_commitment():
             "start": 0.0,
             "end": 10.0,
             "speaker": "Speaker 1",
-            "name": "Riley",
-            "name_confidence": 0.95,
-            "name_source": "visual_active_speaker_highlight",
-            "text": "I will deploy MPC today.",
+                "name": "Riley",
+                "name_confidence": 0.95,
+                "name_source": "visual_active_speaker_highlight",
+                "visual_identity_agent_audit": {"status": "confirmed"},
+                "text": "I will deploy MPC today.",
         },
         {
             "start": 10.0,
             "end": 61.0,
             "speaker": "Speaker 1",
-            "name": "Riley",
-            "name_confidence": 0.95,
-            "name_source": "visual_active_speaker_highlight",
-            "text": "The MPC work is being reviewed by the team.",
+                "name": "Riley",
+                "name_confidence": 0.95,
+                "name_source": "visual_active_speaker_highlight",
+                "visual_identity_agent_audit": {"status": "confirmed"},
+                "text": "The MPC work is being reviewed by the team.",
         },
     ]
     ledger = build_action_ledger(segments)

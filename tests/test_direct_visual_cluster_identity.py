@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from meeting_minutes.direct_visual_cluster_identity import (
     _turn_evidence,
     apply_direct_visual_cluster_identity,
@@ -34,6 +36,17 @@ def _frame(name: str, time: float) -> dict:
         "actualTime": time,
         "path": f"/tmp/{name}-{time}.jpg",
     }
+
+
+def test_direct_visual_cluster_config_rejects_invalid_vote_threshold(tmp_path):
+    config = tmp_path / "invalid.json"
+    config.write_text(
+        '{"settings":{"minimum_turn_frame_votes":0}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="minimum_turn_frame_votes"):
+        load_direct_visual_cluster_config(config)
 
 
 def test_turn_evidence_erodes_boundary_lag_before_voting():

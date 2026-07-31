@@ -7,6 +7,7 @@ import unicodedata
 from collections.abc import Iterable
 from typing import Any
 
+from .identity_authority import ACTIVE_SPEAKER_HIGHLIGHT_SOURCE
 from .time_utils import format_ts
 
 LEDGER_FORMAT = "meeting-minutes/action-ledger-v2"
@@ -22,6 +23,11 @@ _SELF_COMMITMENT = re.compile(
 )
 _CONVERSATIONAL_LET_ME = re.compile(
     r"^\s*let\s+me\s+(?:ask|explain|look|say|see|show|think)\b",
+    re.IGNORECASE,
+)
+_IDEA_FRAMED_LET_ME = re.compile(
+    r"^\s*let\s+me\s+(?:continue\s+)?(?:my\s+){0,2}idea\s+(?:was|is)\b|"
+    r"^\s*my\s+(?:main\s+)?idea\s+(?:was|is)\b",
     re.IGNORECASE,
 )
 _NEGATED_SELF_COMMITMENT = re.compile(
@@ -161,7 +167,7 @@ def transcript_fingerprint(segments: list[dict[str, Any]]) -> str:
 
 def _speaker_label(segment: dict[str, Any]) -> str | None:
     name = str(segment.get("name") or "").strip()
-    if name and float(segment.get("name_confidence", 0.0)) >= 0.6:
+    if name and _trusted_named_segment(segment):
         return name
     speaker = str(segment.get("speaker") or "Speaker Unknown")
     return None if speaker == "Speaker Unknown" else speaker
@@ -173,7 +179,12 @@ def _trusted_named_segment(segment: dict[str, Any]) -> bool:
     name = str(segment.get("name") or "").strip()
     if not name or name.casefold().startswith("speaker ") or name.casefold() in {"unknown", "unresolved"}:
         return False
-    return float(segment.get("name_confidence", 0.0) or 0.0) >= 0.6
+    if float(segment.get("name_confidence", 0.0) or 0.0) < 0.6:
+        return False
+    if str(segment.get("name_source") or "") == ACTIVE_SPEAKER_HIGHLIGHT_SOURCE:
+        audit = segment.get("visual_identity_agent_audit")
+        return isinstance(audit, dict) and audit.get("status") == "confirmed"
+    return True
 
 
 def _topic_groups(text: str) -> list[str]:
@@ -320,6 +331,7 @@ def _deduplicated_commitments(text: str) -> list[re.Match[str]]:
         suffix = text[match.start() :]
         if (
             _CONVERSATIONAL_LET_ME.match(suffix)
+            or _IDEA_FRAMED_LET_ME.match(suffix)
             or _NEGATED_SELF_COMMITMENT.match(suffix)
         ):
             continue
